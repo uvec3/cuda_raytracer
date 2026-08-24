@@ -1,0 +1,9 @@
+CMAKE_MINIMUM_REQUIRED(VERSION 4.2)
+
+SET(CMAKE_CXX_STANDARD 23)
+SET(CMAKE_CUDA_STANDARD 20)
+
+project(Raytracer CXX CUDA)
+
+add_executable(Raytracer main.cpp)
+
