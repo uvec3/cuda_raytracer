@@ -5,5 +5,18 @@ SET(CMAKE_CUDA_STANDARD 20)
 
 project(Raytracer CXX CUDA)
 
-add_executable(Raytracer main.cpp)
+add_executable(Raytracer main.cpp
+    src/kernels/kernel.cu
+        src/kernels/kernel.h)
 
+
+add_subdirectory(vkbase)
+
+target_link_libraries(Raytracer
+        vkbase_e
+        vkbase::assets
+        imgui
+        SDL_backend_core
+        SDL_backend_imgui
+        Buffer
+        imgui_Log)

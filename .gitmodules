@@ -1,0 +1,3 @@
+[submodule "vkbase"]
+	path = vkbase
+	url = https://github.com/uvec3/vkbase
