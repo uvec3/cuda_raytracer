@@ -1,76 +1,95 @@
 #include <iostream>
-#include "vkbase/core/EngineBase.h"
-#include "vkbase/extensions/imgui/imgui.hpp"
-#include "vkbase/extensions/imgui/Log.hpp"
-#include "src/kernels/kernel.h"
+#include "src/Raytracer.hpp"
+
 
 static bool exitFlag=false;
+static std::unique_ptr<Raytracer> raytracer;
+
 
 void ui()
 {
     vkbase::imgui::showDebugWindow();
+
+    if (ImGui::Begin("Test wind"))
+    {
+        auto available=ImGui::GetContentRegionAvail();
+        raytracer->swap_chain.setImageSize(available.x,available.y);
+
+        auto image_to_presen=raytracer->swap_chain.getImageToPresent();
+        if (image_to_presen)
+            ImGui::Image(image_to_presen->image_imgui,available);
+    }
+
+    ImGui::End();
 }
 
-void initVec(float* vec, uint64_t N)
-{
-    for (uint64_t i=0;i<N;++i)
-    {
-        vec[i]=i;
-    }
-}
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** args)
 {
-    int N=111;
-    float* a= (float*) malloc(N* sizeof(float));
-    float* b= (float*) malloc(N* sizeof(float));
-    float* result= (float*) malloc(N* sizeof(float));
-    float* result_from_device = (float*) malloc(N* sizeof(float));
-
-    initVec(a,N);
-    initVec(b,N);
-    memset(result,0,N*sizeof(float));
-
-
-
-    deviceAdd(result_from_device,a,b,N);
-
-    std::cout<<"\nd: ";
-    for (auto i=0;i<N;++i)
-    {
-        std::cout<<result_from_device[i]<<"\n";
-    }
-
     try
     {
+        //register extensions
+        vkbase::cuda::init();
+
+
         //target image count
         vkbase::imageCount=2;
-        vkbase::init("IPTE");//init engine
+        // vkbase::sys::fullscreen(true);
+        vkbase::init("Raytracer");//init engine
         vkbase::imgui::initIMGUI();//init imgui
         vkbase::imgui::registerEngineMessagesLog();//copy engine messages to imgui log window
 
+
+        //set up imgui
         // vkbase::imgui::setDefaultFontName("JetBrainsMono-Regular");
         vkbase::imgui::setDefaultFontSize(16);
         ImGuiStyle& style = ImGui::GetStyle();
-        style.Colors[ImGuiCol_WindowBg].w = 0.5f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.f;
 
 
-        //register ui function
+        //register callbacks
         vkbase::imgui::addOnUiCallback(ui);
+
+        raytracer=std::make_unique<Raytracer>();
+        RenderParameters parameters{};
+
+
+        //cuda loop
+        bool stop_cuda=false;
+        std::thread cuda_loop([&]()
+        {
+            while (!stop_cuda)
+            {
+                raytracer->draw_frame(parameters);
+            }
+        });
+
+
+        vkbase::addBeforeSubmitCallback([](uint32_t image_id)
+        {
+            auto dependencies=raytracer->swap_chain.swap();
+            for (auto wp:dependencies)
+                vkbase::addNextSubmitWait(wp);
+        },10);
 
 
         //main loop
         while (vkbase::handleEvents()&&!exitFlag)
         {
+            vkbase::info("\n\nNew frame");
+
             vkbase::drawFrame();
         }
 
-
+        stop_cuda=true;
+        cuda_loop.join();
+        raytracer=nullptr;//destroy raytracer before vkbase::destroy
         vkbase::destroy();
     }
     catch (const std::exception &e)
     {
         std::cout<< "Exception: "+ std::string(e.what());
+        return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
