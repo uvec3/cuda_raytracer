@@ -29,10 +29,6 @@ class CudaVulkanSwapChain
 
 
 
-
-
-
-
 public:
     std::vector<std::unique_ptr<ImageData>> images;
 
@@ -125,10 +121,10 @@ public:
 
 
     std::mutex image_mutex;
-    uint32_t acquireNextImage()
+    int acquireNextImage(const std::atomic<bool>& stopFlag)
     {
         auto id= 0;
-        while (true)
+        while (!stopFlag)
         {
             std::lock_guard lock(image_mutex);
             auto image=images[id].get();
@@ -144,8 +140,14 @@ public:
             id=(id+1)%images.size();
         };
 
+        return -1;
+    }
 
 
+    void cancelImage(uint32_t id)
+    {
+        std::lock_guard lock(image_mutex);
+        *images[id]->state=ImageState::ReadyForDraw;
     }
 
     vkbase::cuda::Image& getImage(uint32_t id)
@@ -229,7 +231,7 @@ public:
 
                     vkbase::info(std::format("{} Recreated {}",vkbase::sys::getMilliseconds(),currently_presented));
 
-                    auto lastFrameToken=vkbase::getPreviousFrameWaitToken();
+                    auto lastFrameToken=vkbase::getThisFrameWaitToken();
                     vkbase::doAfter(lastFrameToken,[old_image=std::move(old_image),id=currently_presented]()mutable
                     {
                         vkbase::info(std::format("{} Destroyed: {}",vkbase::sys::getMilliseconds(),id));
@@ -237,25 +239,23 @@ public:
                 }
                 else
                 {
-                    auto image_is_free= img.transfer_Optimal_to_General.submit_async(
-                        {vkbase::WaitPoint{vkbase::getPreviousFrameWaitToken(),VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}});
+                    *img.state=ImageState::ReadyForDraw;
 
-
-                    std::thread returnImageStatus([image_is_free,&img,id=currently_presented]()
-                    {
-                        vkbase::info(std::format("{} Scheduled for Release: {} frame value={}",vkbase::sys::getMilliseconds(),id,image_is_free.value));
-                        image_is_free.wait();
-
-                        *img.state=ImageState::ReadyForDraw;
-                        vkbase::info(std::format("{} Released: {}",vkbase::sys::getMilliseconds(),id));
-                    });
-                    returnImageStatus.detach();
+                    // std::thread returnImageStatus([image_is_free,&img,id=currently_presented]()
+                    // {
+                    //     vkbase::info(std::format("{} Scheduled for Release: {} frame value={}",vkbase::sys::getMilliseconds(),id,image_is_free.value));
+                    //     image_is_free.wait();
+                    //
+                    //
+                    //     vkbase::info(std::format("{} Released: {}",vkbase::sys::getMilliseconds(),id));
+                    // });
+                    // returnImageStatus.detach();
                 }
             }
 
             currently_presented=image_id;
             vkbase::info(std::format("{} : currently_presented={}",vkbase::sys::getMilliseconds(),currently_presented));
-            return {vkbase::WaitPoint{newImageReady,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}};
+            return {};
         }
         printImageStates();
 
@@ -269,6 +269,16 @@ public:
             return  nullptr;
         vkbase::info(std::format("{} : Requested {}",vkbase::sys::getMilliseconds(),currently_presented));
         return images[currently_presented].get();
+    }
+
+    uint32_t get_width() const
+    {
+        return m_width;
+    }
+
+    uint32_t get_height() const
+    {
+        return m_height;
     }
 };
 

@@ -11,6 +11,7 @@ add_executable(Raytracer main.cpp
         src/kernels/kernel.h)
 
 
+set(ASSETS  ${CMAKE_CURRENT_SOURCE_DIR}/assets/Scenes ${CMAKE_CURRENT_SOURCE_DIR}/assets/Fonts)
 
 add_subdirectory(vkbase)
 
