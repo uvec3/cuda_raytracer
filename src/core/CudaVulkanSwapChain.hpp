@@ -1,6 +1,7 @@
 #pragma once
 #include <vkbase_core.hpp>
-
+#include "../../vkbase/extensions/cuda/Image.hpp"
+#include "../../vkbase/extensions/imgui/imgui.hpp"
 
 enum class ImageState
 {
@@ -22,9 +23,6 @@ class CudaVulkanSwapChain
         vkbase::cuda::Image image;
         std::unique_ptr<std::atomic<ImageState>> state;
         vkbase::imgui::Image image_imgui;
-
-        vkbase::CommandBufferGraphics transfer_General_to_Optimal;
-        vkbase::CommandBufferGraphics transfer_Optimal_to_General;
     };
 
 
@@ -101,8 +99,7 @@ public:
             cb_optimal_to_general.end();
 
         return ImageData{
-            std::move(image),std::move(state),std::move(imgui_image),std::move(cb_general_to_optimal),
-            std::move(cb_optimal_to_general)
+            std::move(image),std::move(state),std::move(imgui_image)
         };
     }
 
@@ -131,7 +128,7 @@ public:
             if (image!=nullptr && image->state->load()==ImageState::ReadyForDraw)
             {
                 *images[id]->state=ImageState::Draw;
-                vkbase::info(std::format("      {} Acquired image {} ",vkbase::sys::getMilliseconds(),id));
+                // vkbase::info(std::format("      {} Acquired image {} ",vkbase::sys::getMilliseconds(),id));
                 return id;
             }
 
@@ -160,7 +157,7 @@ public:
     void present(uint32_t image_id)
     {
         std::lock_guard lock(image_mutex);
-        vkbase::info(std::format("      {} Mark image {} for present ",vkbase::sys::getMilliseconds(),image_id));
+        // vkbase::info(std::format("      {} Mark image {} for present ",vkbase::sys::getMilliseconds(),image_id));
         *images[image_id]->state=ImageState::ReadyToPresent;
         last_drawn_image = image_id;
         present_flag=true;
@@ -192,7 +189,7 @@ public:
     std::vector<vkbase::WaitPoint> swap()
     {
         std::lock_guard lock(image_mutex);
-        printImageStates();
+        // printImageStates();
 
         if (present_flag)
         {
@@ -215,10 +212,9 @@ public:
                 }
             }
 
-            vkbase::info(std::format("{} Swapped old: {} new: {}",vkbase::sys::getMilliseconds(),currently_presented,image_id));
+            // vkbase::info(std::format("{} Swapped old: {} new: {}",vkbase::sys::getMilliseconds(),currently_presented,image_id));
 
 
-            auto newImageReady=newImage->transfer_General_to_Optimal.submit_async();
 
             //exclude first swap when there is no old image
             if (currently_presented>=0)
@@ -229,12 +225,12 @@ public:
                     auto old_image=std::move(images[currently_presented]);
                     images[currently_presented] = std::make_unique<ImageData>(createImage(m_width,m_height));
 
-                    vkbase::info(std::format("{} Recreated {}",vkbase::sys::getMilliseconds(),currently_presented));
+                    // vkbase::info(std::format("{} Recreated {}",vkbase::sys::getMilliseconds(),currently_presented));
 
                     auto lastFrameToken=vkbase::getThisFrameWaitToken();
                     vkbase::doAfter(lastFrameToken,[old_image=std::move(old_image),id=currently_presented]()mutable
                     {
-                        vkbase::info(std::format("{} Destroyed: {}",vkbase::sys::getMilliseconds(),id));
+                        // vkbase::info(std::format("{} Destroyed: {}",vkbase::sys::getMilliseconds(),id));
                     });
                 }
                 else
@@ -254,10 +250,10 @@ public:
             }
 
             currently_presented=image_id;
-            vkbase::info(std::format("{} : currently_presented={}",vkbase::sys::getMilliseconds(),currently_presented));
+            // vkbase::info(std::format("{} : currently_presented={}",vkbase::sys::getMilliseconds(),currently_presented));
             return {};
         }
-        printImageStates();
+        // printImageStates();
 
         return {};
     }
@@ -267,7 +263,7 @@ public:
         std::lock_guard lock(image_mutex);
         if (currently_presented==-1)
             return  nullptr;
-        vkbase::info(std::format("{} : Requested {}",vkbase::sys::getMilliseconds(),currently_presented));
+        // vkbase::info(std::format("{} : Requested {}",vkbase::sys::getMilliseconds(),currently_presented));
         return images[currently_presented].get();
     }
 
