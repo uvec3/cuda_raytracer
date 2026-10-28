@@ -6,7 +6,7 @@ enable_testing()
 
 add_executable(soa_test soa_test.cu
         ../external/OffsetAllocator/offsetAllocator.hpp ../external/OffsetAllocator/offsetAllocator.cpp
-        ../src/soa/LogicalAllocatorOffset.hpp ../src/soa/LogicalAllocatorOffset.cpp)
+        ../src/pool/LogicalAllocatorOffset.hpp ../src/pool/LogicalAllocatorOffset.cpp)
 
 set_target_properties(soa_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON )
 target_link_libraries(soa_test PRIVATE gtest_main Boost::pfr)
@@ -23,14 +23,14 @@ add_executable(scene_test scene_test.cpp
         ../external/tinygltf.cpp ../external/tiny_gltf_v3.h
         ../external/stb_image.cpp ../external/stb_image.h
         ../external/OffsetAllocator/offsetAllocator.hpp ../external/OffsetAllocator/offsetAllocator.cpp
-        ../src/soa/LogicalAllocatorOffset.hpp ../src/soa/LogicalAllocatorOffset.cpp)
+        ../src/pool/LogicalAllocatorOffset.hpp ../src/pool/LogicalAllocatorOffset.cpp)
 set_target_properties(scene_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON )
 target_link_libraries(scene_test PRIVATE vkbase::assets glm::glm gtest_main Boost::pfr vkbase::cuda)
 
 
 add_executable(allocation allocation.cpp
-        ../src/soa/LogicalAllocator.hpp ../src/soa/LogicalAllocator.cpp
+        ../src/pool/LogicalAllocator.hpp ../src/pool/LogicalAllocator.cpp
         ../external/OffsetAllocator/offsetAllocator.hpp ../external/OffsetAllocator/offsetAllocator.cpp
-        ../src/soa/LogicalAllocatorOffset.hpp ../src/soa/LogicalAllocatorOffset.cpp
+        ../src/pool/LogicalAllocatorOffset.hpp ../src/pool/LogicalAllocatorOffset.cpp
             )
 target_link_libraries(allocation PRIVATE gtest_main)

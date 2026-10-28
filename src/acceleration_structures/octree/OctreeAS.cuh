@@ -2,7 +2,7 @@
 
 #include <span>
 #include "../../types.hpp"
-#include "../../soa/src/soa_pool_cuda.hpp"
+#include "../../pool/soa_pool_cuda.hpp"
 #include "../../geometry_common.cuh"
 #include "OctreeGeometry.cuh"
 #include "../as_concept.cuh"

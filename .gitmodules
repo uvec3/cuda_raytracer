@@ -1,3 +1,6 @@
 [submodule "vkbase"]
 	path = vkbase
 	url = https://github.com/uvec3/vkbase
+[submodule "external/soa_vector"]
+	path = external/soa_vector
+	url = https://github.com/uvec3/soa_vector

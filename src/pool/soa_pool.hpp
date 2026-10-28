@@ -1,8 +1,8 @@
 #pragma once
 
 #include <algorithm>
-#include "soa_vector.hpp"
-#include "../LogicalAllocatorOffset.hpp"
+#include "../../external/soa_vector/src/soa_vector.hpp"
+#include "LogicalAllocatorOffset.hpp"
 
 template<typename TReference, typename Allocator=soa::DefaultAllocator,int MULT=2>
 class soa_pool: public soa::soa_vector<TReference,Allocator>

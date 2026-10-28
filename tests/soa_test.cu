@@ -4,7 +4,7 @@
 #include <algorithm>
 #include "../src/cuda_common.hpp"
 #include "../src/soa_cuda.cuh"
-#include "../src/soa/src/soa_pool.hpp"
+#include "../src/pool/soa_pool.hpp"
 
 
 struct View

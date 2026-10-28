@@ -4,11 +4,11 @@
 
 #include "../types.hpp"
 #include "../types.cuh"
-#include "../soa/src/soa_cuda.hpp"
+#include "../../external/soa_vector/src/soa_cuda.hpp"
 
 #include "../../external/tiny_gltf_v3.h"
 #include "../../external/stb_image.h"
-#include "../soa/src/soa_pool_cuda.hpp"
+#include "../pool/soa_pool_cuda.hpp"
 #include "../acceleration_structures/octree/OctreeAS.cuh"
 #include "glm/detail/type_quat.hpp"
 #include "glm/gtc/quaternion.hpp"

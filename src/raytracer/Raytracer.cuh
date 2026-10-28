@@ -4,7 +4,7 @@
 #include "rt_kernels.cuh"
 #include "Scene.hpp"
 #include "../acceleration_structures/octree/OctreeAS.cuh"
-#include "../soa/src/soa_vector.hpp"
+#include "../../external/soa_vector/src/soa_vector.hpp"
 #include "../types.hpp"
 
 __host__ __device__

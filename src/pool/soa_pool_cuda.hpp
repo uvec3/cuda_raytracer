@@ -1,6 +1,6 @@
 #pragma once
-#include "soa_cuda.hpp"
 #include "soa_pool.hpp"
+#include "../../external/soa_vector/src/soa_cuda.hpp"
 
 namespace soa
 {

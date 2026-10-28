@@ -1,5 +1,5 @@
 #pragma once
-#include "../soa/src/soa_vector.hpp"
+#include "../../external/soa_vector/src/soa_vector.hpp"
 #include <glm/glm.hpp>
 #include "../types.hpp"
 

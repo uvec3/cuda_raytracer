@@ -12,8 +12,8 @@
 
 #include <glm/glm.hpp>
 #include "imgui.h"
-#include "../soa/src/soa_vector.hpp"
-#include "../soa/src/soa_pool.hpp"
+// #include "../../external/soa_vector/src/soa_vector.hpp"
+#include "../pool/soa_pool.hpp"
 
 namespace soa_ui_detail
 {
@@ -255,7 +255,7 @@ public:
                         ImGui::PopID();
                     };
                     auto ref=m_soa.view()[0];
-                    iterate_struct_recursive(callback,ref);
+                    soa::iterate_struct_recursive(callback,ref);
                     ImGui::PopID();
                 }
             }
