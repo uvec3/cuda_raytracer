@@ -4,29 +4,28 @@
 #include "../../external/soa_vector/src/soa_vector.hpp"
 #include "LogicalAllocatorOffset.hpp"
 
-template<typename TReference, typename Allocator=soa::DefaultAllocator,int MULT=2>
-class soa_pool: public soa::soa_vector<TReference,Allocator>
+template<typename Super ,int MULT=2>
+class soa_pool_generic: public Super
 {
-    using Super=soa::soa_vector<TReference,Allocator>;
     LogicalAllocatorOffset l_allocator;
 
 public:
-
-    soa_pool(size_t size = 0,Allocator&& allocator=Allocator{}):Super(size,std::move(allocator)),
+    using Allocator = typename Super::allocator_type;
+    soa_pool_generic(size_t size = 0,Allocator&& allocator=Allocator{}):Super(size,std::move(allocator)),
     l_allocator(size)
     {
         l_allocator.set_resize_callback([this](auto new_size){resize(new_size*MULT);});
     }
 
-    soa_pool(const soa_pool&) = delete;
-    soa_pool& operator=(const soa_pool&) = delete;
+    soa_pool_generic(const soa_pool_generic&) = delete;
+    soa_pool_generic& operator=(const soa_pool_generic&) = delete;
     bool is_allocated(uint32_t uint32)
     {
         return  true;
     }
 
-    soa_pool(soa_pool&&) = default;
-    soa_pool& operator=(soa_pool&&) = default;
+    soa_pool_generic(soa_pool_generic&&) = default;
+    soa_pool_generic& operator=(soa_pool_generic&&) = default;
 
 
 
@@ -95,7 +94,9 @@ public:
         return l_allocator.used_size();
     }
 
-
 private:
     using Super::allocate;
 };
+
+template<typename TReference>
+using soa_pool=soa_pool_generic<soa::soa_vector<TReference>>;

@@ -262,12 +262,12 @@ uint32_t deinterleave_left(uint64_t x)
     return x2.m_lo;
 }
 
-__device__ __host__ __forceinline__ uint64_t spread_left_aligned(uint32_t val) {
-    // 1. Push the packed bits back to the top of the 64-bit integer
-    // (They return to bits 63 down to 42)
+__device__ __host__ __forceinline__ uint64_t spread_left_aligned(uint32_t val)
+{
+
     uint64_t x = static_cast<uint64_t>(val) << 32;
 
-    // 2. Spread the bits rightwards using your EXACT masks in reverse order
+    // 2. Spread the bits rightwards
     x = (x | (x >> 32)) & 0xFFFF00000000FFFFULL;
     x = (x | (x >> 16)) & 0xFF0000FF0000FF00ULL;
     x = (x | (x >>  8)) & 0xF00F00F00F00F00FULL;

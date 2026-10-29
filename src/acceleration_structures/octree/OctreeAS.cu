@@ -19,7 +19,11 @@ OctreeAS::OctreeAS()
 {
     //reserve element 0 for empty value and don't use it
     as.alloc(1);
+    as[0].child = 0;
+    as[0].parent = 0;
+    as[0].space_id = 0;
     box_content.alloc(1);
+    sync_to_device();
 }
 
 uint32_t OctreeAS::create_space()
@@ -40,6 +44,8 @@ uint32_t OctreeAS::create_space()
     new_space.vertices_size =0;
     new_space.normalization_scale =glm::vec3(1);
     new_space.normalization_translate =glm::vec3(0);
+
+    sync_to_device();
 
     return new_space_id;
 }
@@ -146,7 +152,7 @@ void OctreeAS::add_box_contents(InsertionContext& ic, uint32_t box_id, Primitive
 
 void OctreeAS::normalize_space(uint32_t space_id,bool stretch)
 {
-    auto vertices_start = &vertices[spaces[space_id].vertices_start].position;
+    auto vertices_start = &d_vertices[spaces[space_id].vertices_start].position;
     auto vertices_size = spaces[space_id].vertices_size;
 
     constexpr float inf = std::numeric_limits<float>::infinity();
@@ -319,22 +325,32 @@ void OctreeAS::insert_triangles(uint32_t space_id, uint32_t triangle_first, uint
     static constexpr uint32_t block_size=128;
     uint32_t number_of_blocks= (number_of_triangles-1) / block_size + 1;
 
-    soa::cuda_unified_vector<TriangleNumberId> number_id(number_of_triangles*100);
+    soa::cuda_device_vector<TriangleNumberId> d_number_id(number_of_triangles*100);
 
-    uint32_t* result_size;cudaMallocManaged(&result_size,sizeof(uint32_t));
-    *result_size=0;
+    uint32_t* d_result_size = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_result_size, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_result_size, 0, sizeof(uint32_t)));
 
-    evaluate_triangle_box<<<number_of_blocks,block_size>>>(triangles.view(),vertices.view(),triangle_first,
-       number_of_triangles,number_id.view(),result_size,depth_min,depth_max,triangle_box_stop_ratio);
+    evaluate_triangle_box<<<number_of_blocks,block_size>>>(d_triangles.view(),d_vertices.view(),triangle_first,
+       number_of_triangles,d_number_id.view(),d_result_size,depth_min,depth_max,triangle_box_stop_ratio);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    printf("\n\nElemetnts: %d\n",*result_size);
+    uint32_t result_size = 0;
+    CUDA_CHECK(cudaMemcpy(&result_size, d_result_size, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_result_size));
 
-    thrust::sort_by_key(&number_id[0].number,&number_id[0].number + *result_size,&number_id[0].id);
+    printf("\n\nElemetnts: %d\n", result_size);
+
+    thrust::sort_by_key(thrust::device, &d_number_id[0].number, &d_number_id[0].number + result_size, &d_number_id[0].id);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    printf("\n\nElemetnts: %d\n",*result_size);
+    printf("\n\nElemetnts: %d\n", result_size);
     printf("Nubmer of triangles: %d\n",number_of_triangles);
+
+    d_number_id.resize(result_size);
+    soa::soa_vector<TriangleNumberId> number_id = d_number_id;
+    d_number_id.clear();
+    d_number_id.shrink_to_fit();
     
     InsertionContext insertion_context;
     insertion_context.num_id=number_id;
@@ -347,7 +363,7 @@ void OctreeAS::insert_triangles(uint32_t space_id, uint32_t triangle_first, uint
     insertion_context.__as[0].space_id=space_id;
     insertion_context.__as[0].parent=0;
 
-    insert_triangles_recursive(0, BoxStack{}, insertion_context,0,*result_size, {});
+    insert_triangles_recursive(0, BoxStack{}, insertion_context,0,result_size, {});
 
 
     auto as_start=as.alloc(insertion_context.__as.size());
@@ -382,8 +398,6 @@ void OctreeAS::insert_triangles(uint32_t space_id, uint32_t triangle_first, uint
     {
         primitives[primitives_start+i]=insertion_context.__primitives[i];
     }
-
-    cudaFree(result_size);
 }
 
 
@@ -414,7 +428,7 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
                 auto v1=vertices[triangles[t_id].v2].position;
                 auto v2=vertices[triangles[t_id].v3].position;
                 auto rel=find_triangle_cube_relation_precise(stack.get_center(),stack.half_box_size(),v0,v1,v2);
-                if (true)
+                if (rel!=TriangleCubeRelation::Outside)
                 {
                     additional_unsorted_triangles.push_back(t_id);
                 }
@@ -512,4 +526,46 @@ void OctreeAS::free_box_content(int box_id)
     }
 }
 
+void OctreeAS::sort_space(uint32_t space_id)
+{
+    auto triangles_start=spaces[space_id].first_triangle;
+    auto triangles_size=spaces[space_id].number_of_triangles;
+    if (triangles_size == 0 || spaces[space_id].vertices_size == 0)
+        return;
 
+    thrust::device_vector<uint64_t> morton_codes(triangles_size,thrust::no_init);
+    calculate_morton_codes<<<(triangles_size-1)/128+1,128>>>(&d_vertices[0].position,&d_triangles[triangles_start].v1,
+        &d_triangles[triangles_start].v2,&d_triangles[triangles_start].v3,morton_codes.data().get(),triangles_size);
+    thrust::sort_by_key(thrust::device,morton_codes.begin(), morton_codes.end(),thrust::make_zip_iterator(d_triangles.get_tuple(triangles_start)));
+
+    //free memory
+    morton_codes.resize(0);morton_codes.shrink_to_fit();
+
+    auto vertices_start=spaces[space_id].vertices_start;
+    auto vertices_size=spaces[space_id].vertices_size;
+
+
+   auto map=sort_by_first_appearance_in_lists({&d_triangles[triangles_start].v1,&d_triangles[triangles_start].v2,&d_triangles[triangles_start].v3},
+       triangles_size, vertices_start,vertices_size,
+       thrust::make_zip_iterator(d_vertices.get_tuple(vertices_start)));
+
+
+    auto begin=&d_triangles[triangles_start].v1;
+    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
+    {
+        return map[v-vertices_start];
+    });
+
+    begin=&d_triangles[triangles_start].v2;
+    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
+    {
+        return map[v-vertices_start];
+    });
+
+    begin=&d_triangles[triangles_start].v3;
+    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
+    {
+        return map[v-vertices_start];
+    });
+
+}

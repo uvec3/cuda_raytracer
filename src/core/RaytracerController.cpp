@@ -444,8 +444,6 @@ bool RaytracerController::ui_scenes_manager()
                 }
             }
 
-
-
             ImGui::InputInt("Min depth",&min_depth,1);
             ImGui::InputInt("Max depth",&max_depth,1);
             ImGui::InputFloat("Triangle to box stop ratio",&triangle_to_box_stop_ratio,0.1);
@@ -480,9 +478,9 @@ void RaytracerController::next_frame()
 
 
     device_data_mutex.lock();
-    CUDA_CHECK(cudaEventRecord(start));
+
     draw_cuda(image.cuda_surface,image.width,image.height);
-    CUDA_CHECK(cudaEventRecord(finish));
+
 
     //HOST WAIT
     CUDA_CHECK(cudaEventSynchronize(finish));

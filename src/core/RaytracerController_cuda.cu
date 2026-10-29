@@ -68,7 +68,10 @@ void RaytracerController::draw_cuda(cudaSurfaceObject_t surface, uint32_t width,
     //lock access to the parameters
     std::lock_guard lock(ui_mutex);
     auto& scene=scenes[active_scene_number].scene;
+
+    CUDA_CHECK(cudaEventRecord(start));
     raytracer->draw(*scene,surface,width, height);
+    CUDA_CHECK(cudaEventRecord(finish));
 }
 
 
@@ -147,7 +150,13 @@ bool RaytracerController::ui_debug_pixel()
             {
                 auto& scene=scenes[active_scene_number].scene;
                 raytracer->update_parameters(*scene,current_image_size.x, current_image_size.y);
-                debug_pixel_result=draw_pixel(debug_pixel.x,debug_pixel.y,raytracer->parameters);
+                RenderParameters host_params = raytracer->parameters;
+                host_params.vertices = scene->as.vertices.view();
+                host_params.triangles = scene->as.triangles.view();
+                host_params.as = scene->as.as.view();
+                host_params.containers = scene->as.box_content.view();
+                host_params.primitives = scene->as.primitives.view();
+                debug_pixel_result=draw_pixel(debug_pixel.x,debug_pixel.y,host_params);
             }
             device_data_mutex.unlock();
         }

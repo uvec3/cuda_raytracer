@@ -31,7 +31,7 @@ add_executable(Raytracer main.cpp
         src/raytracer/Raytracer.cu src/raytracer/Raytracer.cuh
         src/raytracer/Scene.cpp src/raytracer/Scene.hpp
         src/acceleration_structures/octree/OctreeAS.cu src/acceleration_structures/octree/OctreeAS.cuh src/acceleration_structures/octree/OctreeGeometry.cuh
-        src/ui_helpers/soa_ui_view.cpp src/ui_helpers/soa_ui_view.hpp
+        src/ui_helpers/soa_ui_view.hpp
 
         external/tinygltf.cpp external/tiny_gltf_v3.h
         external/stb_image.cpp external/stb_image.h
