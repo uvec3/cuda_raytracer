@@ -11,19 +11,10 @@ if (MSVC)
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
     )
 endif()
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--threads=0>")
 
 
 set(CMAKE_CUDA_ARCHITECTURES 86)
-
-
-
-#Fetch
-include(FetchContent)
-FetchContent_Declare(
-        Boost
-        URL https://github.com/boostorg/boost/releases/download/boost-1.92.0/boost-1.92.0-cmake.tar.gz
-)
-FetchContent_MakeAvailable(Boost)
 
 
 add_executable(Raytracer main.cpp
@@ -39,10 +30,9 @@ add_executable(Raytracer main.cpp
 )
 
 
-
-set(ASSETS  ${CMAKE_CURRENT_SOURCE_DIR}/assets/Scenes ${CMAKE_CURRENT_SOURCE_DIR}/assets/Fonts)
-
+set(VKBASE_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/assets/Scenes ${CMAKE_CURRENT_SOURCE_DIR}/assets/Fonts)
 add_subdirectory(vkbase)
+vkbase_target_copy_assets(Raytracer)
 
 target_link_libraries(Raytracer
         vkbase::core
@@ -56,9 +46,6 @@ target_link_libraries(Raytracer
         vkbase::buffer
         vkbase::image
         vkbase::cuda
-
-        Boost::headers Boost::pfr
-
 )
 
 add_subdirectory(tests)

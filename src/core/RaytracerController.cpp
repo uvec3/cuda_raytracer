@@ -1,5 +1,7 @@
 #include "RaytracerController.hpp"
 
+#include "../raytracer/Scene.hpp"
+#include "../ui_helpers/soa_ui_view.hpp"
 #include <cuda_profiler_api.h>
 #include <numeric>
 #include <vkbase_core.hpp>
@@ -10,6 +12,11 @@
 #include "../cuda_common.hpp"
 #include "../../vkbase/extensions/Assets/assets.h"
 #include <ranges>
+
+SceneData::SceneData() = default;
+SceneData::~SceneData() = default;
+SceneData::SceneData(SceneData&&) noexcept = default;
+SceneData& SceneData::operator=(SceneData&&) noexcept = default;
 
 
 RaytracerController::RaytracerController()

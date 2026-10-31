@@ -2,10 +2,10 @@
 #include <chrono>
 
 #include "rt_kernels.cuh"
-#include "Scene.hpp"
-#include "../acceleration_structures/octree/OctreeAS.cuh"
 #include "../../external/soa_vector/src/soa_vector.hpp"
 #include "../types.hpp"
+
+class Scene;
 
 __host__ __device__
 glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p);

@@ -4,7 +4,6 @@
 #define GLM_FORCE_PURE
 #include <glm/glm.hpp>
 #include <cstdint>
-#include <format>
 
 #undef min
 #undef max
@@ -464,9 +463,9 @@ struct BoxStack
         printf("Center=(%f, %f, %f)   ",center.x, center.y, center.z);
         printf("Is invalid: %s    ",is_invalid()?"True":"False");
         printf("Is outside: %s    ",is_outside()?"True":"False");
-        printf("bits: %s    ",std::format("{:b}", m_data).c_str() );
-        printf("begin: %s    ",std::format("{:b}", begin()).c_str() );
-        printf("end: %s    ",std::format("{:b}", end()).c_str() );
+        // printf("bits: %s    ",std::format("{:b}", m_data).c_str() );
+        // printf("begin: %s    ",std::format("{:b}", begin()).c_str() );
+        // printf("end: %s    ",std::format("{:b}", end()).c_str() );
 
         printf("Stack: ");
 

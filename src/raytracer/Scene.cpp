@@ -1,7 +1,33 @@
 #include "glm/glm.hpp"
 #include "Scene.hpp"
 #include "../../external/tiny_gltf_v3.h"
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/matrix_decompose.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+
+glm::mat4 Node::getTransform()
+{
+    if (m_dirty)
+    {
+        // recalculate the local transform matrix
+        glm::mat4 matTranslate = glm::translate(glm::mat4(1), m_translation);
+        glm::mat4 matRotate = glm::mat4_cast(m_rotation);
+        glm::mat4 matScale = glm::scale(glm::mat4(1), m_scale);
+        m_transform = matTranslate * matRotate * matScale;
+        m_dirty = false;
+    }
+    return m_transform;
+}
+
+void Node::setTransform(glm::mat4 &transform)
+{
+    glm::vec3 skew;
+    glm::vec4 perspective;
+    glm::decompose(transform, m_scale, m_rotation, m_translation, skew, perspective);
+    m_transform = transform;
+    m_dirty = false;
+}
 
 
 

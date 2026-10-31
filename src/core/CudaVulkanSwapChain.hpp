@@ -23,6 +23,7 @@ class CudaVulkanSwapChain
         vkbase::cuda::Image image;
         std::unique_ptr<std::atomic<ImageState>> state;
         vkbase::imgui::Image image_imgui;
+        vkbase::WaitToken wait_token;
     };
 
 
@@ -32,6 +33,7 @@ public:
 
     int currently_presented=-1;
     int last_drawn_image=0;
+    int next_acquire_id=0;
     bool  present_flag=false;
 
     ImageData createImage(uint32_t width, uint32_t height)
@@ -120,22 +122,25 @@ public:
     std::mutex image_mutex;
     int acquireNextImage(const std::atomic<bool>& stopFlag)
     {
-        auto id= 0;
         while (!stopFlag)
         {
-            std::lock_guard lock(image_mutex);
-            auto image=images[id].get();
-            if (image!=nullptr && image->state->load()==ImageState::ReadyForDraw)
             {
-                *images[id]->state=ImageState::Draw;
-                // vkbase::info(std::format("      {} Acquired image {} ",vkbase::sys::getMilliseconds(),id));
-                return id;
+                std::lock_guard lock(image_mutex);
+                for (size_t i = 0; i < images.size(); ++i)
+                {
+                    int id = (next_acquire_id + i) % images.size();
+                    auto image = images[id].get();
+                    if (image != nullptr && image->state->load() == ImageState::ReadyForDraw && image->wait_token.wait(0))
+                    {
+                        *image->state = ImageState::Draw;
+                        next_acquire_id = (id + 1) % images.size();
+                        // vkbase::info(std::format("      {} Acquired image {} ",vkbase::sys::getMilliseconds(),id));
+                        return id;
+                    }
+                }
             }
-
-
-
-            id=(id+1)%images.size();
-        };
+            std::this_thread::yield();
+        }
 
         return -1;
     }
@@ -158,6 +163,11 @@ public:
     {
         std::lock_guard lock(image_mutex);
         // vkbase::info(std::format("      {} Mark image {} for present ",vkbase::sys::getMilliseconds(),image_id));
+        if (present_flag && last_drawn_image != static_cast<int>(image_id) &&
+            images[last_drawn_image]->state->load() == ImageState::ReadyToPresent)
+        {
+            *images[last_drawn_image]->state = ImageState::ReadyForDraw;
+        }
         *images[image_id]->state=ImageState::ReadyToPresent;
         last_drawn_image = image_id;
         present_flag=true;
@@ -205,7 +215,7 @@ public:
                     {
                         *img->state=ImageState::Present;
                     }
-                    else//in case more than one image was rendered by this time set them free
+                    else
                     {
                         *img->state=ImageState::ReadyForDraw;
                     }
@@ -220,6 +230,7 @@ public:
             if (currently_presented>=0)
             {
                 auto& img=*images[currently_presented];
+                auto lastFrameToken=vkbase::getPreviousFrameWaitToken();
                 if (img.image.width!=m_width||img.image.height!=m_height)
                 {
                     auto old_image=std::move(images[currently_presented]);
@@ -227,7 +238,7 @@ public:
 
                     // vkbase::info(std::format("{} Recreated {}",vkbase::sys::getMilliseconds(),currently_presented));
 
-                    auto lastFrameToken=vkbase::getThisFrameWaitToken();
+
                     vkbase::doAfter(lastFrameToken,[old_image=std::move(old_image),id=currently_presented]()mutable
                     {
                         // vkbase::info(std::format("{} Destroyed: {}",vkbase::sys::getMilliseconds(),id));
@@ -235,6 +246,7 @@ public:
                 }
                 else
                 {
+                    img.wait_token=lastFrameToken;
                     *img.state=ImageState::ReadyForDraw;
 
                     // std::thread returnImageStatus([image_is_free,&img,id=currently_presented]()
@@ -277,5 +289,3 @@ public:
         return m_height;
     }
 };
-
-

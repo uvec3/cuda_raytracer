@@ -15,7 +15,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** args)
         vkbase::cuda::init();
 
         //target image count
-        vkbase::imageCount=2;
+        vkbase::config.min_img_in_swapchain=2;
+        vkbase::config.preferred_present_mode=VK_PRESENT_MODE_IMMEDIATE_KHR;
         vkbase::sys::fullscreen(true);
         vkbase::init("Raytracer");//init engine
         vkbase::imgui::initIMGUI();//init imgui

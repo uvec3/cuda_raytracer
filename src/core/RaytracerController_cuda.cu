@@ -1,5 +1,6 @@
 #include "RaytracerController.hpp"
 #include "../raytracer/Raytracer.cuh"
+#include "../raytracer/Scene.hpp"
 #include  <imgui.h>
 #include <cuda_profiler_api.h>
 #include "../cuda_common.hpp"
@@ -101,7 +102,16 @@ void RaytracerController::ui_surface_input()
             debug_pixel={pos.x-corner.x,pos.y-corner.y};
         }
 
-        p.near_+=io.MouseWheel*0.01f;
+        if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))
+        {
+            p.near_+=io.MouseWheel*0.01f;
+        }
+        else
+        {
+            movement_speed+=movement_speed*io.MouseWheel*0.1;
+            if (movement_speed<0.000001)
+                movement_speed=0.000001;
+        }
     }
 
 
@@ -131,7 +141,7 @@ void RaytracerController::ui_surface_input()
         auto cos_az=cos(p.az);
 
         move={ move.x*cos_az-move.y*sin_az, move.x*sin_az+move.y*cos_az, move.z};
-        p.view_pos+=move*speed*dt;
+        p.view_pos+=move*speed*movement_speed*dt;
     }
 }
 

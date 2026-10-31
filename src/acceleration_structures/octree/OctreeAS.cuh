@@ -7,7 +7,6 @@
 #include "OctreeGeometry.cuh"
 #include "../as_concept.cuh"
 #include "../../concepts.hpp"
-#include "../../geometry_common.cuh"
 
 struct InsertionContext;
 struct Mesh;

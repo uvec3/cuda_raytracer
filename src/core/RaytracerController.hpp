@@ -1,13 +1,16 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
-#include<mutex>
+#include <mutex>
 #include <functional>
 #include <map>
-
-#include "../raytracer/Scene.hpp"
-#include "../ui_helpers/soa_ui_view.hpp"
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+#include <glm/glm.hpp>
 
 #include "../../vkbase/extensions/cuda/cuda.hpp"
 
@@ -21,6 +24,8 @@ struct WindowInfo
 
 class Raytracer;
 class CudaVulkanSwapChain;
+class Scene;
+class soa_ui_table_interface;
 
 
 struct SceneData
@@ -28,6 +33,11 @@ struct SceneData
     std::unique_ptr<Scene> scene;
     std::map<std::string,std::unique_ptr<soa_ui_table_interface>> soa_tables;
     uint32_t active_space=0;
+
+    SceneData();
+    ~SceneData();
+    SceneData(SceneData&&) noexcept;
+    SceneData& operator=(SceneData&&) noexcept;
 };
 
 class RaytracerController
@@ -68,6 +78,8 @@ public:
     glm::uvec2 current_image_size{0};
 
     cudaEvent_t start, finish;
+
+    float movement_speed=1;
 
     RaytracerController();
     ~RaytracerController();
