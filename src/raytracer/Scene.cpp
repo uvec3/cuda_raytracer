@@ -29,87 +29,6 @@ void Node::setTransform(glm::mat4 &transform)
     m_dirty = false;
 }
 
-
-
-void loadMeshFromGLB(const char* filename) {
-    tg3_parse_options opts;
-    tg3_error_stack errors;
-    tg3_model model;
-
-    // 1. Initialize v3 tracking structures
-    tg3_parse_options_init(&opts);
-    tg3_error_stack_init(&errors);
-
-    // 2. Parse the file directly (handles both .gltf and .glb automatically)
-    // The "10" is the maximum parse depth allowed.
-    tg3_error_code err = tg3_parse_file(&model, &errors, filename, 10, &opts);
-
-    if (err != TG3_OK) {
-        for (uint32_t i = 0; i < errors.count; i++) {
-            fprintf(stderr, "Err [%d]: %s\n",
-                    (int)errors.entries[i].severity,
-                    errors.entries[i].message ? errors.entries[i].message : "Unknown");
-        }
-        tg3_error_stack_free(&errors);
-        return;
-    }
-
-    // 3. Iterate through all meshes using C-style counts
-    for (uint32_t m = 0; m < model.meshes_count; ++m) {
-        const tg3_mesh *mesh = &model.meshes[m];
-
-        // Strings in v3 are tg3_str (pointer + length), not null-terminated!
-        printf("Mesh: %.*s\n", mesh->name.len, mesh->name.data);
-
-        for (uint32_t p = 0; p < mesh->primitives_count; ++p) {
-            const tg3_primitive *primitive = &mesh->primitives[p];
-
-            // 4. Find the POSITION attribute (no more std::map lookups)
-            int32_t position_accessor_idx = -1;
-            for (uint32_t a = 0; a < primitive->attributes_count; ++a) {
-                const tg3_str_int_pair *attr = &primitive->attributes[a];
-
-                // Safe string comparison using the tg3_str length
-                if (attr->key.len == 8 && strncmp(attr->key.data, "POSITION", 8) == 0) {
-                    position_accessor_idx = attr->value;
-                    break;
-                }
-            }
-
-            if (position_accessor_idx >= 0) {
-
-                // 5. Follow the reference chain using integer indices
-                const tg3_accessor *accessor = &model.accessors[position_accessor_idx];
-                const tg3_buffer_view *bufferView = &model.buffer_views[accessor->buffer_view];
-                const tg3_buffer *buffer = &model.buffers[bufferView->buffer];
-
-                // Pointer math using the data span from the arena
-                const unsigned char* dataPtr = buffer->data.data + bufferView->byte_offset + accessor->byte_offset;
-
-                // Handle stride. In v3, a byte_stride of 0 means tightly packed.
-                // 3 floats (vec3) * 4 bytes = 12 bytes.
-                uint32_t stride = bufferView->byte_stride == 0 ? 12 : bufferView->byte_stride;
-
-                printf("  Vertices: %llu\n", (unsigned long long)accessor->count);
-
-                // 6. Read the data
-                uint64_t limit = accessor->count < 3 ? accessor->count : 3;
-                for (uint64_t i = 0; i < limit; ++i) {
-                    const float* position = (const float*)(dataPtr + i * stride);
-                    printf("    v[%llu]: (%f, %f, %f)\n",
-                           (unsigned long long)i, position[0], position[1], position[2]);
-                }
-            }
-        }
-    }
-
-    // 7. Free the entire arena at once
-    tg3_model_free(&model);
-    tg3_error_stack_free(&errors);
-}
-
-
-
 Scene::Scene(std::string_view name):m_name(name)
 {
     m_active_space=root_space;
@@ -123,6 +42,9 @@ void Scene::load(std::string_view data)
 
     // 1. Initialize tracking structures
     tg3_parse_options_init(&opts);
+    opts.borrow_input_buffers = 1;
+    opts.skip_extras_values = 1;
+    opts.images_as_is = 1;
     tg3_error_stack_init(&errors);
 
     // 2. Parse directly from the memory buffer
@@ -149,16 +71,14 @@ void Scene::load(std::string_view data)
     tg3_error_stack_free(&errors);
 
     m_is_loaded=true;
-
-    get_mesh_transform();
 }
 
-bool Scene::is_loaded()
+bool Scene::is_loaded() const
 {
     return m_is_loaded;
 }
 
-const std::string& Scene::get_name()
+const std::string& Scene::get_name() const
 {
     return m_name;
 }
@@ -195,80 +115,189 @@ struct SubMesh
     uint32_t materialId = 0;
 };
 
+namespace
+{
+    float readComponentAsFloat(const uint8_t* ptr, int32_t componentType, bool normalized)
+    {
+        switch (componentType)
+        {
+        case TG3_COMPONENT_TYPE_FLOAT:
+            return *reinterpret_cast<const float*>(ptr);
+        case TG3_COMPONENT_TYPE_DOUBLE:
+            return static_cast<float>(*reinterpret_cast<const double*>(ptr));
+        case TG3_COMPONENT_TYPE_BYTE:
+        {
+            const int8_t v = *reinterpret_cast<const int8_t*>(ptr);
+            return normalized ? std::max(static_cast<float>(v) / 127.0f, -1.0f) : static_cast<float>(v);
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
+        {
+            const uint8_t v = *reinterpret_cast<const uint8_t*>(ptr);
+            return normalized ? static_cast<float>(v) / 255.0f : static_cast<float>(v);
+        }
+        case TG3_COMPONENT_TYPE_SHORT:
+        {
+            const int16_t v = *reinterpret_cast<const int16_t*>(ptr);
+            return normalized ? std::max(static_cast<float>(v) / 32767.0f, -1.0f) : static_cast<float>(v);
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+        {
+            const uint16_t v = *reinterpret_cast<const uint16_t*>(ptr);
+            return normalized ? static_cast<float>(v) / 65535.0f : static_cast<float>(v);
+        }
+        case TG3_COMPONENT_TYPE_INT:
+        {
+            const int32_t v = *reinterpret_cast<const int32_t*>(ptr);
+            return normalized ? std::max(static_cast<float>(static_cast<double>(v) / 2147483647.0), -1.0f) : static_cast<float>(v);
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+        {
+            const uint32_t v = *reinterpret_cast<const uint32_t*>(ptr);
+            return normalized ? static_cast<float>(static_cast<double>(v) / 4294967295.0) : static_cast<float>(v);
+        }
+        default:
+            assert(false && "Unsupported TG3_COMPONENT_TYPE");
+            return 0.0f;
+        }
+    }
+
+    uint32_t readComponentAsUint32(const uint8_t* ptr, int32_t componentType)
+    {
+        switch (componentType)
+        {
+        case TG3_COMPONENT_TYPE_BYTE:
+            return static_cast<uint32_t>(*reinterpret_cast<const int8_t*>(ptr));
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
+            return static_cast<uint32_t>(*reinterpret_cast<const uint8_t*>(ptr));
+        case TG3_COMPONENT_TYPE_SHORT:
+            return static_cast<uint32_t>(*reinterpret_cast<const int16_t*>(ptr));
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+            return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(ptr));
+        case TG3_COMPONENT_TYPE_INT:
+            return static_cast<uint32_t>(*reinterpret_cast<const int32_t*>(ptr));
+        case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+            return *reinterpret_cast<const uint32_t*>(ptr);
+        case TG3_COMPONENT_TYPE_FLOAT:
+            return static_cast<uint32_t>(*reinterpret_cast<const float*>(ptr));
+        case TG3_COMPONENT_TYPE_DOUBLE:
+            return static_cast<uint32_t>(*reinterpret_cast<const double*>(ptr));
+        default:
+            assert(false && "Unsupported TG3_COMPONENT_TYPE");
+            return 0;
+        }
+    }
+} // namespace
+
 std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds)
 {
     std::vector<uint32_t> meshIds(model.meshes_count);
+    m_meshes.reserve(m_meshes.size() + model.meshes_count);
+
     // load all gltf mesh and primitive data
-    for (int i = 0; i < model.meshes_count; ++i)
+    for (uint32_t i = 0; i < model.meshes_count; ++i)
     {
         Mesh mesh;
         const tg3_mesh* tg3mesh = &model.meshes[i];
-        mesh.name = tg3mesh->name.data != nullptr ? tg3mesh->name.data : "No Name";
+        mesh.name = tg3mesh->name.data != nullptr
+            ? std::string(tg3mesh->name.data, tg3mesh->name.len)
+            : "No Name";
 
         // lambda to perform attribute data copy
-        auto writeAttribute = [this, &model,&mesh]<typename T>(T* dst, const tg3_str_int_pair* attr,uint32_t start)
+        auto writeAttribute = [&model]<typename T>(T* dst, const tg3_str_int_pair* attr, uint32_t start)
         {
             const tg3_accessor* accessor = &model.accessors[attr->value];
             const tg3_buffer_view* bufferView = &model.buffer_views[accessor->buffer_view];
             const tg3_buffer* buffer = &model.buffers[bufferView->buffer];
             const size_t bufferOffset = bufferView->byte_offset + accessor->byte_offset;
-            const size_t stride = bufferView->byte_stride != 0 ? bufferView->byte_stride : sizeof(T);
+            const int32_t compSize = tg3_component_size(accessor->component_type);
+            const int32_t numComps = tg3_num_components(accessor->type);
+            assert(compSize > 0 && numComps > 0);
+            const size_t stride = bufferView->byte_stride != 0
+                ? bufferView->byte_stride
+                : static_cast<size_t>(compSize * numComps);
+            const bool normalized = accessor->normalized != 0;
+            const uint8_t* basePtr = buffer->data.data + bufferOffset;
+
+            if constexpr (std::is_same_v<T, glm::vec3>)
+            {
+                if (accessor->component_type == TG3_COMPONENT_TYPE_FLOAT &&
+                    accessor->type == TG3_TYPE_VEC3 &&
+                    stride == sizeof(glm::vec3))
+                {
+                    memcpy(&dst[start], basePtr, accessor->count * sizeof(glm::vec3));
+                    return;
+                }
+            }
 
             for (uint64_t idx = 0; idx < accessor->count; ++idx)
             {
-                const size_t elementOffset = bufferOffset + idx * stride;
-                const float* data = reinterpret_cast<const float*>(buffer->data.data + elementOffset);
-                if constexpr (std::is_same<T, glm::vec3>())
+                const uint8_t* elemPtr = basePtr + idx * stride;
+                float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int32_t count = std::min<int32_t>(numComps, 4);
+                for (int32_t c = 0; c < count; ++c)
                 {
-                    dst[start + idx] = glm::vec3(data[0], data[1], data[2]);
+                    values[c] = readComponentAsFloat(elemPtr + c * compSize, accessor->component_type, normalized);
                 }
-                else if constexpr (std::is_same<T, glm::vec2>())
+
+                if constexpr (std::is_same_v<T, glm::vec4>)
                 {
-                    dst[start + idx] = glm::vec2(data[0], data[1]);
+                    dst[start + idx] = glm::vec4(values[0], values[1], values[2], values[3]);
+                }
+                else if constexpr (std::is_same_v<T, glm::vec3>)
+                {
+                    dst[start + idx] = glm::vec3(values[0], values[1], values[2]);
+                }
+                else if constexpr (std::is_same_v<T, glm::vec2>)
+                {
+                    dst[start + idx] = glm::vec2(values[0], values[1]);
                 }
             }
         };
 
 
         //extract submeshes
-        std::vector<SubMesh>  subMeshes;
+        std::vector<SubMesh> subMeshes(tg3mesh->primitives_count);
         std::vector<uint32_t> indices;
-        subMeshes.resize(tg3mesh->primitives_count);
-        for (int s = 0; s < tg3mesh->primitives_count; ++s)
+        for (uint32_t s = 0; s < tg3mesh->primitives_count; ++s)
         {
             const tg3_primitive* primitive = &tg3mesh->primitives[s];
-            subMeshes[s].materialId = materialIds[primitive->material];
+            if (primitive->mode != -1 && primitive->mode != TG3_MODE_TRIANGLES)
+            {
+                continue;
+            }
+
+            if (primitive->material >= 0)
+                subMeshes[s].materialId = materialIds[primitive->material];
 
 
-            for (int a = 0; a < primitive->attributes_count; ++a)
+            for (uint32_t a = 0; a < primitive->attributes_count; ++a)
             {
                 const tg3_str_int_pair* attr = &primitive->attributes[a];
-                if (strcmp(attr->key.data, "POSITION") == 0)
+                if (tg3_str_equals_cstr(attr->key, "POSITION"))
                 {
                     const tg3_accessor* accessor = &model.accessors[attr->value];
-                    assert(accessor->type == TG3_TYPE_VEC3 && accessor->component_type == TG3_COMPONENT_TYPE_FLOAT);
+                    assert(accessor->type == TG3_TYPE_VEC3 && tg3_component_size(accessor->component_type) > 0);
                     subMeshes[s].vertexCount = accessor->count;
-                    subMeshes[s].attribute_position=attr;
+                    subMeshes[s].attribute_position = attr;
                 }
-                else if (strcmp(attr->key.data, "NORMAL") == 0)
+                else if (tg3_str_equals_cstr(attr->key, "NORMAL"))
                 {
                     const tg3_accessor* accessor = &model.accessors[attr->value];
-                    assert(accessor->type == TG3_TYPE_VEC3 && accessor->component_type == TG3_COMPONENT_TYPE_FLOAT);
-                    subMeshes[s].attribute_normal=attr;
+                    assert(accessor->type == TG3_TYPE_VEC3 && tg3_component_size(accessor->component_type) > 0);
+                    subMeshes[s].attribute_normal = attr;
                 }
-                else if (strcmp(attr->key.data, "COLOR_0") == 0)
+                else if (tg3_str_equals_cstr(attr->key, "COLOR_0"))
                 {
                     const tg3_accessor* accessor = &model.accessors[attr->value];
                     assert(accessor->type == TG3_TYPE_VEC3 || accessor->type == TG3_TYPE_VEC4);
-                    assert(accessor->component_type == TG3_COMPONENT_TYPE_FLOAT);
-                    subMeshes[s].attribute_color=attr;
-
+                    assert(tg3_component_size(accessor->component_type) > 0);
+                    subMeshes[s].attribute_color = attr;
                 }
-                else if (strcmp(attr->key.data, "TEXCOORD_0") == 0)
+                else if (tg3_str_equals_cstr(attr->key, "TEXCOORD_0"))
                 {
                     const tg3_accessor* accessor = &model.accessors[attr->value];
-                    assert(accessor->type == TG3_TYPE_VEC2 && accessor->component_type == TG3_COMPONENT_TYPE_FLOAT);
-                    subMeshes[s].attribute_texcoord=attr;
+                    assert(accessor->type == TG3_TYPE_VEC2 && tg3_component_size(accessor->component_type) > 0);
+                    subMeshes[s].attribute_texcoord = attr;
                 }
             }
 
@@ -279,74 +308,96 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
                 const tg3_accessor* accessor = &model.accessors[primitive->indices];
                 const tg3_buffer_view* bufferView = &model.buffer_views[accessor->buffer_view];
                 const tg3_buffer* buffer = &model.buffers[bufferView->buffer];
-                auto start=indices.size();
-                indices.resize(start+accessor->count);
+                auto start = indices.size();
+                indices.resize(start + accessor->count);
 
                 subMeshes[s].indexStart = start;
                 subMeshes[s].indexCount = accessor->count;
 
-                if (accessor->component_type == TG3_COMPONENT_TYPE_UNSIGNED_INT)
+                const int32_t compSize = tg3_component_size(accessor->component_type);
+                assert(compSize > 0);
+                const size_t stride = bufferView->byte_stride != 0
+                    ? bufferView->byte_stride
+                    : static_cast<size_t>(compSize);
+                const uint8_t* basePtr = buffer->data.data + bufferView->byte_offset + accessor->byte_offset;
+
+                if (accessor->component_type == TG3_COMPONENT_TYPE_UNSIGNED_INT && stride == sizeof(uint32_t))
                 {
-                    const uint32_t* buffData = reinterpret_cast<const uint32_t*>(buffer->data.data + bufferView->
-                        byte_offset + accessor->byte_offset);
-                    memcpy(&indices[start], buffData, accessor->count * sizeof(uint32_t));
+                    memcpy(&indices[start], basePtr, accessor->count * sizeof(uint32_t));
                 }
-                else if (accessor->component_type == TG3_COMPONENT_TYPE_UNSIGNED_SHORT)
+                else
                 {
-                    const uint16_t* buffData = reinterpret_cast<const uint16_t*>(buffer->data.data + bufferView->
-                        byte_offset + accessor->byte_offset);
                     for (uint64_t idx = 0; idx < accessor->count; ++idx)
                     {
-                        indices[start + idx] = static_cast<uint32_t>(buffData[idx]);
+                        indices[start + idx] = readComponentAsUint32(basePtr + idx * stride, accessor->component_type);
                     }
+                }
+            }
+            else if (subMeshes[s].vertexCount > 0)
+            {
+                auto start = indices.size();
+                indices.resize(start + subMeshes[s].vertexCount);
+
+                subMeshes[s].indexStart = start;
+                subMeshes[s].indexCount = subMeshes[s].vertexCount;
+
+                for (size_t idx = 0; idx < subMeshes[s].vertexCount; ++idx)
+                {
+                    indices[start + idx] = static_cast<uint32_t>(idx);
                 }
             }
         }
 
-        uint32_t total_number_of_vertices=0;
-        for (auto& m:subMeshes)
+        uint32_t total_number_of_vertices = 0;
+        for (const auto& m : subMeshes)
         {
-            total_number_of_vertices+=m.vertexCount;
+            total_number_of_vertices += m.vertexCount;
         }
         mesh.vertices.reserve(total_number_of_vertices);
 
 
-        for (int s = 0; s < tg3mesh->primitives_count; ++s)
+        for (uint32_t s = 0; s < tg3mesh->primitives_count; ++s)
         {
+            if (subMeshes[s].vertexCount == 0)
+                continue;
+
             subMeshes[s].vertexStart = mesh.vertices.allocate(subMeshes[s].vertexCount);
 
             if (subMeshes[s].attribute_position)
             {
-                writeAttribute(&mesh.vertices[0].position, subMeshes[s].attribute_position,subMeshes[s].vertexStart);
+                writeAttribute(&mesh.vertices[0].position, subMeshes[s].attribute_position, subMeshes[s].vertexStart);
             }
 
             if (subMeshes[s].attribute_normal)
             {
-                writeAttribute(&mesh.vertices[0].normal, subMeshes[s].attribute_normal,subMeshes[s].vertexStart);
+                writeAttribute(&mesh.vertices[0].normal, subMeshes[s].attribute_normal, subMeshes[s].vertexStart);
             }
 
             if (subMeshes[s].attribute_color)
             {
-                writeAttribute(&mesh.vertices[0].color, subMeshes[s].attribute_color,subMeshes[s].vertexStart);
+                writeAttribute(&mesh.vertices[0].color, subMeshes[s].attribute_color, subMeshes[s].vertexStart);
             }
 
             if (subMeshes[s].attribute_texcoord)
             {
-                writeAttribute(&mesh.vertices[0].uv, subMeshes[s].attribute_texcoord,subMeshes[s].vertexStart);
+                writeAttribute(&mesh.vertices[0].uv, subMeshes[s].attribute_texcoord, subMeshes[s].vertexStart);
             }
         }
 
-        mesh.triangles.reserve(indices.size()/3);
-        for (auto& submesh:subMeshes)
+        mesh.triangles.reserve(indices.size() / 3);
+        for (const auto& submesh : subMeshes)
         {
-            auto number_of_triangles=submesh.indexCount/3;
-            auto start=mesh.triangles.allocate(number_of_triangles);
-            for (int i=0;i<number_of_triangles;i++)
+            auto number_of_triangles = submesh.indexCount / 3;
+            if (number_of_triangles == 0)
+                continue;
+
+            auto start = mesh.triangles.allocate(number_of_triangles);
+            for (size_t t = 0; t < number_of_triangles; ++t)
             {
-                mesh.triangles[start+i].v1= submesh.vertexStart + indices[submesh.indexStart+i*3];
-                mesh.triangles[start+i].v2= submesh.vertexStart+ indices[submesh.indexStart+i*3+1];
-                mesh.triangles[start+i].v3= submesh.vertexStart+ indices[submesh.indexStart+i*3+2];
-                mesh.triangles[start+i].material_id=submesh.materialId;
+                mesh.triangles[start + t].v1 = submesh.vertexStart + indices[submesh.indexStart + t * 3];
+                mesh.triangles[start + t].v2 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 1];
+                mesh.triangles[start + t].v3 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 2];
+                mesh.triangles[start + t].material_id = submesh.materialId;
             }
         }
 
@@ -359,7 +410,8 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
 std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds)
 {
     std::vector<uint32_t> materialIds(model.materials_count);
-    for (int i = 0; i < model.materials_count; ++i)
+    m_materials.reserve(m_materials.size() + model.materials_count);
+    for (uint32_t i = 0; i < model.materials_count; ++i)
     {
         const tg3_material *tg3mat = &model.materials[i];
         m_materials.push_back(Material
@@ -380,15 +432,15 @@ std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::ve
 }
 
 
-uint32_t Scene::importNode(const tg3_model &model,uint32_t nodeIndex, uint32_t parentId,std::vector<uint32_t>& meshIds)
+Node Scene::importNode(const tg3_model& model, uint32_t nodeIndex, const std::vector<uint32_t>& meshIds)
 {
-    const tg3_node &tg3Node = model.nodes[nodeIndex];
+    const tg3_node& tg3Node = model.nodes[nodeIndex];
     Node node;
 
     if (tg3Node.has_matrix)
     {
         glm::mat4 transform(1);
-        float *transformPtr = &transform[0][0];
+        float* transformPtr = &transform[0][0];
         for (int i = 0; i < 16; ++i)
         {
             transformPtr[i] = static_cast<float>(tg3Node.matrix[i]);
@@ -411,61 +463,73 @@ uint32_t Scene::importNode(const tg3_model &model,uint32_t nodeIndex, uint32_t p
         node.meshId = meshIds[tg3Node.mesh];
     }
 
-
-    node.child_start=nodes.size();
-    node.child_size=tg3Node.children_count;
-    // iterate through child nodes
-    for (int i = 0; i < tg3Node.children_count; ++i)
+    node.children.reserve(tg3Node.children_count);
+    for (uint32_t i = 0; i < tg3Node.children_count; ++i)
     {
         int32_t childIndex = tg3Node.children[i];
-        importNode(model, childIndex, nodeIndex, meshIds);
+        node.children.push_back(importNode(model, childIndex, meshIds));
     }
 
-    nodes.push_back(node);
-    return nodes.size()-1;
+    return node;
 }
 
-void Scene::load_nodes(const tg3_model& model, std::vector<uint32_t>& meshIds)
+void Scene::load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds)
 {
-    for (auto scene_id=0;scene_id<model.scenes_count;++scene_id)
-    {
-        // import scene nodes
-        const tg3_scene *scene = &model.scenes[model.default_scene != -1 ? model.default_scene : 0];
+    default_scene = (model.default_scene >= 0 && static_cast<uint32_t>(model.default_scene) < model.scenes_count)
+        ? static_cast<uint32_t>(model.default_scene)
+        : 0;
 
-        // iterate over the scene's roots nodes, attach to existing root node (if present)
-        for (int i = 0; i < scene->nodes_count; ++i)
+    scenes.reserve(scenes.size() + model.scenes_count);
+    for (uint32_t scene_id = 0; scene_id < model.scenes_count; ++scene_id)
+    {
+        const tg3_scene* scene = &model.scenes[scene_id];
+
+        GltfScene gltf_scene;
+        gltf_scene.name = scene->name.data != nullptr
+            ? std::string(scene->name.data, scene->name.len)
+            : "";
+        gltf_scene.root_nodes.reserve(scene->nodes_count);
+
+        for (uint32_t i = 0; i < scene->nodes_count; ++i)
         {
-            uint32_t nodeId = importNode( model, scene->nodes[i], 0, meshIds);
-            std::string name=std::string(scene->name.data,scene->name.data+scene->name.len);
-            root_nodes.push_back(RootNode{.root_node = nodeId,.name = name});
+            gltf_scene.root_nodes.push_back(importNode(model, scene->nodes[i], meshIds));
         }
+
+        scenes.push_back(std::move(gltf_scene));
     }
 }
 
-std::vector<std::pair<glm::mat4, Mesh&>> Scene::get_mesh_transform()
+std::vector<std::pair<glm::mat4, Mesh&>> Scene::get_mesh_transform(int scene_index)
 {
-    std::vector<std::pair<glm::mat4, Mesh&>> resut;
+    std::vector<std::pair<glm::mat4, Mesh&>> result;
+    if (scenes.empty())
+        return result;
 
-    for (const auto& root: root_nodes)
+    uint32_t target_scene = (scene_index >= 0 && static_cast<size_t>(scene_index) < scenes.size())
+        ? static_cast<uint32_t>(scene_index)
+        : default_scene;
+
+    if (target_scene >= scenes.size())
+        target_scene = 0;
+
+    for (auto& root : scenes[target_scene].root_nodes)
     {
-        mesh_transform_recursive(root.root_node,glm::mat4(1),resut);
+        mesh_transform_recursive(root, glm::mat4(1), result);
     }
-    return resut;
+    return result;
 }
 
 
-void Scene::mesh_transform_recursive(uint32_t node_id,glm::mat4 transform, std::vector<std::pair<glm::mat4, Mesh&>>& result)
+void Scene::mesh_transform_recursive(Node& node, glm::mat4 transform, std::vector<std::pair<glm::mat4, Mesh&>>& result)
 {
-    auto&& node=nodes[node_id];
-    auto current_transform=node.getTransform()*transform;
-    if (node.meshId>0)
+    auto current_transform = transform * node.getTransform();
+    if (node.meshId > 0)
     {
-        result.push_back({current_transform,m_meshes[node.meshId-1]});
+        result.push_back({current_transform, m_meshes[node.meshId - 1]});
     }
 
-    for (auto i=0;i<node.child_size;++i)
+    for (auto& child : node.children)
     {
-        mesh_transform_recursive(node.child_start+i,current_transform,result);
+        mesh_transform_recursive(child, current_transform, result);
     }
 }
-

@@ -391,11 +391,12 @@ bool RaytracerController::ui_scenes_manager()
             ImGui::Text("Selected model id:%d", selected_model);
 
 
-            static int min_depth=4;
-            static int max_depth=10;
+            static int min_depth=1;
+            static int max_depth=19;
             static bool stretch=false;
-            static float triangle_to_box_stop_ratio=1.f;
+            static float triangle_to_box_stop_ratio=1.1f;
             static bool swapYZ=true;
+            static bool auto_play=true;
             if (selected_model==0)
             {
                 ImGui::Text("Root node selected");
@@ -447,7 +448,8 @@ bool RaytracerController::ui_scenes_manager()
                     mesh.space_id=active_scene.as.create_space_for_models(std::views::single(std::pair<glm::mat4,Mesh&>{glm::mat4(1),mesh}), stretch,swapYZ,min_depth,max_depth,triangle_to_box_stop_ratio);
                     active_scene.set_active_space(mesh.space_id);//select built mesh
                     device_data_mutex.unlock();
-                    play();
+                    if (auto_play)
+                        play();
                 }
             }
 
@@ -456,6 +458,7 @@ bool RaytracerController::ui_scenes_manager()
             ImGui::InputFloat("Triangle to box stop ratio",&triangle_to_box_stop_ratio,0.1);
             ImGui::Checkbox("Stretch",&stretch);
             ImGui::Checkbox("Swap y and z",&swapYZ);
+            ImGui::Checkbox("Auto play after build",&auto_play);
         }
         ImGui::EndChild();
     }

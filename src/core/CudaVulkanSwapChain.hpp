@@ -1,4 +1,10 @@
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
 #include <vkbase_core.hpp>
 #include "../../vkbase/extensions/cuda/Image.hpp"
 #include "../../vkbase/extensions/imgui/imgui.hpp"
@@ -23,10 +29,11 @@ class CudaVulkanSwapChain
         vkbase::cuda::Image image;
         std::unique_ptr<std::atomic<ImageState>> state;
         vkbase::imgui::Image image_imgui;
-        vkbase::WaitToken wait_token;
+        uint64_t wait_frame_id = 0;
     };
 
-
+    std::vector<std::pair<uint64_t, std::unique_ptr<ImageData>>> pending_delete;
+    std::atomic<uint64_t> last_completed_frame{0};
 
 public:
     std::vector<std::unique_ptr<ImageData>> images;
@@ -124,22 +131,52 @@ public:
     {
         while (!stopFlag)
         {
+            std::vector<std::unique_ptr<ImageData>> to_destroy;
+            int acquired_id = -1;
+
             {
                 std::lock_guard lock(image_mutex);
+                uint64_t completed_frame = last_completed_frame.load(std::memory_order_acquire);
+
+                for (auto it = pending_delete.begin(); it != pending_delete.end();)
+                {
+                    if (it->first <= completed_frame)
+                    {
+                        to_destroy.push_back(std::move(it->second));
+                        it = pending_delete.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
                 for (size_t i = 0; i < images.size(); ++i)
                 {
                     int id = (next_acquire_id + i) % images.size();
                     auto image = images[id].get();
-                    if (image != nullptr && image->state->load() == ImageState::ReadyForDraw && image->wait_token.wait(0))
+                    if (image != nullptr && image->state->load() == ImageState::ReadyForDraw &&
+                        image->wait_frame_id <= completed_frame)
                     {
+                        image->wait_frame_id = 0;
                         *image->state = ImageState::Draw;
                         next_acquire_id = (id + 1) % images.size();
-                        // vkbase::info(std::format("      {} Acquired image {} ",vkbase::sys::getMilliseconds(),id));
-                        return id;
+                        acquired_id = id;
+                        break;
                     }
                 }
             }
-            std::this_thread::yield();
+
+            // Destroy retired images outside image_mutex on the CUDA thread while CUDA is idle between frames
+            to_destroy.clear();
+
+            if (acquired_id != -1)
+            {
+                return acquired_id;
+            }
+
+            last_completed_frame.store(vkbase::getLastRenderedFrame_device(), std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
 
         return -1;
@@ -199,6 +236,7 @@ public:
     std::vector<vkbase::WaitPoint> swap()
     {
         std::lock_guard lock(image_mutex);
+        last_completed_frame.store(vkbase::getLastRenderedFrame_device(), std::memory_order_release);
         // printImageStates();
 
         if (present_flag)
@@ -237,27 +275,12 @@ public:
                     images[currently_presented] = std::make_unique<ImageData>(createImage(m_width,m_height));
 
                     // vkbase::info(std::format("{} Recreated {}",vkbase::sys::getMilliseconds(),currently_presented));
-
-
-                    vkbase::doAfter(lastFrameToken,[old_image=std::move(old_image),id=currently_presented]()mutable
-                    {
-                        // vkbase::info(std::format("{} Destroyed: {}",vkbase::sys::getMilliseconds(),id));
-                    });
+                    pending_delete.emplace_back(lastFrameToken.value, std::move(old_image));
                 }
                 else
                 {
-                    img.wait_token=lastFrameToken;
+                    img.wait_frame_id=lastFrameToken.value;
                     *img.state=ImageState::ReadyForDraw;
-
-                    // std::thread returnImageStatus([image_is_free,&img,id=currently_presented]()
-                    // {
-                    //     vkbase::info(std::format("{} Scheduled for Release: {} frame value={}",vkbase::sys::getMilliseconds(),id,image_is_free.value));
-                    //     image_is_free.wait();
-                    //
-                    //
-                    //     vkbase::info(std::format("{} Released: {}",vkbase::sys::getMilliseconds(),id));
-                    // });
-                    // returnImageStatus.detach();
                 }
             }
 

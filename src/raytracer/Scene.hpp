@@ -24,10 +24,7 @@ class Node
 
 public:
 	uint32_t meshId = 0;
-	uint32_t parentId = 0;
-	uint32_t child_start = 0;
-	uint32_t child_size = 0;
-
+	std::vector<Node> children;
 
 	glm::vec3 getTranslation() const { return m_translation; }
 	void setTranslation(const glm::vec3 &translation)
@@ -55,52 +52,45 @@ public:
 };
 
 
-struct  RootNode
+struct GltfScene
 {
-	uint32_t root_node=0;
 	std::string name;
+	std::vector<Node> root_nodes;
 };
 
 
 class Scene
 {
 public:
-    Scene(std::string_view name);
-    void load(std::string_view data);
-	bool is_loaded();
-    const std::string& get_name();
+	Scene(std::string_view name);
+	void load(std::string_view data);
+	bool is_loaded() const;
+	const std::string& get_name() const;
 	void set_active_space(uint32_t space_id);
 	int get_root_box() const;
 	uint32_t get_active_space() const;
 
-    std::vector<uint32_t> loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds);
-	std::vector<uint32_t> loadMaterials(const tg3_model &model, const std::vector<uint32_t> &textureIds);
-    uint32_t importNode(const tg3_model& model, uint32_t nodeIndex, uint32_t parentId, std::vector<uint32_t>& meshIds);
-    void load_nodes(const tg3_model& model, std::vector<uint32_t>& meshIds);
+	std::vector<std::pair<glm::mat4, Mesh&>> get_mesh_transform(int scene_index = -1);
 
-    std::vector<std::pair<glm::mat4, Mesh&>> get_mesh_transform();
-
-
-	void build_triangles();
-
-	void transformMeshVertices(Mesh& mesh,const glm::mat3& mat, glm::vec3 transpose);
-
-    std::vector<Mesh> m_meshes;
+	std::vector<Mesh> m_meshes;
 	std::vector<Material> m_materials;
+	std::vector<GltfScene> scenes;
+	uint32_t default_scene = 0;
 
-	uint32_t root_space=0;
+	uint32_t root_space = 0;
 
 	OctreeAS as;
-	bool m_is_loaded=false;
+	bool m_is_loaded = false;
 	std::string m_name;
 
 private:
-	uint32_t m_active_space;
-	int m_root_box;
+	uint32_t m_active_space = 0;
+	int m_root_box = -1;
 
-	std::vector<Node> nodes;
-	std::vector<RootNode> root_nodes;
+	std::vector<uint32_t> loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds);
+	std::vector<uint32_t> loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds);
+	Node importNode(const tg3_model& model, uint32_t nodeIndex, const std::vector<uint32_t>& meshIds);
+	void load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds);
 
-
-    void mesh_transform_recursive(uint32_t node_id, glm::mat4 transform, std::vector<std::pair<glm::mat4, Mesh&>>& result);
+	void mesh_transform_recursive(Node& node, glm::mat4 transform, std::vector<std::pair<glm::mat4, Mesh&>>& result);
 };
