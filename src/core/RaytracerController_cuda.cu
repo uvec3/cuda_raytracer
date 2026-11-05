@@ -27,13 +27,75 @@ bool RaytracerController::ui_show_parameters()
 
         ImGui::DragFloat("AX",&p.ax);
         ImGui::DragFloat("AZ",&p.az);
-        ImGui::DragFloat3("Pos",&p.view_pos[0]);
-        ImGui::InputFloat("Near",&p.near_);
+        ImGui::DragFloat3("Pos",&p.view_pos[0],0.01);
+        ImGui::InputFloat("Near",&p.near_,0.01);
         ImGui::Checkbox("Show time",&p.measure_time);
         ImGui::Checkbox("Show iterations",&p.show_iterations);
         ImGui::Checkbox("Show triangles",&p.show_triangles);
         ImGui::Checkbox("Show boxes",&p.show_boxes);
         ImGui::InputInt("Time max",&p.time_max);
+        ImGui::Checkbox("Fake normals",&p.use_fake_normals);
+        ImGui::Checkbox("Fixed light source",&p.fixed_light_source);
+        ImGui::DragFloat3("Light source",&p.light_source[0],0.01);
+        ImGui::DragFloat("Diffuse lightning",&p.diffuse_light,0.01);
+        ImGui::DragFloat("Ambient lightning",&p.ambient_light,0.01);
+
+        ImGui::Separator();
+        ImGui::Text("Resolution");
+
+        bool resolution_changed = false;
+        bool is_fixed = (resolution_mode != 0);
+        if (ImGui::Checkbox("Fixed resolution", &is_fixed))
+        {
+            if (is_fixed)
+                resolution_mode = (last_fixed_mode > 0 ? last_fixed_mode : 2); // Default to 1080p
+            else
+                resolution_mode = 0; // Window (Dynamic)
+            resolution_changed = true;
+        }
+
+        static const char* const preset_names[] = {
+            "Window (Dynamic)",
+            "1280 x 720 (720p HD)",
+            "1920 x 1080 (1080p FHD)",
+            "2560 x 1440 (1440p QHD)",
+            "3440 x 1440 (UWQHD 21:9)",
+            "3840 x 2160 (4K UHD)",
+            "7680 x 4320 (8K UHD)",
+            "Custom"
+        };
+        constexpr int preset_count = static_cast<int>(sizeof(preset_names) / sizeof(preset_names[0]));
+
+        if (ImGui::Combo("Preset", &resolution_mode, preset_names, preset_count))
+        {
+            if (resolution_mode != 0)
+                last_fixed_mode = resolution_mode;
+            resolution_changed = true;
+        }
+
+        if (resolution_mode == preset_count - 1) // Custom
+        {
+            if (ImGui::InputInt2("Custom size (W x H)", custom_resolution))
+            {
+                if (custom_resolution[0] < 1) custom_resolution[0] = 1;
+                if (custom_resolution[0] > 10000) custom_resolution[0] = 10000;
+                if (custom_resolution[1] < 1) custom_resolution[1] = 1;
+                if (custom_resolution[1] > 10000) custom_resolution[1] = 10000;
+                resolution_changed = true;
+            }
+        }
+
+        if (resolution_mode != 0)
+        {
+            ImGui::Checkbox("Scale display to window", &scale_display_to_window);
+        }
+
+        ImGui::Text("Current render size: %u x %u", current_image_size.x, current_image_size.y);
+
+        if (resolution_changed && !cuda_is_running)
+        {
+            draw_one_frame();
+        }
     }
     ImGui::End();
 
@@ -99,7 +161,18 @@ void RaytracerController::ui_surface_input()
         {
             auto pos=ImGui::GetMousePos();
             auto corner=ImGui::GetItemRectMin();
-            debug_pixel={pos.x-corner.x,pos.y-corner.y};
+            auto item_size=ImGui::GetItemRectSize();
+            float scale_x = (item_size.x > 0.0f) ? (static_cast<float>(current_image_size.x) / item_size.x) : 1.0f;
+            float scale_y = (item_size.y > 0.0f) ? (static_cast<float>(current_image_size.y) / item_size.y) : 1.0f;
+            int px = static_cast<int>((pos.x - corner.x) * scale_x);
+            int py = static_cast<int>((pos.y - corner.y) * scale_y);
+            int max_x = static_cast<int>(current_image_size.x);
+            int max_y = static_cast<int>(current_image_size.y);
+            if (px < 0) px = 0;
+            if (px >= max_x) px = max_x > 0 ? max_x - 1 : 0;
+            if (py < 0) py = 0;
+            if (py >= max_y) py = max_y > 0 ? max_y - 1 : 0;
+            debug_pixel = {px, py};
         }
 
         if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))

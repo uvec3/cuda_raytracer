@@ -28,7 +28,6 @@ inline float get_block_size(int depth)
 }
 
 
-
 __host__ __device__
 inline float ray_flat_intersection_offset(glm::vec3 flat_point,glm::vec3 flat_normal,glm::vec3 ray_point, glm::vec3 ray_direction)
 {
@@ -38,8 +37,6 @@ inline float ray_flat_intersection_offset(glm::vec3 flat_point,glm::vec3 flat_no
 
     return offset;
 }
-
-
 
 __device__ __host__ inline
 bool correct_ray_pos(glm::vec3& pos, glm::vec3 dir,float box_size)

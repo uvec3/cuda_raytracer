@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -13,6 +14,7 @@
 #include <glm/glm.hpp>
 
 #include "../../vkbase/extensions/cuda/cuda.hpp"
+#include <container_explorer.hpp>
 
 
 struct WindowInfo
@@ -22,17 +24,27 @@ struct WindowInfo
     bool open=true;
 };
 
+struct ResolutionPreset
+{
+    const char* label;
+    uint32_t width;
+    uint32_t height;
+};
+
+static const ResolutionPreset* get_resolution_presets();
+static int get_resolution_preset_count();
+
 class Raytracer;
 class CudaVulkanSwapChain;
 class Scene;
-class soa_ui_table_interface;
+class Node;
 
 
 struct SceneData
 {
     std::unique_ptr<Scene> scene;
-    std::map<std::string,std::unique_ptr<soa_ui_table_interface>> soa_tables;
-    uint32_t active_space=0;
+    ContainerExplorer explorer;
+    Node* selected_node = nullptr;
 
     SceneData();
     ~SceneData();
@@ -56,10 +68,6 @@ public:
     std::atomic<bool> cuda_is_running=false;
     std::atomic<bool> wake_cuda=false;
 
-
-
-    std::string active_table;
-
     std::thread cuda_loop;
 
     uint64_t frame_counter=0;
@@ -76,6 +84,13 @@ public:
     glm::ivec2 debug_pixel{0,0};
     glm::vec4 debug_pixel_result{0};
     glm::uvec2 current_image_size{0};
+
+    int resolution_mode = 0; // 0: Window (Dynamic), 1: 720p, 2: 1080p, 3: 1440p, 4: UWQHD, 5: 4K, 6: 8K, 7: Custom
+    int last_fixed_mode = 2; // Default fixed preset: 1080p
+    int custom_resolution[2] = {1920, 1080};
+    bool scale_display_to_window = true;
+
+    glm::uvec2 get_target_resolution(glm::vec2 available_size) const;
 
     cudaEvent_t start, finish;
 

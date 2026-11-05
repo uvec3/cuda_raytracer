@@ -1,7 +1,6 @@
 #include "RaytracerController.hpp"
 
 #include "../raytracer/Scene.hpp"
-#include "../ui_helpers/soa_ui_view.hpp"
 #include <cuda_profiler_api.h>
 #include <numeric>
 #include <vkbase_core.hpp>
@@ -56,7 +55,7 @@ RaytracerController::RaytracerController()
     windows.push_back({"Output image", [this]()
     {
         bool open=true;
-        if (ImGui::Begin("Output",&open))
+        if (ImGui::Begin("Output",&open, ImGuiWindowFlags_HorizontalScrollbar))
         {
             ui_image();
         }
@@ -67,11 +66,6 @@ RaytracerController::RaytracerController()
 
 
     initScenes();
-
-
-    // soa_ui_view<decltype(scene.vertices)> table{scene.vertices};
-
-    active_table="Acceleration structure";
 
     // play();
 }
@@ -101,12 +95,8 @@ void RaytracerController::initScenes()
         s.scene=std::make_unique<Scene>(scene_name);
         s.scene->load(scene_data);
 
-        s.soa_tables["Vertices"]=std::make_unique<soa_ui_view<decltype(s.scene->as.vertices)>>(s.scene->as.vertices);
-        s.soa_tables["Acceleration structure"]=std::make_unique<soa_ui_view<decltype(s.scene->as.as)>>(s.scene->as.as);
-        s.soa_tables["Box contents"]=std::make_unique<soa_ui_view<decltype(s.scene->as.box_content)>>(s.scene->as.box_content);
-        s.soa_tables["Primitives"]=std::make_unique<soa_ui_view<decltype(s.scene->as.primitives)>>(s.scene->as.primitives);
-        s.soa_tables["Triangles"]=std::make_unique<soa_ui_view<decltype(s.scene->as.triangles)>>(s.scene->as.triangles);
-        s.soa_tables["Spaces"]=std::make_unique<soa_ui_view<decltype(s.scene->as.spaces)>>(s.scene->as.spaces);
+        s.scene->as.register_containers(s.explorer);
+        s.explorer.register_container("scene.materials", s.scene->m_materials);
 
         scenes.push_back(std::move(s));
     }
@@ -129,6 +119,10 @@ void RaytracerController::ui()
         ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
+    if (hide_ui && resolution_mode != 0 && !scale_display_to_window)
+    {
+        window_flags |= ImGuiWindowFlags_HorizontalScrollbar;
+    }
 
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -255,19 +249,76 @@ void RaytracerController::ui_menu()
     showMenu= ImGui::IsAnyItemFocused() || ImGui::IsAnyItemActive() || ImGui::IsAnyItemHovered() ;
 }
 
+static const ResolutionPreset s_resolution_presets[] = {
+    {"Window (Dynamic)",        0,    0},
+    {"1280 x 720 (720p HD)", 1280,  720},
+    {"1920 x 1080 (1080p FHD)", 1920, 1080},
+    {"2560 x 1440 (1440p QHD)", 2560, 1440},
+    {"3440 x 1440 (UWQHD 21:9)", 3440, 1440},
+    {"3840 x 2160 (4K UHD)", 3840, 2160},
+    {"7680 x 4320 (8K UHD)", 7680, 4320},
+    {"Custom",                  0,    0}
+};
+static const int s_resolution_preset_count = static_cast<int>(sizeof(s_resolution_presets) / sizeof(s_resolution_presets[0]));
+
+const ResolutionPreset* get_resolution_presets()
+{
+    return s_resolution_presets;
+}
+
+int get_resolution_preset_count()
+{
+    return s_resolution_preset_count;
+}
+
+glm::uvec2 RaytracerController::get_target_resolution(glm::vec2 available_size) const
+{
+    if (resolution_mode == 0) // Window (Dynamic)
+    {
+        uint32_t w = available_size.x > 1.0f ? static_cast<uint32_t>(available_size.x) : 1u;
+        uint32_t h = available_size.y > 1.0f ? static_cast<uint32_t>(available_size.y) : 1u;
+        return {std::clamp(w, 1u, 10000u), std::clamp(h, 1u, 10000u)};
+    }
+    if (resolution_mode >= 1 && resolution_mode < s_resolution_preset_count - 1)
+    {
+        return {s_resolution_presets[resolution_mode].width, s_resolution_presets[resolution_mode].height};
+    }
+    // Custom
+    uint32_t w = std::clamp(static_cast<uint32_t>(custom_resolution[0]), 1u, 10000u);
+    uint32_t h = std::clamp(static_cast<uint32_t>(custom_resolution[1]), 1u, 10000u);
+    return {w, h};
+}
+
 void RaytracerController::ui_image()
 {
     ui_toolbar();
-    auto available=ImGui::GetContentRegionAvail();
-    swap_chain->setImageSize(available.x,available.y);
-    current_image_size={available.x,available.y};
+    auto available = ImGui::GetContentRegionAvail();
+    auto target_res = get_target_resolution({available.x, available.y});
 
-    auto image_to_present=swap_chain->getImageToPresent();
+    swap_chain->setImageSize(target_res.x, target_res.y);
+    current_image_size = target_res;
+
+    auto image_to_present = swap_chain->getImageToPresent();
     if (image_to_present)
     {
-        ImGui::Image(image_to_present->image_imgui,ImVec2(image_to_present->image.width,image_to_present->image.height));
-        ui_surface_input();
+        ImVec2 display_size(static_cast<float>(image_to_present->image.width),
+                            static_cast<float>(image_to_present->image.height));
 
+        if (resolution_mode != 0 && scale_display_to_window && available.x > 0.0f && available.y > 0.0f)
+        {
+            float aspect = static_cast<float>(image_to_present->image.width) / static_cast<float>(image_to_present->image.height);
+            float disp_w = available.x;
+            float disp_h = disp_w / aspect;
+            if (disp_h > available.y)
+            {
+                disp_h = available.y;
+                disp_w = disp_h * aspect;
+            }
+            display_size = ImVec2(disp_w, disp_h);
+        }
+
+        ImGui::Image(image_to_present->image_imgui, display_size);
+        ui_surface_input();
     }
 }
 
@@ -336,21 +387,85 @@ bool RaytracerController::ui_frame_info()
 
 
 
+static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_space_id, int& id_counter)
+{
+    ImGui::PushID(++id_counter);
+
+    bool is_selected = (selected_node == &node);
+    bool is_active_render = (node.as_ref.is_valid() && node.as_ref.space_id == active_space_id);
+
+    std::string label = node.name.empty() ? "Node" : node.name;
+    if (node.as_ref.is_valid())
+    {
+        label += (node.as_ref.type == ASType::Octree)
+            ? (" [Octree #" + std::to_string(node.as_ref.space_id) + "]")
+            : (" [BVH #" + std::to_string(node.as_ref.space_id) + "]");
+    }
+    if (is_active_render)
+    {
+        label += " [Active]";
+    }
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (is_selected)
+    {
+        flags |= ImGuiTreeNodeFlags_Selected;
+    }
+
+    if (node.children.empty())
+    {
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (is_active_render)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
+        ImGui::TreeNodeEx((void*)&node, flags, "%s", label.c_str());
+        if (is_active_render)
+            ImGui::PopStyleColor();
+
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        {
+            selected_node = &node;
+        }
+    }
+    else
+    {
+        if (is_active_render)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
+        bool node_open = ImGui::TreeNodeEx((void*)&node, flags, "%s", label.c_str());
+        if (is_active_render)
+            ImGui::PopStyleColor();
+
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        {
+            selected_node = &node;
+        }
+
+        if (node_open)
+        {
+            for (auto& child : node.children)
+            {
+                render_node_tree(child, selected_node, active_space_id, id_counter);
+            }
+            ImGui::TreePop();
+        }
+    }
+
+    ImGui::PopID();
+}
+
 bool RaytracerController::ui_scenes_manager()
 {
     static bool open=true;
     if (ImGui::Begin("Active scene",&open))
     {
-        auto& active_scene=*scenes[active_scene_number].scene;
-        auto& selected_model=scenes[active_scene_number].active_space;
+        auto& scene_data = scenes[active_scene_number];
+        auto& active_scene = *scene_data.scene;
 
-        if (ImGui::BeginCombo("Select table", active_scene.get_name().c_str()))
+        if (ImGui::BeginCombo("Select scene", active_scene.get_name().c_str()))
         {
             for (int i=0;i<scenes.size();++i)
             {
-
                 auto& s=scenes[i];
-                if (ImGui::Selectable(s.scene->get_name().c_str(),i==active_scene_number) )
+                if (ImGui::Selectable(s.scene->get_name().c_str(), i==active_scene_number))
                 {
                     active_scene_number=i;
                 }
@@ -358,107 +473,152 @@ bool RaytracerController::ui_scenes_manager()
             ImGui::EndCombo();
         }
 
+        auto available = ImGui::GetContentRegionAvail();
+        float left_width = available.x * 0.45f;
+        float right_width = available.x - left_width - 8.0f;
 
-        ImGui::Text("Show");
-
-        auto available=ImGui::GetContentRegionAvail();
-        available.x=available.x/2;
-        if (ImGui::BeginChild("model",available,1))
+        if (ImGui::BeginChild("scene_tree", ImVec2(left_width, available.y), true))
         {
-
-            if (ImGui::Selectable("Scene root",selected_model==0))
-            {
-                selected_model=0;
-            }
-
-            for (int i=1;i<=active_scene.m_meshes.size();++i)
-            {
-                ImGui::PushID(i);
-                auto& mesh=active_scene.m_meshes[i-1];
-                if (ImGui::Selectable(mesh.name.c_str(),selected_model==i))
-                {
-                    selected_model=i;
-                }
-                ImGui::PopID();
-            }
+            int id_counter = 0;
+            render_node_tree(active_scene.root_node, scene_data.selected_node, active_scene.get_active_space(), id_counter);
         }
         ImGui::EndChild();
 
         ImGui::SameLine();
 
-        if (ImGui::BeginChild("model info",available,1))
+        if (ImGui::BeginChild("node_inspector", ImVec2(right_width, available.y), true))
         {
-            ImGui::Text("Selected model id:%d", selected_model);
+            static bool auto_select = true;
+            static bool auto_play = true;
 
-
-            static int min_depth=1;
-            static int max_depth=19;
-            static bool stretch=false;
-            static float triangle_to_box_stop_ratio=1.1f;
-            static bool swapYZ=true;
-            static bool auto_play=true;
-            if (selected_model==0)
+            if (scene_data.selected_node == nullptr)
             {
-                ImGui::Text("Root node selected");
+                scene_data.selected_node = &active_scene.root_node;
+            }
 
-                if (ImGui::Button("Select space"))
+            Node& node = *scene_data.selected_node;
+
+            ImGui::Text("Node: %s", node.name.c_str());
+            ImGui::Separator();
+
+            auto trans = node.getTranslation();
+            auto scale = node.getScale();
+            ImGui::Text("Translation: (%.2f, %.2f, %.2f)", trans.x, trans.y, trans.z);
+            ImGui::Text("Scale:       (%.2f, %.2f, %.2f)", scale.x, scale.y, scale.z);
+
+            if (node.meshId > 0 && node.meshId - 1 < active_scene.m_meshes.size())
+            {
+                auto& mesh = active_scene.m_meshes[node.meshId - 1];
+                ImGui::Text("Direct Mesh: %s", mesh.name.c_str());
+                ImGui::Text("  Triangles: %u", (uint32_t)mesh.triangles.size());
+                ImGui::Text("  Vertices:  %u", (uint32_t)mesh.vertices.size());
+            }
+            else
+            {
+                ImGui::Text("Direct Mesh: None");
+            }
+
+            size_t sub_meshes = node.count_subtree_meshes();
+            size_t sub_triangles = node.count_subtree_triangles(active_scene.m_meshes);
+            size_t sub_vertices = node.count_subtree_vertices(active_scene.m_meshes);
+            ImGui::Text("Subtree Meshes:    %zu", sub_meshes);
+            ImGui::Text("Subtree Triangles: %zu", sub_triangles);
+            ImGui::Text("Subtree Vertices:  %zu", sub_vertices);
+
+            ImGui::Separator();
+            ImGui::Text("Acceleration Structure");
+
+            if (node.as_ref.is_valid())
+            {
+                const char* type_str = (node.as_ref.type == ASType::Octree) ? "Octree" : "BVH";
+                ImGui::Text("Status: Built (%s, Space #%u)", type_str, node.as_ref.space_id);
+                if (active_scene.as.spaces.is_allocated(node.as_ref.space_id))
                 {
-                    active_scene.set_active_space(0);
+                    auto sp = active_scene.as.spaces[node.as_ref.space_id];
+                    ImGui::Text("  Boxes:      %u", (uint32_t)sp.as_size);
+                    ImGui::Text("  Contents:   %u", (uint32_t)sp.box_content_size);
+                    ImGui::Text("  Primitives: %u", (uint32_t)sp.primitives_size);
                 }
-
-                if (ImGui::Button("build AS space"))
+                if (active_scene.get_active_space() == node.as_ref.space_id)
                 {
-                    pause();
-                    device_data_mutex.lock();
-                    // if (mesh.space_id!=UINT32_MAX)
-                    //     active_scene.as.free_space(mesh.space_id);
-                    auto new_id=active_scene.as.create_space_for_models(active_scene.get_mesh_transform(), stretch,swapYZ,min_depth,max_depth,triangle_to_box_stop_ratio);
-                    active_scene.set_active_space(new_id);//select built mesh
-                    device_data_mutex.unlock();
-                    play();
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Currently Active in Renderer");
                 }
             }
             else
             {
-                auto& mesh=active_scene.m_meshes[selected_model-1];
-                ImGui::Text("Model id %d", selected_model);
-                ImGui::Text("Model space id: %d",mesh.space_id);
-
-                if (ImGui::Button("Select space"))
-                {
-                    device_data_mutex.lock();
-                    active_scene.set_active_space(mesh.space_id);
-                    device_data_mutex.unlock();
-                }
-
-
-                ImGui::Text("Number of triangles: %d",(uint32_t)mesh.triangles.size());
-                ImGui::Text("First triangle: %d",0);
-
-                ImGui::Text("Number of vertices: %d",(uint32_t)mesh.vertices.size());
-                ImGui::Text("First vertex: %d",0);
-
-
-                if (ImGui::Button("build AS space"))
-                {
-                    pause();
-                    device_data_mutex.lock();
-                    if (mesh.space_id!=UINT32_MAX)
-                        active_scene.as.free_space(mesh.space_id);
-                    mesh.space_id=active_scene.as.create_space_for_models(std::views::single(std::pair<glm::mat4,Mesh&>{glm::mat4(1),mesh}), stretch,swapYZ,min_depth,max_depth,triangle_to_box_stop_ratio);
-                    active_scene.set_active_space(mesh.space_id);//select built mesh
-                    device_data_mutex.unlock();
-                    if (auto_play)
-                        play();
-                }
+                ImGui::Text("Status: Not built");
             }
 
-            ImGui::InputInt("Min depth",&min_depth,1);
-            ImGui::InputInt("Max depth",&max_depth,1);
-            ImGui::InputFloat("Triangle to box stop ratio",&triangle_to_box_stop_ratio,0.1);
-            ImGui::Checkbox("Stretch",&stretch);
-            ImGui::Checkbox("Swap y and z",&swapYZ);
-            ImGui::Checkbox("Auto play after build",&auto_play);
+            static int selected_as_type = 0; // 0: Octree, 1: BVH
+            const char* as_type_names[] = {"Octree", "BVH (Coming soon)"};
+            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 2);
+
+            if (ImGui::Button("Build AS"))
+            {
+                pause();
+                device_data_mutex.lock();
+                if (node.as_ref.is_valid())
+                {
+                    active_scene.as.free_space(node.as_ref.space_id);
+                    node.as_ref = {};
+                }
+
+                auto relative_meshes = active_scene.get_mesh_transform(&node);
+                if (!relative_meshes.empty())
+                {
+                    uint32_t new_space_id = active_scene.as.create_space_for_models(
+                        relative_meshes);
+                    node.as_ref = {new_space_id, ASType::Octree};
+
+                    if (auto_select)
+                    {
+                        active_scene.set_active_space(new_space_id);
+                    }
+                }
+                device_data_mutex.unlock();
+                if (auto_play)
+                    play();
+            }
+
+            active_scene.as.config_ui();
+
+
+            ImGui::Separator();
+
+
+
+            ImGui::Checkbox("Auto select for render after build", &auto_select);
+            ImGui::Checkbox("Auto play after build", &auto_play);
+            ImGui::BeginDisabled(sub_triangles == 0 || selected_as_type != 0);
+
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+
+            ImGui::BeginDisabled(!node.as_ref.is_valid());
+            if (ImGui::Button("Select for Render"))
+            {
+                device_data_mutex.lock();
+                active_scene.set_active_space(node.as_ref.space_id);
+                device_data_mutex.unlock();
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+
+            ImGui::BeginDisabled(!node.as_ref.is_valid());
+            if (ImGui::Button("Free AS"))
+            {
+                pause();
+                device_data_mutex.lock();
+                if (node.as_ref.is_valid())
+                {
+                    active_scene.as.free_space(node.as_ref.space_id);
+                    node.as_ref = {};
+                }
+                device_data_mutex.unlock();
+            }
+            ImGui::EndDisabled();
         }
         ImGui::EndChild();
     }
@@ -517,37 +677,10 @@ void RaytracerController::next_frame()
 
 bool RaytracerController::ui_table()
 {
-    static bool open=true;
-    if (ImGui::Begin("Table",&open))
-    {
-        auto& soa_tables=scenes[active_scene_number].soa_tables;
-
-        if (ImGui::BeginCombo("Select table", active_table.c_str()))
-        {
-            for (auto& [key,val]:soa_tables)
-            {
-                const bool is_selected = (key==active_table);
-
-                if (ImGui::Selectable(key.c_str(), is_selected))
-                {
-                    active_table=key;
-                }
-
-                if (is_selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
-
-        bool data_available=!cuda_is_running && device_data_mutex.try_lock();
-        if (!active_table.empty())
-            soa_tables.at(active_table)->draw(data_available);
-        if (data_available)
-            device_data_mutex.unlock();
-
-    }
-    ImGui::End();
+    bool data_available = !cuda_is_running && device_data_mutex.try_lock();
+    bool open = scenes[active_scene_number].explorer.draw("Table", data_available);
+    if (data_available)
+        device_data_mutex.unlock();
 
     return open;
 }

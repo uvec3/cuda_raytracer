@@ -9,6 +9,21 @@
 #undef min
 #undef max
 
+enum class ASType : uint32_t
+{
+    None = 0,
+    Octree = 1,
+    BVH = 2
+};
+
+struct ASRef
+{
+    uint32_t space_id = UINT32_MAX;
+    ASType type = ASType::None;
+
+    bool is_valid() const { return space_id != UINT32_MAX && type != ASType::None; }
+};
+
 enum class PrimitiveType: int
 {
     Count,

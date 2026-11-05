@@ -29,6 +29,51 @@ void Node::setTransform(glm::mat4 &transform)
     m_dirty = false;
 }
 
+void Node::get_mesh_transform_relative(glm::mat4 current_transform,
+                                       std::vector<std::pair<glm::mat4, Mesh&>>& result,
+                                       std::vector<Mesh>& meshes)
+{
+    if (meshId > 0 && meshId - 1 < meshes.size())
+    {
+        result.push_back({current_transform, meshes[meshId - 1]});
+    }
+
+    for (auto& child : children)
+    {
+        child.get_mesh_transform_relative(current_transform * child.getTransform(), result, meshes);
+    }
+}
+
+size_t Node::count_subtree_meshes() const
+{
+    size_t count = (meshId > 0) ? 1 : 0;
+    for (const auto& child : children)
+    {
+        count += child.count_subtree_meshes();
+    }
+    return count;
+}
+
+size_t Node::count_subtree_triangles(const std::vector<Mesh>& meshes) const
+{
+    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].triangles.size() : 0;
+    for (const auto& child : children)
+    {
+        count += child.count_subtree_triangles(meshes);
+    }
+    return count;
+}
+
+size_t Node::count_subtree_vertices(const std::vector<Mesh>& meshes) const
+{
+    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].vertices.size() : 0;
+    for (const auto& child : children)
+    {
+        count += child.count_subtree_vertices(meshes);
+    }
+    return count;
+}
+
 Scene::Scene(std::string_view name):m_name(name)
 {
     m_active_space=root_space;
@@ -436,6 +481,9 @@ Node Scene::importNode(const tg3_model& model, uint32_t nodeIndex, const std::ve
 {
     const tg3_node& tg3Node = model.nodes[nodeIndex];
     Node node;
+    node.name = (tg3Node.name.data != nullptr && tg3Node.name.len > 0)
+        ? std::string(tg3Node.name.data, tg3Node.name.len)
+        : ("Node " + std::to_string(nodeIndex));
 
     if (tg3Node.has_matrix)
     {
@@ -479,57 +527,45 @@ void Scene::load_nodes(const tg3_model& model, const std::vector<uint32_t>& mesh
         ? static_cast<uint32_t>(model.default_scene)
         : 0;
 
-    scenes.reserve(scenes.size() + model.scenes_count);
+    root_node = Node{};
+    root_node.name = m_name.empty() ? "Model Root" : m_name;
+    root_node.children.reserve(model.scenes_count);
+
     for (uint32_t scene_id = 0; scene_id < model.scenes_count; ++scene_id)
     {
         const tg3_scene* scene = &model.scenes[scene_id];
 
-        GltfScene gltf_scene;
-        gltf_scene.name = scene->name.data != nullptr
+        Node subscene_node;
+        subscene_node.name = (scene->name.data != nullptr && scene->name.len > 0)
             ? std::string(scene->name.data, scene->name.len)
-            : "";
-        gltf_scene.root_nodes.reserve(scene->nodes_count);
+            : ("Subscene " + std::to_string(scene_id));
+        subscene_node.children.reserve(scene->nodes_count);
 
         for (uint32_t i = 0; i < scene->nodes_count; ++i)
         {
-            gltf_scene.root_nodes.push_back(importNode(model, scene->nodes[i], meshIds));
+            subscene_node.children.push_back(importNode(model, scene->nodes[i], meshIds));
         }
 
-        scenes.push_back(std::move(gltf_scene));
+        root_node.children.push_back(std::move(subscene_node));
     }
 }
 
-std::vector<std::pair<glm::mat4, Mesh&>> Scene::get_mesh_transform(int scene_index)
+std::vector<std::pair<glm::mat4, Mesh&>> Scene::get_mesh_transform(const Node* node)
 {
     std::vector<std::pair<glm::mat4, Mesh&>> result;
-    if (scenes.empty())
+    if (node != nullptr)
+    {
+        const_cast<Node*>(node)->get_mesh_transform_relative(glm::mat4(1.0f), result, m_meshes);
         return result;
-
-    uint32_t target_scene = (scene_index >= 0 && static_cast<size_t>(scene_index) < scenes.size())
-        ? static_cast<uint32_t>(scene_index)
-        : default_scene;
-
-    if (target_scene >= scenes.size())
-        target_scene = 0;
-
-    for (auto& root : scenes[target_scene].root_nodes)
-    {
-        mesh_transform_recursive(root, glm::mat4(1), result);
     }
+
+    if (root_node.children.empty())
+    {
+        root_node.get_mesh_transform_relative(glm::mat4(1.0f), result, m_meshes);
+        return result;
+    }
+
+    uint32_t target_scene = (default_scene < root_node.children.size()) ? default_scene : 0;
+    root_node.children[target_scene].get_mesh_transform_relative(glm::mat4(1.0f), result, m_meshes);
     return result;
-}
-
-
-void Scene::mesh_transform_recursive(Node& node, glm::mat4 transform, std::vector<std::pair<glm::mat4, Mesh&>>& result)
-{
-    auto current_transform = transform * node.getTransform();
-    if (node.meshId > 0)
-    {
-        result.push_back({current_transform, m_meshes[node.meshId - 1]});
-    }
-
-    for (auto& child : node.children)
-    {
-        mesh_transform_recursive(child, current_transform, result);
-    }
 }

@@ -22,7 +22,6 @@ add_executable(Raytracer main.cpp
         src/raytracer/Raytracer.cu src/raytracer/Raytracer.cuh
         src/raytracer/Scene.cpp src/raytracer/Scene.hpp
         src/acceleration_structures/octree/OctreeAS.cu src/acceleration_structures/octree/OctreeAS.cuh src/acceleration_structures/octree/OctreeGeometry.cuh
-        src/ui_helpers/soa_ui_view.hpp
 
         external/tinygltf.cpp external/tiny_gltf_v3.h
         external/stb_image.cpp external/stb_image.h
@@ -32,6 +31,7 @@ add_executable(Raytracer main.cpp
 
 set(VKBASE_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/assets/Scenes ${CMAKE_CURRENT_SOURCE_DIR}/assets/Fonts)
 add_subdirectory(vkbase)
+add_subdirectory(external/imgui_container_explorer)
 vkbase_target_copy_assets(Raytracer)
 
 target_link_libraries(Raytracer
@@ -46,6 +46,7 @@ target_link_libraries(Raytracer
         vkbase::buffer
         vkbase::image
         vkbase::cuda
+        imgui_container_explorer::imgui_container_explorer
 )
 
 add_subdirectory(tests)

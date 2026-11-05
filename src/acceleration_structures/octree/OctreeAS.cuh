@@ -58,6 +58,9 @@ public:
         };
     }
 
+    void config_ui();
+    void register_containers(ContainerExplorer& explorer);
+
     OctreeAS();
 
     uint32_t create_space();
@@ -66,9 +69,13 @@ public:
 
 
     void insert_triangles(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
-                          triangle_box_stop_ratio);
+                          triangle_box_stop_ratio, bool use_gpu = true);
+    void insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
+                              triangle_box_stop_ratio);
+    void insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
+                              triangle_box_stop_ratio);
 
-    uint32_t create_space_for_models(range_of<std::pair<glm::mat4,Mesh&>> auto&& meshes, bool stretch, bool swapYZ, int depth_min, int depth_max, float triangle_to_box_stop_ratio)
+    uint32_t create_space_for_models(range_of<std::pair<glm::mat4,Mesh&>> auto&& meshes)
     {
         size_t triangles_size=0;
         size_t vertices_size=0;
@@ -112,9 +119,13 @@ public:
 
 
                 dst_vertex.position=transform*glm::vec4(dst_vertex.position,1);
-                if (swapYZ)
+                dst_vertex.normal=transform*glm::vec4(dst_vertex.normal,0);
+                if (config.swapYZ)
                 {
                     std::swap(dst_vertex.position.y,dst_vertex.position.z);
+                    dst_vertex.position.y=-dst_vertex.position.y;
+                    std::swap(dst_vertex.normal.y,dst_vertex.normal.z);
+                    dst_vertex.normal.y=-dst_vertex.normal.y;
                 }
             }
 
@@ -126,14 +137,17 @@ public:
         d_vertices = vertices;
         d_triangles = triangles;
 
-        normalize_space(space_id, stretch);
-        sort_space(space_id);
+        normalize_space(space_id, config.stretch);
+        if (config.sort_space)
+        {
+            sort_space(space_id);
+        }
 
         //download back
         static_cast<soa::soa_vector<Vertex>&>(vertices) = d_vertices;
         static_cast<soa::soa_vector<Triangle>&>(triangles) = d_triangles;
 
-        insert_triangles(space_id, spaces[space_id].first_triangle,triangles_size, depth_min, depth_max, triangle_to_box_stop_ratio);
+        insert_triangles(space_id, spaces[space_id].first_triangle,triangles_size, config.min_depth, config.max_depth, config.triangle_to_box_stop_ratio,config.use_gpu);
 
         sync_to_device();
 
@@ -148,6 +162,21 @@ public:
     void free_box_content(int box_id);
     void normalize_space(uint32_t space_id, bool stretch);
     void sort_space(uint32_t space_id);
+
+
+    struct Config
+    {
+        int min_depth = 1;
+        int max_depth = 19;
+        float triangle_to_box_stop_ratio = 1.1f;
+        bool stretch = false;
+        bool swapYZ = true;
+
+        bool use_gpu = true;
+        bool sort_space = true;
+    };
+
+    Config config;
 
 };
 static_assert(AS<OctreeAS>); //OctreeAS implements AS concept

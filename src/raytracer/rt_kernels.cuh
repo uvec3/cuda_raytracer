@@ -19,10 +19,17 @@ struct RenderParameters
     glm::mat3 rotation;
     float near_ = 1;
 
+    float ambient_light=0.1;
+    float diffuse_light=0.9;
+
+    bool fixed_light_source=false;
+    glm::vec3 light_source{0.5, 0.5,1.5};
+
     bool show_iterations=true;
     bool measure_time=false;
     bool show_triangles=true;
     bool show_boxes=true;
+    bool use_fake_normals=true;
 
     int time_max=50000;
 

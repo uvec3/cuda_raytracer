@@ -21,14 +21,46 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
 }
 
 
-__host__ __device__ __forceinline__
-float triangle_simple_lighting(glm::vec3 v0,glm::vec3 v1,glm::vec3 v2, glm::vec3 dir, float u, float v)
+
+inline __host__ __device__
+glm::vec4 fragment_shader(uint32_t primitive_id, glm::vec3 ray_src, glm::vec3  ray_dir, glm::vec3 tuv, RenderParameters& p)
 {
     using namespace glm;
-    auto normal = normalize(cross(v1-v0, v2-v0));
-    return abs(dot(normalize(dir),normal));
-}
 
+    auto v0_id=p.triangles[primitive_id].v1;
+    auto v1_id=p.triangles[primitive_id].v2;
+    auto v2_id=p.triangles[primitive_id].v3;
+    glm::vec3 normal;
+    if (p.use_fake_normals)
+    {
+        auto n0=p.vertices[v0_id].normal;
+        auto n1=p.vertices[v1_id].normal;
+        auto n2=p.vertices[v2_id].normal;
+        normal = n0*(1-tuv[1]-tuv[2])+n1*tuv[1]+n2*tuv[2];
+    }
+    else
+    {
+        auto v0=p.vertices[v0_id].position;
+        auto v1=p.vertices[v1_id].position;
+        auto v2=p.vertices[v2_id].position;
+        normal=glm::normalize(glm::cross(v1-v0, v2-v0));
+    }
+
+    float diffuse;
+    if (p.fixed_light_source)
+    {
+        auto intersection=ray_src+ray_dir*tuv[0];
+        auto l=p.light_source-intersection;
+        auto dist=length(l);
+        diffuse = clamp( dot(l/dist,normal),0.f,1.f);
+    }
+    else
+    {
+        diffuse = abs(dot(normalize(ray_dir),normal));
+    }
+
+    return vec4(diffuse*p.diffuse_light+p.ambient_light);
+}
 
 __host__ __device__
 glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p)
@@ -42,6 +74,7 @@ glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p)
     direction={ direction.x*p.az_c.x-direction.y*p.az_c.y, direction.x*p.az_c.y+direction.y*p.az_c.x, direction.z};
 
     auto source=p.view_pos;
+    auto current_source=source;
 
     // direction=glm::normalize(direction);
 
@@ -58,7 +91,7 @@ glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p)
     {
         //AS TRAVERSAL
         DEVICE_ONLY(__syncwarp());
-        auto result=traverse_stackless(&p.as[0].child, current_box,source,direction,it);
+        auto result=traverse_stackless(&p.as[0].child, current_box,current_source,direction,it);
         container_id=result.content;
         DEVICE_ONLY(__syncwarp());
 
@@ -78,13 +111,13 @@ glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p)
                     if (p.primitives[primitives_start+i].type == PrimitiveType::Triangle)
                     {
                         auto triangle_id=p.primitives[primitives_start+i].id;
-                        auto v1_id=p.triangles[triangle_id].v1;
-                        auto v2_id=p.triangles[triangle_id].v2;
-                        auto v3_id=p.triangles[triangle_id].v3;
+                        auto v0_id=p.triangles[triangle_id].v1;
+                        auto v1_id=p.triangles[triangle_id].v2;
+                        auto v2_id=p.triangles[triangle_id].v3;
 
                         glm::vec3 tuv;
                         bool hit=intersectRayTriangle(source,direction,
-                            p.vertices[v1_id].position,p.vertices[v2_id].position,p.vertices[v3_id].position,
+                            p.vertices[v0_id].position,p.vertices[v1_id].position,p.vertices[v2_id].position,
                             tuv.x,tuv.y,tuv.z);
 
                         if (hit)
@@ -103,12 +136,15 @@ glm::vec4 draw_pixel(uint32_t x, uint32_t y, RenderParameters p)
                             {
                                 closest_tuv=tuv;
                                 closest_triangle=triangle_id;
-                                hit_primitive_color=triangle_simple_lighting(p.vertices[v1_id].position,p.vertices[v2_id].position,p.vertices[v3_id].position,
-                                    direction,tuv[1],tuv[2]);
                             }
                         }
                     }
                 }
+            }
+
+            if (closest_triangle!=UINT32_MAX)
+            {
+                hit_primitive_color=fragment_shader(closest_triangle,source,direction,closest_tuv,p).r;
             }
         }
 

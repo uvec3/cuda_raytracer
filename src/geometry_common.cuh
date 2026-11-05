@@ -336,6 +336,13 @@ struct BoxStack
     }
 
     __host__ __device__ __forceinline__
+    void descend()
+    {
+        TEST_ASSERT(depth()<max_depth);
+        ++m_lo;//increment depth
+    }
+
+    __host__ __device__ __forceinline__
     void ascend()
     {
         TEST_ASSERT(depth()>0);
