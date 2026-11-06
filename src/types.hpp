@@ -30,6 +30,7 @@ enum class PrimitiveType: int
     Sphere,
     Triangle,
     Subspace,
+    NagataPatch,
     Dynamic//??
 };
 
@@ -44,18 +45,17 @@ struct Transform
 struct Vertex
 {
     glm::vec3& position;
-    glm::vec3& color;
     glm::vec3& normal;
+    glm::vec3& color;
     glm::vec3& uv;
-
 };
 
 struct Triangle
 {
-    uint32_t& v1;
-    uint32_t& v2;
-    uint32_t& v3;
-    uint32_t& material_id;
+    uint32_t v1;
+    uint32_t v2;
+    uint32_t v3;
+    uint32_t material_id;
 };
 
 struct Sphere
@@ -66,8 +66,8 @@ struct Sphere
 
 struct Primitive
 {
-    PrimitiveType& type;//first primitive is PrimitiveType::Count
-    uint32_t& id; //for first primitive holds number of primitives that follow
+    PrimitiveType type;//first primitive is PrimitiveType::Count
+    uint32_t id; //for first primitive holds number of primitives that follow
 };
 
 struct Space
@@ -91,19 +91,11 @@ struct Space
     glm::vec3& normalization_scale;
 };
 
-struct Box
-{
-    int32_t &child;
-    uint32_t& parent;
-    uint32_t& space_id;
-};
-
 struct BoxContent
 {
-    uint32_t& start;
-    uint32_t& number_of_primitives;
+    uint32_t start;
+    uint32_t number_of_primitives;
 };
-
 
 struct SpaceView
 {
@@ -118,7 +110,6 @@ struct Material
     uint32_t textureIndex = 0;
 };
 
-
 struct Ray
 {
     glm::vec3& src;
@@ -132,4 +123,3 @@ struct Beam
     uint32_t& size;
     uint32_t& traced;
 };
-

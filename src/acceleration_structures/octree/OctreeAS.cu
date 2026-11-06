@@ -1,5 +1,6 @@
 #include "OctreeAS.cuh"
 #include <thrust/device_vector.h>
+#include <thrust/fill.h>
 #include <thrust/sort.h>
 
 #include "imgui.h"
@@ -15,7 +16,7 @@ struct InsertionContext
     float triangle_box_stop_ratio;
     soa::soa_view<TriangleNumberId> num_id;
 
-    soa::soa_vector<Box> __as;
+    soa::soa_vector<int> __as;
     soa::soa_vector<BoxContent> __box_content;
     soa::soa_vector<Primitive> __primitives;
 };
@@ -29,6 +30,13 @@ void OctreeAS::config_ui()
     ImGui::Checkbox("Swap y and z", &config.swapYZ);
     ImGui::Checkbox("Build on GPU", &config.use_gpu);
     ImGui::Checkbox("Sort space", &config.sort_space);
+
+    const char* approx_names[] = {"Precise", "Approximate", "Nagata"};
+    int approx = static_cast<int>(config.primitive_approximation);
+    if (ImGui::Combo("Primitive approximation", &approx, approx_names, 3))
+    {
+        config.primitive_approximation = static_cast<PrimitiveApproximation>(approx);
+    }
 }
 
 void OctreeAS::register_containers(ContainerExplorer& explorer)
@@ -45,9 +53,7 @@ OctreeAS::OctreeAS()
 {
     //reserve element 0 for empty value and don't use it
     as.alloc(1);
-    as[0].child = 0;
-    as[0].parent = 0;
-    as[0].space_id = 0;
+    as[0] = 0;
     box_content.alloc(1);
     sync_to_device();
 }
@@ -55,13 +61,9 @@ OctreeAS::OctreeAS()
 uint32_t OctreeAS::create_space()
 {
     auto new_space_id=spaces.alloc_element();
-    auto new_space=spaces[new_space_id];
+    auto&& new_space=spaces[new_space_id];
     auto root_box_id=as.alloc_element();
-    auto root_box=as[root_box_id];
-
-    root_box.child=0;
-    root_box.space_id=new_space_id;
-    root_box.parent=0;
+    as[root_box_id]=0;
 
     new_space.root_box =new_space_id;
     new_space.first_triangle =0;
@@ -111,17 +113,13 @@ void OctreeAS::free_space(uint32_t space_id)
 
 int OctreeAS::divide_box(InsertionContext& insertion_context, BoxInfo box_info)
 {
-    auto box = insertion_context.__as[box_info.id];
-    auto content = box.child;
+    auto content = insertion_context.__as[box_info.id];
     const int32_t child_start = insertion_context.__as.allocate(9);
-    for (int i = 0; i < 9; ++i)
+    for (int i = 0; i < 8; ++i)
     {
-        auto new_box = insertion_context.__as[child_start + i];
-        new_box.child = 0;
-        new_box.parent = box_info.id;
-        new_box.space_id = insertion_context.__as[box_info.id].space_id;
+        insertion_context.__as[child_start + i] = 0;
     }
-    insertion_context.__as[child_start + 8].child = static_cast<int>(box_info.id);//place parent id as 9-th element
+    insertion_context.__as[child_start + 8] = static_cast<int>(box_info.id);//place parent id as 9-th element
 
     if (content > 0)
         throw std::runtime_error("ain't suppose to divide if already split");
@@ -131,7 +129,7 @@ int OctreeAS::divide_box(InsertionContext& insertion_context, BoxInfo box_info)
         exit(1);
     }
 
-    insertion_context.__as[box_info.id].child = child_start;
+    insertion_context.__as[box_info.id] = child_start;
     return child_start;
 }
 
@@ -141,13 +139,13 @@ void OctreeAS::add_box_contents(InsertionContext& ic, uint32_t box_id, Primitive
     if (primitives.empty())
         return;
 
-    auto content_id = ic.__as[box_id].child;
+    auto content_id = ic.__as[box_id];
     if (content_id > 0)
         throw std::runtime_error("can't add content");
     if (content_id == 0)//if empty
     {
         content_id = -ic.__box_content.allocate(1);
-        ic.__as[box_id].child = content_id;
+        ic.__as[box_id] = content_id;
         ic.__box_content[-content_id].number_of_primitives = 0;
     }
 
@@ -166,7 +164,7 @@ void OctreeAS::add_box_contents(InsertionContext& ic, uint32_t box_id, Primitive
 
     for (int i = 0; i < primitives.size(); ++i)
     {
-        auto new_primitive = ic.__primitives[start + number_of_primitives + i];
+        auto&& new_primitive = ic.__primitives[start + number_of_primitives + i];
         new_primitive.type = type;
         new_primitive.id = primitives[i];
     }
@@ -209,10 +207,11 @@ void OctreeAS::normalize_space(uint32_t space_id,bool stretch)
 }
 
 
-#define STACK_SIZE 2048
+#define STACK_SIZE 3000
 __global__
 void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vertex> vertices, uint32_t first_triangle,
-    uint32_t number_of_triangles,  soa::soa_view<TriangleNumberId> result, uint32_t* result_counter, int DEPTH_MIN, int DEPTH_MAX, float TRIANGLE_BOX_STOP_RATIO)
+    uint32_t number_of_triangles,  soa::soa_view<TriangleNumberId> result, uint32_t* result_counter, int DEPTH_MIN, int DEPTH_MAX, float TRIANGLE_BOX_STOP_RATIO,
+    auto find_triangle_cube_relation)
 {
     struct StackElement
     {
@@ -251,7 +250,10 @@ void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vert
         auto v1=vertices[triangles[t_id].v1].position;
         auto v2=vertices[triangles[t_id].v2].position;
         auto v3=vertices[triangles[t_id].v3].position;
-        auto rel=find_triangle_cube_relation_precise(box.get_center(),box.half_box_size(),v1,v2,v3);
+        auto n1=vertices[triangles[t_id].v1].normal;
+        auto n2=vertices[triangles[t_id].v2].normal;
+        auto n3=vertices[triangles[t_id].v3].normal;
+        auto rel=find_triangle_cube_relation(box.get_center(),box.half_box_size(),v1,v2,v3,n1,n2,n3);
 
         if (rel!=TriangleCubeRelation::Outside)
         {
@@ -321,12 +323,15 @@ void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vert
                 auto v0=vertices[triangles[t_id].v1].position;
                 auto v1=vertices[triangles[t_id].v2].position;
                 auto v2=vertices[triangles[t_id].v3].position;
+                auto n0=vertices[triangles[t_id].v1].normal;
+                auto n1=vertices[triangles[t_id].v2].normal;
+                auto n2=vertices[triangles[t_id].v3].normal;
 
                 box.descend(0);
                 for (int branch=0;branch<8;++branch)
                 {
                     box.move(branch);
-                    auto rel=find_triangle_cube_relation_precise(box.get_center(),box.half_box_size(),v0,v1,v2);
+                    auto rel=find_triangle_cube_relation(box.get_center(),box.half_box_size(),v0,v1,v2,n0,n1,n2);
                     if (rel!=TriangleCubeRelation::Outside)
                     {
                         push_to_stack(t_id,box);
@@ -365,13 +370,6 @@ CUDA_HOST_DEVICE uint32_t find_greater_or_equal_index(T value, const T* sorted_l
     }
 
     return search_start;
-}
-
-__device__ bool is_box_empty(const uint64_t* used_boxes,uint32_t used_boxes_size,  BoxStack box)
-{
-    auto begin_pos=find_greater_or_equal_index(box.begin(),used_boxes,0,used_boxes_size);
-    auto end_pos=find_greater_or_equal_index(box.begin(),used_boxes,0,used_boxes_size);
-    return begin_pos!=end_pos;
 }
 
 struct ExecutionState
@@ -504,6 +502,7 @@ __global__ void create_as(const uint64_t* used_boxes, uint32_t used_boxes_size, 
     }
 }
 
+#define STACK_SIZE 2048
 __global__ void expand_number_id(
     soa::soa_view<Triangle> triangles,
     soa::soa_view<Vertex> vertices,
@@ -513,7 +512,8 @@ __global__ void expand_number_id(
     const uint64_t* as_box,
     soa::soa_view<TriangleNumberId> result,
     uint32_t* result_counter,
-    uint32_t max_result_capacity)
+    uint32_t max_result_capacity,
+    auto find_triangle_cube_relation)
 {
     struct StackElement
     {
@@ -617,6 +617,9 @@ __global__ void expand_number_id(
                 auto v0 = vertices[triangles[t_id].v1].position;
                 auto v1 = vertices[triangles[t_id].v2].position;
                 auto v2 = vertices[triangles[t_id].v3].position;
+                auto n0 = vertices[triangles[t_id].v1].normal;
+                auto n1 = vertices[triangles[t_id].v2].normal;
+                auto n2 = vertices[triangles[t_id].v3].normal;
 
                 for (int branch = 0; branch < 8; ++branch)
                 {
@@ -624,8 +627,8 @@ __global__ void expand_number_id(
                     BoxStack child_box = box;
                     child_box.descend(branch);
 
-                    auto rel = find_triangle_cube_relation_precise(
-                        child_box.get_center(), child_box.half_box_size(), v0, v1, v2);
+                    auto rel = find_triangle_cube_relation(
+                        child_box.get_center(), child_box.half_box_size(), v0, v1, v2, n0, n1, n2);
 
                     if (rel != TriangleCubeRelation::Outside)
                     {
@@ -741,9 +744,9 @@ __global__ void adjust_box_content_offsets_kernel(
     }
 }
 
-void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles,int depth_min, int depth_max, float triangle_box_stop_ratio)
+void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles,int depth_min, int depth_max, float triangle_box_stop_ratio,auto find_triangle_cube_relation)
 {
-    static constexpr uint32_t block_size=256;
+    static constexpr uint32_t block_size=128;
     uint32_t number_of_blocks= (number_of_triangles-1) / block_size + 1;
 
     soa::cuda_device_vector<TriangleNumberId> d_number_id(number_of_triangles*100);
@@ -753,7 +756,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     CUDA_CHECK(cudaMemset(d_result_size, 0, sizeof(uint32_t)));
 
     evaluate_triangle_box<<<number_of_blocks,block_size>>>(d_triangles.view(),d_vertices.view(),triangle_first,
-       number_of_triangles,d_number_id.view(),d_result_size,depth_min,depth_max,triangle_box_stop_ratio);
+       number_of_triangles,d_number_id.view(),d_result_size,depth_min,depth_max,triangle_box_stop_ratio,find_triangle_cube_relation);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     uint32_t result_size = 0;
@@ -772,7 +775,8 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
 
     // Step 1: create_as (Single-Block Kernel, Layer-by-Layer)
     uint32_t max_as_capacity = std::max(2048u, result_size * 18 + 1024);
-    thrust::device_vector<int> d_local_as(max_as_capacity, 0);
+    soa::cuda_device_vector<int> d_local_as(max_as_capacity);
+    thrust::fill_n(thrust::device, &d_local_as[0], max_as_capacity, 0);
     thrust::device_vector<uint64_t> d_as_box(max_as_capacity, 0);
 
     uint32_t* d_as_size = nullptr;
@@ -781,7 +785,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
 
     create_as<<<1, 256>>>(
         &d_number_id[0].number, result_size,
-        d_local_as.data().get(), d_as_box.data().get(),
+        &d_local_as[0], d_as_box.data().get(),
         max_as_capacity, d_as_size);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -805,8 +809,9 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     expand_number_id<<<expand_blocks, 256>>>(
         d_triangles.view(), d_vertices.view(),
         d_number_id.view(), result_size,
-        d_local_as.data().get(), d_as_box.data().get(),
-        d_expanded_number_id.view(), d_expanded_size, max_expanded_capacity);
+        &d_local_as[0], d_as_box.data().get(),
+        d_expanded_number_id.view(), d_expanded_size, max_expanded_capacity,
+        find_triangle_cube_relation);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     uint32_t expanded_size = 0;
@@ -833,7 +838,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
 
     uint32_t leaf_blocks = (as_size - 1) / 256 + 1;
     count_leaf_primitives_kernel<<<leaf_blocks, 256>>>(
-        d_local_as.data().get(), d_as_box.data().get(), as_size,
+        &d_local_as[0], d_as_box.data().get(), as_size,
         &d_expanded_number_id[0].number, expanded_size,
         d_prim_counts.data().get(), d_has_content.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -852,13 +857,17 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     uint32_t total_contents = last_content_offset + last_has_content;
 
     soa::cuda_device_vector<BoxContent> d_local_box_content(total_contents + 1);
-    CUDA_CHECK(cudaMemset(d_local_box_content.view().m_data[0], 0, sizeof(uint32_t) * (total_contents + 1)));
-    CUDA_CHECK(cudaMemset(d_local_box_content.view().m_data[1], 0, sizeof(uint32_t) * (total_contents + 1)));
+    {
+        auto bc_begin = thrust::make_zip_iterator(d_local_box_content.get_tuple());
+        auto bc_end = thrust::make_zip_iterator(d_local_box_content.get_tuple(total_contents + 1));
+        using BcZipValue = typename decltype(bc_begin)::value_type;
+        thrust::fill(thrust::device, bc_begin, bc_end, BcZipValue{});
+    }
 
     soa::cuda_device_vector<Primitive> d_local_primitives(total_primitives);
 
     populate_leaf_primitives_kernel<<<leaf_blocks, 256>>>(
-        d_local_as.data().get(), d_as_box.data().get(), as_size,
+        &d_local_as[0], d_as_box.data().get(), as_size,
         &d_expanded_number_id[0].number, &d_expanded_number_id[0].id, expanded_size,
         d_prim_counts.data().get(), d_prim_offsets.data().get(),
         d_has_content.data().get(), d_content_offsets.data().get(),
@@ -879,7 +888,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     spaces[space_id].primitives_size = total_primitives;
 
     adjust_global_as_offsets_kernel<<<leaf_blocks, 256>>>(
-        d_local_as.data().get(), as_size, as_start, box_content_start);
+        &d_local_as[0], as_size, as_start, box_content_start);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (total_contents + 1 > 0)
@@ -893,34 +902,23 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     if (d_box_content.size() < box_content.size()) d_box_content.resize(box_content.size());
     if (d_primitives.size() < primitives.size()) d_primitives.resize(primitives.size());
 
-    int32_t* dst_as_child = static_cast<int32_t*>(d_as.view().m_data[0]) + as_start;
-    CUDA_CHECK(cudaMemcpy(dst_as_child, d_local_as.data().get(), as_size * sizeof(int32_t), cudaMemcpyDeviceToDevice));
-
-    uint32_t* dst_bc_start = static_cast<uint32_t*>(d_box_content.view().m_data[0]) + box_content_start;
-    uint32_t* dst_bc_count = static_cast<uint32_t*>(d_box_content.view().m_data[1]) + box_content_start;
-    CUDA_CHECK(cudaMemcpy(dst_bc_start, d_local_box_content.view().m_data[0], (total_contents + 1) * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst_bc_count, d_local_box_content.view().m_data[1], (total_contents + 1) * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-
+    d_as.range(as_start, as_size).copy_from(d_local_as);
+    d_box_content.range(box_content_start, total_contents + 1).copy_from(d_local_box_content);
     if (total_primitives > 0)
     {
-        PrimitiveType* dst_prim_type = static_cast<PrimitiveType*>(d_primitives.view().m_data[0]) + primitives_start;
-        uint32_t* dst_prim_id = static_cast<uint32_t*>(d_primitives.view().m_data[1]) + primitives_start;
-        CUDA_CHECK(cudaMemcpy(dst_prim_type, d_local_primitives.view().m_data[0], total_primitives * sizeof(PrimitiveType), cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(dst_prim_id, d_local_primitives.view().m_data[1], total_primitives * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        d_primitives.range(primitives_start, total_primitives).copy_from(d_local_primitives);
     }
 
     // Download to host pools for UI & debug
-    CUDA_CHECK(cudaMemcpy(static_cast<int32_t*>(as.view().m_data[0]) + as_start, dst_as_child, as_size * sizeof(int32_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(static_cast<uint32_t*>(box_content.view().m_data[0]) + box_content_start, dst_bc_start, (total_contents + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(static_cast<uint32_t*>(box_content.view().m_data[1]) + box_content_start, dst_bc_count, (total_contents + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    as.range(as_start, as_size).copy_from(d_as.range(as_start, as_size));
+    box_content.range(box_content_start, total_contents + 1).copy_from(d_box_content.range(box_content_start, total_contents + 1));
     if (total_primitives > 0)
     {
-        CUDA_CHECK(cudaMemcpy(static_cast<PrimitiveType*>(primitives.view().m_data[0]) + primitives_start, static_cast<PrimitiveType*>(d_primitives.view().m_data[0]) + primitives_start, total_primitives * sizeof(PrimitiveType), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(static_cast<uint32_t*>(primitives.view().m_data[1]) + primitives_start, static_cast<uint32_t*>(d_primitives.view().m_data[1]) + primitives_start, total_primitives * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        primitives.range(primitives_start, total_primitives).copy_from(d_primitives.range(primitives_start, total_primitives));
     }
 }
 
-void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float triangle_box_stop_ratio)
+void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float triangle_box_stop_ratio,auto find_triangle_cube_relation)
 {
     static constexpr uint32_t block_size = 256;
     uint32_t number_of_blocks = (number_of_triangles - 1) / block_size + 1;
@@ -933,7 +931,8 @@ void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, 
 
     evaluate_triangle_box<<<number_of_blocks, block_size>>>(
         d_triangles.view(), d_vertices.view(), triangle_first,
-        number_of_triangles, d_number_id.view(), d_result_size, depth_min, depth_max, triangle_box_stop_ratio);
+        number_of_triangles, d_number_id.view(), d_result_size, depth_min, depth_max, triangle_box_stop_ratio,
+        find_triangle_cube_relation);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     uint32_t result_size = 0;
@@ -955,11 +954,9 @@ void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, 
     insertion_context.triangle_box_stop_ratio = triangle_box_stop_ratio;
     insertion_context.__as.allocate(1);
     insertion_context.__box_content.allocate(1);
-    insertion_context.__as[0].child = 0;
-    insertion_context.__as[0].space_id = space_id;
-    insertion_context.__as[0].parent = 0;
+    insertion_context.__as[0] = 0;
 
-    insert_triangles_recursive(0, BoxStack{}, insertion_context, 0, result_size, {});
+    insert_triangles_recursive(0, BoxStack{}, insertion_context, 0, result_size, {}, find_triangle_cube_relation);
 
     auto as_start = as.alloc(insertion_context.__as.size());
     auto box_content_start = box_content.alloc(insertion_context.__box_content.size());
@@ -975,7 +972,7 @@ void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, 
 
     for (int i = 0; i < insertion_context.__as.size(); ++i)
     {
-        auto&& child = insertion_context.__as[i].child;
+        auto&& child = insertion_context.__as[i];
         if (child > 0)
             child += as_start;
         else if (child < 0)
@@ -997,19 +994,37 @@ void OctreeAS::insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, 
 
 void OctreeAS::insert_triangles(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float triangle_box_stop_ratio, bool use_gpu)
 {
-    if (use_gpu)
+    auto dispatch = [&](auto relation_func)
     {
-        insert_triangles_gpu(space_id, triangle_first, number_of_triangles, depth_min, depth_max, triangle_box_stop_ratio);
-    }
-    else
+        if (use_gpu)
+        {
+            insert_triangles_gpu(space_id, triangle_first, number_of_triangles, depth_min, depth_max, triangle_box_stop_ratio, relation_func);
+        }
+        else
+        {
+            insert_triangles_cpu(space_id, triangle_first, number_of_triangles, depth_min, depth_max, triangle_box_stop_ratio, relation_func);
+        }
+    };
+
+    switch (config.primitive_approximation)
     {
-        insert_triangles_cpu(space_id, triangle_first, number_of_triangles, depth_min, depth_max, triangle_box_stop_ratio);
+    case PrimitiveApproximation::Approximate:
+        dispatch(FindCubeIntersection<PrimitiveApproximation::Approximate>{});
+        break;
+    case PrimitiveApproximation::Nagata:
+        dispatch(FindCubeIntersection<PrimitiveApproximation::Nagata>{});
+        break;
+    case PrimitiveApproximation::Precise:
+    default:
+        dispatch(FindCubeIntersection<PrimitiveApproximation::Precise>{});
+        break;
     }
 }
 
 
 void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionContext& ic,
-                                                       uint32_t start, uint32_t size,const std::vector<std::pair<uint32_t,uint32_t>>& parent_triangles={})
+                                                       uint32_t start, uint32_t size, const std::vector<std::pair<uint32_t,uint32_t>>& parent_triangles,
+                                                       auto find_triangle_cube_relation)
 {
     auto depth=stack.depth();
 
@@ -1034,7 +1049,10 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
                 auto v0=vertices[triangles[t_id].v1].position;
                 auto v1=vertices[triangles[t_id].v2].position;
                 auto v2=vertices[triangles[t_id].v3].position;
-                auto rel=find_triangle_cube_relation_precise(stack.get_center(),stack.half_box_size(),v0,v1,v2);
+                auto n0=vertices[triangles[t_id].v1].normal;
+                auto n1=vertices[triangles[t_id].v2].normal;
+                auto n2=vertices[triangles[t_id].v3].normal;
+                auto rel=find_triangle_cube_relation(stack.get_center(),stack.half_box_size(),v0,v1,v2,n0,n1,n2);
                 if (rel!=TriangleCubeRelation::Outside)
                 {
                     additional_unsorted_triangles.push_back(t_id);
@@ -1043,7 +1061,7 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
         }
         if (!additional_unsorted_triangles.empty())
         {
-            auto content_id=- ic.__as[box_id].child;
+            auto content_id=- ic.__as[box_id];
             if (content_id==0)
             {
                 add_box_contents(ic,box_id,PrimitiveType::Triangle, additional_unsorted_triangles);
@@ -1069,11 +1087,11 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
 
         start+=exact_count;
         size-=exact_count;
-        if (ic.__as[box_id].child==0)
+        if (ic.__as[box_id]==0)
         {
             divide_box(ic, {stack.get_center(), stack.depth(),static_cast<uint32_t>(box_id),stack.box_size()});
         }
-        assert(ic.__as[box_id].child!=0);
+        assert(ic.__as[box_id]!=0);
 
         for (int branch=0; branch<8; ++branch)
         {
@@ -1096,7 +1114,7 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
             }
 
             if (end_pos>start || !next_parent_triangles.empty())
-                insert_triangles_recursive(ic.__as[box_id].child+branch, stack,ic,start,end_pos-start, next_parent_triangles);
+                insert_triangles_recursive(ic.__as[box_id]+branch, stack,ic,start,end_pos-start, next_parent_triangles, find_triangle_cube_relation);
             size-= (end_pos-start);
             start=end_pos;
 
@@ -1114,7 +1132,7 @@ void OctreeAS::free_box(int box_id)
 
 void OctreeAS::free_box_content(int box_id)
 {
-    auto content = as[box_id].child;
+    auto content = as[box_id];
     if (content > 0)
     {
         for (int branch = 0; branch < 8; ++branch)
@@ -1140,10 +1158,12 @@ void OctreeAS::sort_space(uint32_t space_id)
     if (triangles_size == 0 || spaces[space_id].vertices_size == 0)
         return;
 
+    auto triangles_range = d_triangles.view(triangles_start, triangles_size);
+
     thrust::device_vector<uint64_t> morton_codes(triangles_size,thrust::no_init);
-    calculate_morton_codes<<<(triangles_size-1)/128+1,128>>>(&d_vertices[0].position,&d_triangles[triangles_start].v1,
-        &d_triangles[triangles_start].v2,&d_triangles[triangles_start].v3,morton_codes.data().get(),triangles_size);
-    thrust::sort_by_key(thrust::device,morton_codes.begin(), morton_codes.end(),thrust::make_zip_iterator(d_triangles.get_tuple(triangles_start)));
+    calculate_morton_codes<<<(triangles_size-1)/128+1,128>>>(d_vertices.view(), triangles_range, morton_codes.data().get(), triangles_size);
+    auto t=d_triangles.get_tuple(triangles_start);
+    thrust::sort_by_key(thrust::device,morton_codes.begin(), morton_codes.end(),thrust::zip_iterator{t});
 
     //free memory
     morton_codes.resize(0);morton_codes.shrink_to_fit();
@@ -1151,28 +1171,9 @@ void OctreeAS::sort_space(uint32_t space_id)
     auto vertices_start=spaces[space_id].vertices_start;
     auto vertices_size=spaces[space_id].vertices_size;
 
+    auto map=sort_by_first_appearance_in_triangles(triangles_range,
+        triangles_size, vertices_start, vertices_size,
+        thrust::make_zip_iterator(d_vertices.get_tuple(vertices_start)));
 
-   auto map=sort_by_first_appearance_in_lists({&d_triangles[triangles_start].v1,&d_triangles[triangles_start].v2,&d_triangles[triangles_start].v3},
-       triangles_size, vertices_start,vertices_size,
-       thrust::make_zip_iterator(d_vertices.get_tuple(vertices_start)));
-
-
-    auto begin=&d_triangles[triangles_start].v1;
-    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
-    {
-        return map[v-vertices_start];
-    });
-
-    begin=&d_triangles[triangles_start].v2;
-    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
-    {
-        return map[v-vertices_start];
-    });
-
-    begin=&d_triangles[triangles_start].v3;
-    thrust::transform(thrust::device,begin,begin+triangles_size,begin,[map=map.data().get(),vertices_start]__device__(auto&& v)
-    {
-        return map[v-vertices_start];
-    });
-
+    remap_triangle_vertices<<<(triangles_size-1)/256+1,256>>>(triangles_range, map.data().get(), vertices_start, triangles_size);
 }

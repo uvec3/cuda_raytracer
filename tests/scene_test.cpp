@@ -32,7 +32,14 @@ TEST(Scene, NodeHierarchyAndASRef)
     auto subscene_meshes = scene.get_mesh_transform(&subscene);
     ASSERT_FALSE(subscene_meshes.empty());
 
-    uint32_t space_id = scene.as.create_space_for_models(subscene_meshes, false, true, 1, 10, 1.1f, true, true);
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as.config.use_gpu = true;
+    scene.as.config.sort_space = true;
+    uint32_t space_id = scene.as.create_space_for_models(subscene_meshes);
     subscene.as_ref = {space_id, ASType::Octree};
 
     EXPECT_TRUE(subscene.as_ref.is_valid());
@@ -54,7 +61,12 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.as.create_space_for_models(meshes, false, true, 1, 10, 1.1f);
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
 
     std::cout << "primitives_size = " << scene.as.spaces[space_id].primitives_size << std::endl;
     for (int i = 0; i < std::min(10, (int)scene.as.spaces[space_id].primitives_size); ++i)
@@ -90,7 +102,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0].child, current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
@@ -134,7 +146,13 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.as.create_space_for_models(meshes, false, true, 1, 10, 1.1f, /*use_gpu=*/false);
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as.config.use_gpu = false;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
 
     EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
@@ -158,7 +176,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0].child, current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
@@ -203,7 +221,14 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
     ASSERT_FALSE(meshes.empty());
 
     // Build AS without sort_space (sort = false)
-    uint32_t space_id = scene.as.create_space_for_models(meshes, false, true, 1, 10, 1.1f, /*use_gpu=*/true, /*sort=*/false);
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as.config.use_gpu = true;
+    scene.as.config.sort_space = false;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
 
     EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
@@ -227,7 +252,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0].child, current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
@@ -274,7 +299,12 @@ TEST(OctreeAS, BuildAndTraverseHairballGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.as.create_space_for_models(meshes, false, true, 1, 8, 1.1f);
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 8;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
     EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
@@ -317,3 +347,4 @@ TEST(Assets, DirectoryIterator)
     EXPECT_GE(count, 2);
     EXPECT_TRUE(found_teapot);
 }
+

@@ -4,6 +4,8 @@
 #define GLM_FORCE_PURE
 #include <glm/glm.hpp>
 #include <cstdint>
+#define NOMINMAX
+#include "types/NagataPatch.cuh"
 
 #undef min
 #undef max
@@ -19,6 +21,8 @@
 
 __host__ __device__ __forceinline__ bool intersectRayTriangle(
     const glm::vec3 orig, const glm::vec3 dir,
+    float tMin,
+    float tMax,
     const glm::vec3 v0, const glm::vec3 v1, const glm::vec3 v2,
     float& t, float& u, float& v)
 {
@@ -33,48 +37,70 @@ __host__ __device__ __forceinline__ bool intersectRayTriangle(
     // The subsequent math will yield Inf or NaN, which will fail the boolean checks below.
     float invDet = 1.0f / det;
 
-    glm::vec3 tvec = orig - v0;
+    // Shift origin to box entry so |tvec| ~ box_size instead of ~1.0 (avoids catastrophic cancellation at deep levels)
+    glm::vec3 local_orig = orig + dir * tMin;
+    glm::vec3 tvec = local_orig - v0;
     glm::vec3 qvec = glm::cross(tvec, edge1);
 
-    // Speculatively compute barycentric coordinates and distance
+    // Speculatively compute barycentric coordinates and local distance
     float u_tmp = glm::dot(tvec, pvec) * invDet;
     float v_tmp = glm::dot(dir, qvec) * invDet;
-    float t_tmp = glm::dot(edge2, qvec) * invDet;
+    float t_local = glm::dot(edge2, qvec) * invDet;
+    float t_tmp = tMin + t_local;
+
+    float box_dt = tMax - tMin;
+    float t_eps = glm::max(1e-6f, box_dt * 1e-2f);
+    constexpr float uv_eps = 1e-5f;
 
     // Use bitwise AND (&) instead of logical AND (&&).
     // This prevents the compiler from generating short-circuit branching.
     // The conditions map directly to sequential predicate assignments in PTX.
-    bool is_valid = (glm::abs(det) > 1e-8f) &
-                    (u_tmp >= 0.0f) &
-                    (u_tmp <= 1.0f) &
-                    (v_tmp >= 0.0f) &
-                    (u_tmp + v_tmp <= 1.0f) &
-                    (t_tmp > 1e-8f);
+    bool is_valid = (glm::abs(det) > 1e-30f) &
+                    (u_tmp >= -uv_eps) &
+                    (u_tmp <= 1.0f + uv_eps) &
+                    (v_tmp >= -uv_eps) &
+                    (u_tmp + v_tmp <= 1.0f + uv_eps) &
+                    (t_tmp > 1e-7f) &
+                    (t_local >= -t_eps) &
+                    (t_local <= box_dt + t_eps);
 
     // Only write to the output variables if the intersection is valid.
     if (is_valid) {
         t = t_tmp;
-        u = u_tmp;
-        v = v_tmp;
+        u = glm::clamp(u_tmp, 0.0f, 1.0f);
+        v = glm::clamp(v_tmp, 0.0f, 1.0f);
     }
 
     return is_valid;
+}
+
+__host__ __device__ __forceinline__ bool intersectRayTriangle(
+    const glm::vec3 orig, const glm::vec3 dir,
+    const glm::vec3 v0, const glm::vec3 v1, const glm::vec3 v2,
+    float& t, float& u, float& v)
+{
+    return intersectRayTriangle(orig, dir, 0.0f, 1e30f, v0, v1, v2, t, u, v);
 }
 
 __device__ __host__
 inline glm::vec3 side(glm::vec3 p, glm::vec3 dir,glm::vec3 boxCenter, float boxSize)
 {
     using namespace glm;
-
-    vec3 checkDirection= glm::sign(dir);
-
-
-    vec3 remainedBox=checkDirection*(boxSize*0.5f)+boxCenter-p;
-    vec3 qubeizedDir= glm::abs(dir/remainedBox);//can be NAN
+    vec3 step_dir= glm::sign(dir);
+    vec3 exit_plane=step_dir*(boxSize*0.5f)+boxCenter;
+    vec3 remainedBox=exit_plane-p;
+    vec3 normalizedDir= glm::abs(dir/remainedBox);//can be NAN
     float maxCoord=
-        glm::max(glm::max(qubeizedDir[0],qubeizedDir[1]),qubeizedDir[2]);
-    vec3 mask=glm::sign(qubeizedDir-maxCoord)+1.0f;
-    return mask*checkDirection;
+        glm::max(glm::max(normalizedDir[0],normalizedDir[1]),normalizedDir[2]);
+    vec3 mask=glm::sign(normalizedDir-maxCoord)+1.0f;
+    return mask*step_dir;
+}
+
+
+__device__ __host__ inline
+void slab(glm::vec3 ray_src, glm::vec3 ray_dir, glm::vec3 b_min, glm::vec3 b_max)
+{
+
 }
 
 __device__ __host__
@@ -90,40 +116,44 @@ enum class TriangleCubeRelation
     Intersecting
 };
 
+enum class PrimitiveApproximation : int
+{
+    Precise = 0,
+    Approximate = 1,
+    Nagata = 2
+};
 
 __host__ __device__ __forceinline__
-TriangleCubeRelation find_triangle_cube_relation_approximate(glm::vec3 cube_center, float cube_half_size, const glm::vec3 triangle_in[3])
+TriangleCubeRelation find_triangle_cube_relation_approximate(glm::vec3 cube_center, float cube_half_size,
+    glm::vec3 v0, glm::vec3 v1, glm::vec3 v2,
+    glm::vec3 n0 = {}, glm::vec3 n1 = {}, glm::vec3 n2 = {})
 {
-    glm::vec3 triangle[3];
-    //get relative coordinates
-    for (int i=0;i<3;++i)
-    {
-        triangle[i]=triangle_in[i]-cube_center;
-    }
+    v0 -= cube_center;
+    v1 -= cube_center;
+    v2 -= cube_center;
 
-    bool inside=true;
-    for (int i=0;i<3;++i)
-    {
-        inside= inside && glm::all(glm::lessThanEqual(glm::abs(triangle[i]),glm::vec3(cube_half_size)));
-    }
+    bool inside = true;
+    inside = inside && glm::all(glm::lessThanEqual(glm::abs(v0), glm::vec3(cube_half_size)));
+    inside = inside && glm::all(glm::lessThanEqual(glm::abs(v1), glm::vec3(cube_half_size)));
+    inside = inside && glm::all(glm::lessThanEqual(glm::abs(v2), glm::vec3(cube_half_size)));
     if (inside)
         return TriangleCubeRelation::Inside;
 
-    glm::vec3 aabb_max=glm::max(glm::max(triangle[0],triangle[1]),triangle[2]);
-    glm::vec3 aabb_min=glm::min(glm::min(triangle[0],triangle[1]),triangle[2]);
-    if (    !(glm::all(glm::lessThan(aabb_min,glm::vec3(cube_half_size))) &&
-            glm::all(glm::greaterThan(aabb_max,glm::vec3(-cube_half_size))))         )
+    glm::vec3 aabb_max = glm::max(glm::max(v0, v1), v2);
+    glm::vec3 aabb_min = glm::min(glm::min(v0, v1), v2);
+    if (!(glm::all(glm::lessThan(aabb_min, glm::vec3(cube_half_size))) &&
+          glm::all(glm::greaterThan(aabb_max, glm::vec3(-cube_half_size)))))
     {
         return TriangleCubeRelation::Outside;
     }
-
 
     return TriangleCubeRelation::Intersecting;
 }
 
 __host__ __device__ __forceinline__
 TriangleCubeRelation find_triangle_cube_relation_precise(glm::vec3 cube_center, float cube_half_size,
-    glm::vec3 v0, glm::vec3 v1, glm::vec3 v2)
+    glm::vec3 v0, glm::vec3 v1, glm::vec3 v2,
+    glm::vec3 n0 = {}, glm::vec3 n1 = {}, glm::vec3 n2 = {})
 {
     using namespace glm;
     v0-=cube_center;
@@ -138,16 +168,17 @@ TriangleCubeRelation find_triangle_cube_relation_precise(glm::vec3 cube_center, 
     if (inside)
         return TriangleCubeRelation::Inside;
 
+    const float eps_half_size = cube_half_size * (1.0f + 1e-4f);
     glm::vec3 aabb_max=glm::max(glm::max(v0,v1),v2);
     glm::vec3 aabb_min=glm::min(glm::min(v0,v1),v2);
-    if (    !(glm::all(glm::lessThanEqual(aabb_min,glm::vec3(cube_half_size))) &&
-            glm::all(glm::greaterThanEqual(aabb_max,glm::vec3(-cube_half_size))))         )
+    if (    !(glm::all(glm::lessThanEqual(aabb_min,glm::vec3(eps_half_size))) &&
+            glm::all(glm::greaterThanEqual(aabb_max,glm::vec3(-eps_half_size))))         )
     {
         return TriangleCubeRelation::Outside;
     }
 
 
-    vec3 H = vec3(cube_half_size);
+    vec3 H = vec3(eps_half_size);
 
     // Precompute triangle edges
     vec3 e0 = v1 - v0;
@@ -204,6 +235,59 @@ TriangleCubeRelation find_triangle_cube_relation_precise(glm::vec3 cube_center, 
     return TriangleCubeRelation::Intersecting;
 }
 
+__host__ __device__ __forceinline__
+TriangleCubeRelation find_triangle_cube_relation_nagata(glm::vec3 cube_center, float cube_half_size,
+    glm::vec3 v0, glm::vec3 v1, glm::vec3 v2,
+    glm::vec3 n0 = {}, glm::vec3 n1 = {}, glm::vec3 n2 = {})
+{
+    NagataPatch patch = NagataPatch::fromTriangle(v0, v1, v2, n0, n1, n2);
+    const float eps_half_size = cube_half_size * (1.0f + 1e-4f);
+    AABB box{cube_center - glm::vec3(eps_half_size), cube_center + glm::vec3(eps_half_size)};
+    BoxIntersectionState state = classifyNagataBoxIntersection(patch, box, 4);
+    switch (state)
+    {
+    case BoxIntersectionState::INSIDE:
+        return TriangleCubeRelation::Inside;
+    case BoxIntersectionState::OUTSIDE:
+        return TriangleCubeRelation::Outside;
+    case BoxIntersectionState::INTERSECTS:
+    default:
+        return TriangleCubeRelation::Intersecting;
+    }
+}
+
+template <PrimitiveApproximation Mode>
+__host__ __device__ __forceinline__
+TriangleCubeRelation find_cube_intersection(glm::vec3 cube_center, float cube_half_size,
+    glm::vec3 v0, glm::vec3 v1, glm::vec3 v2,
+    glm::vec3 n0 = {}, glm::vec3 n1 = {}, glm::vec3 n2 = {})
+{
+    if constexpr (Mode == PrimitiveApproximation::Precise)
+    {
+        return find_triangle_cube_relation_precise(cube_center, cube_half_size, v0, v1, v2, n0, n1, n2);
+    }
+    else if constexpr (Mode == PrimitiveApproximation::Approximate)
+    {
+        return find_triangle_cube_relation_approximate(cube_center, cube_half_size, v0, v1, v2, n0, n1, n2);
+    }
+    else
+    {
+        return find_triangle_cube_relation_nagata(cube_center, cube_half_size, v0, v1, v2, n0, n1, n2);
+    }
+}
+
+template <PrimitiveApproximation Mode>
+struct FindCubeIntersection
+{
+    __host__ __device__ __forceinline__
+    TriangleCubeRelation operator()(glm::vec3 cube_center, float cube_half_size,
+        glm::vec3 v0, glm::vec3 v1, glm::vec3 v2,
+        glm::vec3 n0 = {}, glm::vec3 n1 = {}, glm::vec3 n2 = {}) const
+    {
+        return find_cube_intersection<Mode>(cube_center, cube_half_size, v0, v1, v2, n0, n1, n2);
+    }
+};
+
 
 __host__ __device__ __forceinline__
 int id_vec_to_int(glm::ivec3 id_vec)
@@ -256,7 +340,7 @@ uint32_t deinterleave_left(uint64_t x)
     x2.m_data=  (x2.m_data | (x2.m_data <<  4)) & 0xF00F00F00F00F00FULL;
     x2.m_data = (x2.m_data | (x2.m_data <<  8)) & 0xFF0000FF0000FF00ULL;
     x2.m_data = (x2.m_data | (x2.m_data << 16)) & 0xFFFF00000000FFFFULL;
-    x2.m_lo =   (x2.m_hi | x2.m_lo) & 0xFFFFFC00UL;
+    x2.m_lo =   (x2.m_hi | x2.m_lo) & 0xFFFFE000UL;
 
     return x2.m_lo;
 }
@@ -362,8 +446,9 @@ struct BoxStack
     glm::vec3 get_center(int target_depth) const
     {
         TEST_ASSERT(target_depth>=0 && target_depth<=this->depth());
-        uint32_t last_bit=1<<(31-target_depth);
-        uint32_t clean_mask = -(last_bit << 1);
+        uint32_t last_bit = 1u << (31 - target_depth);
+        // uint32_t clean_mask = -(last_bit << 1);
+        uint32_t clean_mask = static_cast<uint32_t>(-(static_cast<uint64_t>(last_bit) << 1));
 
         glm::vec3  center;
         center.z = bits_division_to_float(deinterleave_left(m_data << 1) & clean_mask | last_bit);
@@ -379,23 +464,19 @@ struct BoxStack
         return  get_center(depth());
     }
 
-    __host__ __device__  __forceinline__ [[nodiscard]]
+    __host__ __device__ __forceinline__ [[nodiscard]]
     static BoxStack getContainingBoxStack(glm::vec3 point, int depth)
     {
+        TEST_ASSERT(depth >= 0 && depth <= max_depth);
         BoxStack result;
-        // {
-        //     auto x_bits=spread_left_aligned(bits_division_from_float(point.x)>>3);
-        //     result.m_data|=x_bits;
-        // }
-        // {
-        //     auto y_bits=spread_left_aligned(bits_division_from_float(point.y)>>2);
-        //     result.m_data|=y_bits;
-        // }
-        // {
-        //     auto z_bits=spread_left_aligned(bits_division_from_float(point.z) >> 1 );
-        //     result.m_data|=z_bits;
-        // }
-
+        if (depth > 0)
+        {
+            uint64_t z_bits = spread_left_aligned(bits_division_from_float(point.z)) >> 1;
+            uint64_t y_bits = spread_left_aligned(bits_division_from_float(point.y)) >> 2;
+            uint64_t x_bits = spread_left_aligned(bits_division_from_float(point.x)) >> 3;
+            uint64_t keep_mask = ~((uint64_t(1) << (63 - depth * 3)) - 1);
+            result.m_data = ((z_bits | y_bits | x_bits) & keep_mask) | static_cast<uint64_t>(depth);
+        }
         return result;
     }
 
@@ -421,7 +502,7 @@ struct BoxStack
     void set_outside(bool outside)
     {
         if (outside)
-            m_hi= outside_bit;
+            m_hi|= outside_bit;
         else
             m_hi&= (~outside_bit);
     }
@@ -483,3 +564,5 @@ struct BoxStack
         printf("\n\n");
     }
 };
+
+

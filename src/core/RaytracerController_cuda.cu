@@ -35,6 +35,7 @@ bool RaytracerController::ui_show_parameters()
         ImGui::Checkbox("Show boxes",&p.show_boxes);
         ImGui::InputInt("Time max",&p.time_max);
         ImGui::Checkbox("Fake normals",&p.use_fake_normals);
+        ImGui::Checkbox("Nagata patch",&p.renderNagata);
         ImGui::Checkbox("Fixed light source",&p.fixed_light_source);
         ImGui::DragFloat3("Light source",&p.light_source[0],0.01);
         ImGui::DragFloat("Diffuse lightning",&p.diffuse_light,0.01);
@@ -133,7 +134,7 @@ void RaytracerController::draw_cuda(cudaSurfaceObject_t surface, uint32_t width,
     auto& scene=scenes[active_scene_number].scene;
 
     CUDA_CHECK(cudaEventRecord(start));
-    raytracer->draw(*scene,surface,width, height);
+    raytracer->draw_first_hit(*scene,surface,width, height);
     CUDA_CHECK(cudaEventRecord(finish));
 }
 
@@ -239,7 +240,7 @@ bool RaytracerController::ui_debug_pixel()
                 host_params.as = scene->as.as.view();
                 host_params.containers = scene->as.box_content.view();
                 host_params.primitives = scene->as.primitives.view();
-                debug_pixel_result=draw_pixel(debug_pixel.x,debug_pixel.y,host_params);
+                debug_pixel_result=trace_pixel_first_hit(debug_pixel.x,debug_pixel.y,host_params);
             }
             device_data_mutex.unlock();
         }

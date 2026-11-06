@@ -95,7 +95,8 @@ struct CurrentBox
 {
     int id;
     BoxStack stack;
-    float step=0.f;
+    float t_min=0.0f;
+    float t_max=0.0f;
 };
 
 struct TraversalResult
@@ -106,8 +107,12 @@ struct TraversalResult
 
 
 __device__ __host__
-inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box, glm::vec3& pos, glm::vec3 dir,int& iterations)
+inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box, glm::vec3 pos, glm::vec3& current_pos, glm::vec3 dir, int& iterations)
 {
+    constexpr float eps = 0x1p-21f;
+    glm::vec3 inv_dir = 1.0f / dir;
+    glm::vec3 step_dir = glm::mix(glm::vec3(-1.0f), glm::vec3(1.0f), glm::greaterThanEqual(dir, glm::vec3(0.0f)));
+
     glm::ivec3 center_delta;
     glm::vec3 center;
     int box_content=as[current_box.id];
@@ -118,11 +123,13 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
             return TraversalResult{.content =(uint32_t) -box_content,.stack=current_box.stack};
         }
 
-        if (!correct_ray_pos(pos,dir,BOX_SIZE))
+        current_pos=pos;
+        if (!correct_ray_pos(current_pos,dir,BOX_SIZE))
         {
             //no way of hitting anything inside the region
             return  {0,0};
         }
+        current_pos = glm::clamp(current_pos, glm::vec3(eps), glm::vec3(BOX_SIZE - eps));
 
         center=glm::vec3(0.5,0.5,0.5);
     }
@@ -130,7 +137,6 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
     {
         center = current_box.stack.get_center();
         center_delta = int_to_id_vec(current_box.stack.branch())*2-1;
-        pos=pos+dir*current_box.step;
     }
 
 
@@ -145,7 +151,7 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
         while (box_content>0)
         {
             //determine into which child box to descend
-            glm::ivec3 child_box = glm::greaterThanEqual(pos, center);
+            glm::ivec3 child_box = glm::greaterThanEqual(current_pos, center);
 
             //move center to child box center
             center_delta = child_box * 2 - 1;
@@ -161,12 +167,42 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
         }
 
 
+
+        //==========================================================================================
+        //--------------------------------------FIND EXIT DIRECTION---------------------------------
+        //
+        //==========================================================================================
+        float leaf_half_size = current_box.stack.half_box_size();
+        glm::vec3 leaf_center = center;
+        glm::vec3 exit_plane = leaf_center + step_dir * leaf_half_size;
+        glm::vec3 t_max = (exit_plane - pos) * inv_dir;
+        // Strictly pick a SINGLE exit axis (smallest t_max)
+        glm::ivec3 move_dir(0);
+        float exit_t;
+        if (t_max.x <= t_max.y && t_max.x <= t_max.z)
+        {
+            move_dir.x = static_cast<int>(step_dir.x);
+            exit_t = t_max.x;
+        }
+        else if (t_max.y <= t_max.z)
+        {
+            move_dir.y = static_cast<int>(step_dir.y);
+            exit_t = t_max.y;
+        }
+        else
+        {
+            move_dir.z = static_cast<int>(step_dir.z);
+            exit_t = t_max.z;
+        }
+        // Never allow a negative step (if pos slightly overshot exit_plane by 1 ULP, step = 0)
+        current_box.t_min=current_box.t_max;
+        current_box.t_max = glm::max(current_box.t_max, exit_t);
+
         //==========================================================================================
         //----------------------------------------ASCEND--------------------------------------------
         //
         //==========================================================================================
 
-        glm::ivec3 move_dir = side(pos, dir, center, current_box.stack.box_size());
         while (glm::any(glm::equal(center_delta, move_dir)))
         {//get out
             current_box.id=as[current_box.id+8-current_box.stack.branch()];//element number 8 is parent
@@ -197,14 +233,18 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
 
         current_box.stack.move(current_box.stack.branch()+offset);
 
-        // //update ray start point(pos)
-        auto flat_point=center+glm::vec3(move_dir)*current_box.stack.half_box_size();
-        current_box.step=ray_flat_intersection_offset(flat_point, move_dir, pos, dir);
+        // // //update ray start point(pos)
+        // auto flat_point=center+glm::vec3(move_dir)*current_box.stack.half_box_size();
+        // current_box.step=ray_flat_intersection_offset(flat_point, move_dir, pos, dir);
+
+        float shrink = leaf_half_size - eps;
+        glm::vec3 clamped = glm::clamp(pos + dir * current_box.t_max, leaf_center - shrink, leaf_center + shrink);
+        glm::vec3 snapped = exit_plane + glm::vec3(move_dir) * eps;
+        current_pos = glm::mix(clamped, snapped, glm::notEqual(move_dir, glm::ivec3(0)));
 
         if (box_content<0)
             return TraversalResult{.content =(uint32_t) -box_content,.stack = content_stack};
 
-        pos=pos+dir*current_box.step;
         box_content=as[current_box.id];
         content_stack=current_box.stack;
 
@@ -212,4 +252,11 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
         center=center+glm::vec3(move_dir)*current_box.stack.box_size();
         center_delta=center_delta+move_dir*2;
     }
+}
+
+__device__ __host__
+inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box, glm::vec3 pos, glm::vec3 dir, int& iterations)
+{
+    glm::vec3 current_pos = pos + dir * current_box.t_max;
+    return traverse_stackless(as, current_box, pos, current_pos, dir, iterations);
 }

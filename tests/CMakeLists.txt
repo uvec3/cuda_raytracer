@@ -29,7 +29,7 @@ target_compile_options(scene_test PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
-target_link_libraries(scene_test PRIVATE vkbase::assets glm::glm gtest_main vkbase::cuda imgui_container_explorer::imgui_container_explorer)
+target_link_libraries(scene_test PRIVATE vkbase::assets vkbase::imgui glm::glm gtest_main vkbase::cuda imgui_container_explorer::imgui_container_explorer)
 vkbase_target_copy_assets(scene_test ${VKBASE_ASSETS})
 
 

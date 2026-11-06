@@ -362,14 +362,13 @@ namespace container_explorer_detail
 
 #define CONTAINER_EXPLORER_ADDR_CASE(K) \
     else if constexpr (N == (K)) { \
-        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = obj; \
+        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = boost::pfr::detail::fake_object<T>(); \
         CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_RET, CONTAINER_EXPLORER_EMPTY) \
     }
 
     template <typename T, std::size_t I, std::size_t N>
     consteval auto address_of_value_field() noexcept
     {
-        const T& obj = boost::pfr::detail::fake_object<T>();
         if constexpr (N == 0) {
             return nullptr;
         }
@@ -384,7 +383,7 @@ namespace container_explorer_detail
         else {
             return std::addressof(
                 boost::pfr::detail::sequence_tuple::get<I>(
-                    boost::pfr::detail::tie_as_tuple(obj, boost::pfr::detail::size_t_<N>{})));
+                    boost::pfr::detail::tie_as_tuple(boost::pfr::detail::fake_object<T>(), boost::pfr::detail::size_t_<N>{})));
         }
     }
 
@@ -432,25 +431,75 @@ namespace container_explorer_detail
         return (is_value_member_at<T, Is, N>() && ...);
     }
 
+    template <typename T>
+    struct field_ptr_wrapper
+    {
+        T ptr;
+    };
+    template <typename T>
+    field_ptr_wrapper(T) -> field_ptr_wrapper<T>;
+
+    constexpr bool is_ident_char(char c) noexcept
+    {
+        return (c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') ||
+               c == '_';
+    }
+
+    template <typename MsvcWorkaround, auto WrappedPtr>
+    consteval auto name_of_wrapped_field() noexcept
+    {
+#if defined(__FUNCSIG__)
+        constexpr std::string_view sv = boost::pfr::detail::clang_workaround<MsvcWorkaround>(__FUNCSIG__);
+#elif defined(__PRETTY_FUNCTION__) || defined(__GNUC__) || defined(__clang__)
+        constexpr std::string_view sv = boost::pfr::detail::clang_workaround<MsvcWorkaround>(__PRETTY_FUNCTION__);
+#else
+        constexpr std::string_view sv = "";
+#endif
+        constexpr std::string_view fn = [](std::string_view sig) consteval noexcept -> std::string_view {
+            const std::size_t close_brace = sig.rfind('}');
+            if (close_brace == std::string_view::npos)
+                return {};
+            std::size_t end = close_brace;
+            while (end > 0 && (sig[end - 1] == ')' || sig[end - 1] == ' '))
+                --end;
+            std::size_t start = end;
+            while (start > 0 && is_ident_char(sig[start - 1]))
+                --start;
+            if (start == end || start == 0)
+                return {};
+            const char sep = sig[start - 1];
+            if (sep != '>' && sep != '.' && sep != ':')
+                return {};
+            return sig.substr(start, end - start);
+        }(sv);
+
+        std::array<char, fn.size() + 1> res{};
+        if constexpr (!fn.empty())
+        {
+            for (std::size_t i = 0; i < fn.size(); ++i)
+                res[i] = fn[i];
+        }
+        return res;
+    }
+
+    template <typename T, std::size_t I, std::size_t N>
+    inline constexpr auto stored_field_name = name_of_wrapped_field<
+        T,
+        field_ptr_wrapper{address_of_value_field<T, I, N>()}
+    >();
+
     template <typename T, std::size_t I>
     std::string get_struct_field_name()
     {
         using Clean = resolve_schema_type_t<std::remove_cvref_t<T>>;
         constexpr std::size_t N = aggregate_field_count<Clean>();
 #if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
-        if constexpr (N > 0 && all_value_members_impl<Clean, N>(std::make_index_sequence<N>{}) && requires { sizeof(Clean{}); })
+        if constexpr (N > 0 && is_value_member_at<Clean, I, N>() &&
+                      (N <= 32 || all_value_members_impl<Clean, N>(std::make_index_sequence<N>{})))
         {
-            constexpr std::string_view sv = boost::pfr::get_name<I, Clean>();
-            if (!sv.empty())
-                return std::string(sv);
-        }
-        else if constexpr (N > 0 && is_value_member_at<Clean, I, N>() &&
-                           (N <= 32 || all_value_members_impl<Clean, N>(std::make_index_sequence<N>{})))
-        {
-            constexpr auto stored = boost::pfr::detail::name_of_field<
-                Clean,
-                boost::pfr::detail::make_clang_wrapper(address_of_value_field<Clean, I, N>())>();
-            std::string_view sv(stored.data());
+            std::string_view sv(stored_field_name<Clean, I, N>.data());
             if (!sv.empty())
                 return std::string(sv);
         }

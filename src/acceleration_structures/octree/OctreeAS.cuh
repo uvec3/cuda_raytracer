@@ -14,7 +14,7 @@ struct Mesh;
 struct OctreeASDeviceView
 {
     soa::soa_view<Space> spaces;
-    soa::soa_view<Box> as;
+    soa::soa_view<int> as;
     soa::soa_view<Primitive> primitives;
     soa::soa_view<BoxContent> box_content;
     int traverse();
@@ -25,14 +25,14 @@ class OctreeAS
 {
 public:
     soa_pool<Space> spaces;
-    soa_pool<Box> as;
+    soa_pool<int> as;
     soa_pool<Primitive> primitives;
     soa_pool<BoxContent> box_content;
     soa_pool<Vertex> vertices;
     soa_pool<Triangle> triangles;
 
     soa::cuda_device_vector<Space> d_spaces;
-    soa::cuda_device_vector<Box> d_as;
+    soa::cuda_device_vector<int> d_as;
     soa::cuda_device_vector<Primitive> d_primitives;
     soa::cuda_device_vector<BoxContent> d_box_content;
     soa::cuda_device_vector<Vertex> d_vertices;
@@ -71,9 +71,9 @@ public:
     void insert_triangles(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
                           triangle_box_stop_ratio, bool use_gpu = true);
     void insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
-                              triangle_box_stop_ratio);
+                              triangle_box_stop_ratio, auto find_triangle_cube_relation);
     void insert_triangles_cpu(uint32_t space_id, uint32_t triangle_first, uint32_t number_of_triangles, int depth_min, int depth_max, float
-                              triangle_box_stop_ratio);
+                              triangle_box_stop_ratio, auto find_triangle_cube_relation);
 
     uint32_t create_space_for_models(range_of<std::pair<glm::mat4,Mesh&>> auto&& meshes)
     {
@@ -119,7 +119,7 @@ public:
 
 
                 dst_vertex.position=transform*glm::vec4(dst_vertex.position,1);
-                dst_vertex.normal=transform*glm::vec4(dst_vertex.normal,0);
+                dst_vertex.normal=glm::normalize(transform*glm::vec4(dst_vertex.normal,0));
                 if (config.swapYZ)
                 {
                     std::swap(dst_vertex.position.y,dst_vertex.position.z);
@@ -156,7 +156,7 @@ public:
 
     int divide_box(InsertionContext& insertion_context, BoxInfo box_info);
     void insert_triangles_recursive(int box_id, BoxStack stack, InsertionContext& ic, uint32_t start, uint32_t size, const std::vector<std::pair<uint32_t,
-                                    uint32_t>>& parent_triangles);
+                                    uint32_t>>& parent_triangles, auto find_triangle_cube_relation);
     void add_box_contents(InsertionContext& insertion_context, uint32_t box_id, PrimitiveType type, std::span<uint32_t> primitives);
     void free_box(int box_id);
     void free_box_content(int box_id);
@@ -174,6 +174,7 @@ public:
 
         bool use_gpu = true;
         bool sort_space = true;
+        PrimitiveApproximation primitive_approximation = PrimitiveApproximation::Precise;
     };
 
     Config config;

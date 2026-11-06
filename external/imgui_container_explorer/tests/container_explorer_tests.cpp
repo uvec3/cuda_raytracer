@@ -147,7 +147,7 @@ namespace
             int width = 0;
             int height = 0;
             io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-            io.Fonts->SetTexID(static_cast<ImTextureID>(1));
+            io.Fonts->SetTexID((ImTextureID)1);
         }
 
         ~HeadlessImGuiContext()
@@ -208,6 +208,41 @@ TEST(ContainerExplorerReflection, DecomposesSoaRefWrapperAndReferenceMembers)
     EXPECT_EQ(cols[4], "nested2.field_0");
     EXPECT_EQ(cols[5], "nested2.field_1");
 #endif
+}
+
+TEST(ContainerExplorerReflection, SupportsSoaVectorWithAosValueStruct)
+{
+    using AosSoaVec = soa::soa_vector<SoaTypeValue>;
+    using ElemRef = container_explorer_detail::container_element_t<AosSoaVec>;
+    static_assert(std::is_same_v<ElemRef, SoaTypeValue&>);
+
+    auto cols = container_explorer_detail::get_leaf_column_names<ElemRef>();
+    ASSERT_EQ(cols.size(), 6u);
+
+#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
+    EXPECT_EQ(cols[0], "a");
+    EXPECT_EQ(cols[1], "b");
+    EXPECT_EQ(cols[2], "nested1.n1");
+    EXPECT_EQ(cols[3], "nested1.n2");
+    EXPECT_EQ(cols[4], "nested2.n1");
+    EXPECT_EQ(cols[5], "nested2.n2");
+#endif
+
+    AosSoaVec vec(2);
+    vec[0] = SoaTypeValue{1.0f, 2, {3.0f, 4.0}, {5.0f, 6.0}};
+    auto add_one_float = [](auto&& leaf)
+    {
+        using LeafT = std::remove_cvref_t<decltype(leaf)>;
+        if constexpr (std::is_same_v<LeafT, float> && !std::is_const_v<std::remove_reference_t<decltype(leaf)>>)
+        {
+            leaf += 1.0f;
+        }
+    };
+    container_explorer_detail::visit_leaves_impl<false>(vec[0], add_one_float);
+    EXPECT_FLOAT_EQ(vec[0].a, 2.0f);
+    EXPECT_EQ(vec[0].b, 2);
+    EXPECT_FLOAT_EQ(vec[0].nested1.n1, 4.0f);
+    EXPECT_FLOAT_EQ(vec[0].nested2.n1, 6.0f);
 }
 
 TEST(ContainerExplorerReflection, ReflectsSoaReferenceLeafNamesViaValueTypeAndBeyondEightFields)
