@@ -21,10 +21,12 @@ bool RaytracerController::ui_show_parameters()
 {
     bool open=true;
 
-    if (ImGui::Begin("Parameters",&open))
+    if (ImGui::Begin("Renderer Parameters",&open))
     {
-        RenderParameters& p=raytracer->parameters;
+        ImGui::DragFloat("Movement speed",&movement_speed, 0.01f*movement_speed);
+        ImGui::Separator();
 
+        RenderParameters& p=raytracer->parameters;
         ImGui::DragFloat("AX",&p.ax);
         ImGui::DragFloat("AZ",&p.az);
         ImGui::DragFloat3("Pos",&p.view_pos[0],0.01);
@@ -40,6 +42,9 @@ bool RaytracerController::ui_show_parameters()
         ImGui::DragFloat3("Light source",&p.light_source[0],0.01);
         ImGui::DragFloat("Diffuse lightning",&p.diffuse_light,0.01);
         ImGui::DragFloat("Ambient lightning",&p.ambient_light,0.01);
+
+        ImGui::Checkbox("Refraction",&p.enableRefraction);
+        ImGui::Checkbox("Shadows",&p.enableShadows);
 
         ImGui::Separator();
         ImGui::Text("Resolution");
@@ -237,6 +242,7 @@ bool RaytracerController::ui_debug_pixel()
                 RenderParameters host_params = raytracer->parameters;
                 host_params.vertices = scene->as.vertices.view();
                 host_params.triangles = scene->as.triangles.view();
+                host_params.materials = scene->m_materials.view();
                 host_params.as = scene->as.as.view();
                 host_params.containers = scene->as.box_content.view();
                 host_params.primitives = scene->as.primitives.view();

@@ -6,6 +6,7 @@
 #include "../geometry_common.cuh"
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
 
+
 struct RenderParameters
 {
     uint32_t width;
@@ -35,20 +36,25 @@ struct RenderParameters
     bool use_fake_normals=true;
     bool renderNagata=false;
 
+    bool enableShadows=false;
+    bool enableRefraction=false;
+
     int time_max=50000;
 
+    //as
     soa::soa_view<int> as;
     soa::soa_view<BoxContent> containers;
     soa::soa_view<Primitive> primitives;
-
-
     soa::soa_view<Triangle> triangles;
     soa::soa_view<Vertex> vertices;
 
+    //scene
+    soa::soa_view<Material> materials;
+
+    //temp
     soa::soa_view<Ray> rays;
     uint32_t number_of_rays=0;
     uint32_t initial_rays_generated=0;
-
     int root_box;
 };
 
@@ -98,22 +104,28 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
     surf2Dwrite(pixelColor, surface, x * sizeof(uchar4), y);
 }
 
+
  __host__ __device__ inline
-glm::vec4 fragment_shader(uint32_t primitive_id, glm::vec3 ray_src, glm::vec3  ray_dir, glm::vec3 tuv, RenderParameters& p)
+bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv,const RenderParameters& p)
 {
     using namespace glm;
 
-    auto v0_id=p.triangles[primitive_id].v1;
-    auto v1_id=p.triangles[primitive_id].v2;
-    auto v2_id=p.triangles[primitive_id].v3;
+    auto tri = p.triangles[primitive_id];
+    auto v0_id = tri.v0;
+    auto v1_id = tri.v1;
+    auto v2_id = tri.v2;
+    float w0 = 1.0f - tuv[1] - tuv[2];
+    float w1 = tuv[1];
+    float w2 = tuv[2];
+
     glm::vec3 normal;
     if (p.use_fake_normals)
     {
         auto n0=p.vertices[v0_id].normal;
         auto n1=p.vertices[v1_id].normal;
         auto n2=p.vertices[v2_id].normal;
-        normal = n0*(1-tuv[1]-tuv[2])+n1*tuv[1]+n2*tuv[2];
-        normal=normalize(normal);
+        normal = n0*w0 + n1*w1 + n2*w2;
+        normal = normalize(normal);
     }
     else
     {
@@ -123,10 +135,11 @@ glm::vec4 fragment_shader(uint32_t primitive_id, glm::vec3 ray_src, glm::vec3  r
         normal=glm::normalize(glm::cross(v1-v0, v2-v0));
     }
 
+    vec3 intersection=ray_src+ray_dir*tuv[0];
+
     float diffuse;
     if (p.fixed_light_source)
     {
-        auto intersection=ray_src+ray_dir*tuv[0];
         auto l=p.light_source-intersection;
         auto dist=length(l);
         diffuse = clamp( dot(l/dist,normal),0.f,1.f);
@@ -136,8 +149,57 @@ glm::vec4 fragment_shader(uint32_t primitive_id, glm::vec3 ray_src, glm::vec3  r
         diffuse = abs(dot(normalize(ray_dir),normal));
     }
 
-    return vec4(diffuse*p.diffuse_light+p.ambient_light);
+    glm::vec4 base_color(1.0f);
+    glm::vec3 emissive(0.0f);
+
+    uint32_t mat_id = tri.material_id;
+    if (mat_id < p.materials.size())
+    {
+        auto mat = p.materials[mat_id];
+        base_color = mat.baseColor;
+        emissive = mat.emissiveFactor;
+
+#if defined(__CUDA_ARCH__)//only use texture on gpu
+        cudaTextureObject_t tex = mat.baseColorTexture;
+        if (tex != 0)
+        {
+            auto uv0 = p.vertices[v0_id].uv;
+            auto uv1 = p.vertices[v1_id].uv;
+            auto uv2 = p.vertices[v2_id].uv;
+            glm::vec3 uv = uv0 * w0 + uv1 * w1 + uv2 * w2;
+            float4 sampled = tex2D<float4>(tex, uv.x, uv.y);
+            base_color *= glm::vec4(sampled.x, sampled.y, sampled.z, sampled.w);
+        }
+#endif
+    }
+
+    float lighting = diffuse * p.diffuse_light + p.ambient_light;
+    out_color += glm::vec4(glm::vec3(base_color) * lighting + emissive, base_color.a);
+
+    if (p.enableRefraction)
+    {
+        float eta = 0.75;
+
+        //out
+        if (glm::dot(ray_dir,normal) > 0.0f) {
+            eta = 1/eta;
+            normal=-normal;
+        }
+        auto refracted=glm::refract(ray_dir,normal,eta);
+        if (refracted!=glm::vec3(0))
+        {
+            ray_dir=refracted;
+            ray_src=intersection;
+            return true;
+        }
+        else
+            return false;
+
+    }
+
+    return false;
 }
+
 
 
 __host__ __device__ inline
@@ -149,7 +211,7 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
     //counts how many boxes were hit on the way
     int box_hits=0;
     //records triangles
-    float hit_primitive_color=-1;
+    glm::vec4 hit_primitive_color{0};
 
     //current container and box
     int32_t container_id=INT32_MAX;
@@ -158,7 +220,8 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
     //count the number of iterations to prevent infinite or too long propagations
     //one iteration is a one horizontal step through octree
     int it=0;
-    while (container_id!=0 && hit_primitive_color<0 && it<max_iterations)
+    bool continue_traversal=true;
+    while (container_id!=0 && continue_traversal && it<max_iterations)
     {
         //AS TRAVERSAL STEP (returns after hitting non-empty leaf node)
         TraversalResult result=traverse_stackless(&p.as[0], current_box, source, current_source, direction, it);
@@ -174,18 +237,17 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
             {
                 auto primitives_count=p.containers[container_id].number_of_primitives;
                 auto primitives_start=p.containers[container_id].start;
-                glm::vec3 content_box_center=result.stack.get_center();
                 for (auto i=0;i<primitives_count;++i)
                 {
+                    auto triangle_id=p.primitives[primitives_start+i].id;
                     if (p.primitives[primitives_start+i].type == PrimitiveType::Triangle)
                     {
-                        auto triangle_id=p.primitives[primitives_start+i].id;
-                        auto v0_id=p.triangles[triangle_id].v1;
-                        auto v1_id=p.triangles[triangle_id].v2;
-                        auto v2_id=p.triangles[triangle_id].v3;
+
+                        auto v0_id=p.triangles[triangle_id].v0;
+                        auto v1_id=p.triangles[triangle_id].v1;
+                        auto v2_id=p.triangles[triangle_id].v2;
 
                         glm::vec3 tuv;
-
 
                         bool hit;
                         if (p.renderNagata)
@@ -216,7 +278,13 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
 
             if (closest_triangle!=UINT32_MAX)
             {
-                hit_primitive_color=fragment_shader(closest_triangle,source,direction,closest_tuv,p).r;
+
+                continue_traversal=fragment_shader(hit_primitive_color,closest_triangle,source,direction,closest_tuv,p);
+                if (continue_traversal)
+                {
+                    current_box.t_min=1e-9f;
+                    current_box.t_max=1e-9f;
+                }
             }
         }
 
@@ -226,8 +294,20 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
 
     if (it==max_iterations)//return white to indicate that the loop was interrupted
         return glm::vec4{1.f};
-    //composes the final color result: number of boxes - red, number of leafs - green, geometry - blue
-    return {float(it)/25.0f*p.show_iterations, (box_hits/10.f)*p.show_boxes,hit_primitive_color,1};
+
+    if (!p.show_iterations && !p.show_boxes)
+    {
+        return glm::vec4(glm::vec3(hit_primitive_color), 1.0f);
+    }
+
+    //composes the final color result: number of boxes - red, number of leafs - green, geometry - blue (or additive when geometry has color)
+    float iter_overlay = (float(it) / 25.0f) * p.show_iterations;
+    float box_overlay = (box_hits / 10.0f) * p.show_boxes;
+    return glm::vec4(
+        hit_primitive_color.r + iter_overlay,
+        hit_primitive_color.g + box_overlay,
+        hit_primitive_color.b,
+        1.0f);
 }
 
 __host__ __device__ inline

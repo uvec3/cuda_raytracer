@@ -96,7 +96,8 @@ void RaytracerController::initScenes()
         s.scene->load(scene_data);
 
         s.scene->as.register_containers(s.explorer);
-        s.explorer.register_container("scene.materials", s.scene->m_materials);
+        s.explorer.register_container("scene.materials", s.scene->m_materials, [sc = s.scene.get()](std::size_t) { sc->sync_materials_to_device(); });
+        s.explorer.register_container("scene.textures", s.scene->m_textures);
 
         scenes.push_back(std::move(s));
     }

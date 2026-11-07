@@ -64,7 +64,17 @@ class Scene
 {
 public:
 	Scene(std::string_view name);
+	~Scene();
+
+	Scene(const Scene&) = delete;
+	Scene& operator=(const Scene&) = delete;
+	Scene(Scene&& other) noexcept;
+	Scene& operator=(Scene&& other) noexcept;
+
 	void load(std::string_view data);
+	void sync_materials_to_device();
+	void destroy_textures();
+
 	bool is_loaded() const;
 	const std::string& get_name() const;
 	void set_active_space(uint32_t space_id);
@@ -74,7 +84,9 @@ public:
 	std::vector<std::pair<glm::mat4, Mesh&>> get_mesh_transform(const Node* node = nullptr);
 
 	std::vector<Mesh> m_meshes;
-	std::vector<Material> m_materials;
+	std::vector<Texture> m_textures;
+	soa::soa_vector<Material> m_materials;
+	soa::cuda_device_vector<Material> d_materials;
 	Node root_node;
 	uint32_t default_scene = 0;
 
@@ -88,6 +100,7 @@ private:
 	uint32_t m_active_space = 0;
 	int m_root_box = -1;
 
+	std::vector<uint32_t> loadTextures(const tg3_model& model);
 	std::vector<uint32_t> loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds);
 	std::vector<uint32_t> loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds);
 	Node importNode(const tg3_model& model, uint32_t nodeIndex, const std::vector<uint32_t>& meshIds);

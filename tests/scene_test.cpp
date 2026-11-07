@@ -113,9 +113,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
                         if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
                         {
                             auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v3].position;
+                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
+                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
+                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
@@ -187,9 +187,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
                         if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
                         {
                             auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v3].position;
+                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
+                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
+                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
@@ -263,9 +263,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
                         if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
                         {
                             auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v3].position;
+                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
+                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
+                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
@@ -347,4 +347,46 @@ TEST(Assets, DirectoryIterator)
     EXPECT_GE(count, 2);
     EXPECT_TRUE(found_teapot);
 }
+
+TEST(Scene, LoadTexturesAndMaterials)
+{
+    Scene scene("ABeautifulGame");
+    auto game_view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    if (game_view.empty())
+    {
+        GTEST_SKIP() << "ABeautifulGame.glb not found";
+    }
+    scene.load(game_view);
+
+    EXPECT_TRUE(scene.is_loaded());
+    EXPECT_GT(scene.m_textures.size(), 0u);
+    EXPECT_GT(scene.m_materials.size(), 1u); // slot 0 default + loaded materials
+    EXPECT_EQ(scene.d_materials.size(), scene.m_materials.size());
+
+    // Verify at least one texture was decoded and uploaded to CUDA
+    bool has_valid_cuda_tex = false;
+    for (const auto& tex : scene.m_textures)
+    {
+        if (tex.texObj != 0 && tex.cudaArray != nullptr && tex.width > 0 && tex.height > 0)
+        {
+            has_valid_cuda_tex = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_valid_cuda_tex);
+
+    // Verify at least one material references a valid baseColorTexture or normalTexture
+    bool has_textured_mat = false;
+    for (size_t i = 1; i < scene.m_materials.size(); ++i)
+    {
+        auto mat = scene.m_materials[i];
+        if (mat.baseColorTextureIndex > 0 && mat.baseColorTexture != 0)
+        {
+            has_textured_mat = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_textured_mat);
+}
+
 

@@ -1,10 +1,13 @@
 #include "glm/glm.hpp"
 #include "Scene.hpp"
+#include "../cuda_common.hpp"
 #include "../../external/tiny_gltf_v3.h"
+#include "../../external/stb_image.h"
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/matrix_decompose.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cstring>
 
 glm::mat4 Node::getTransform()
 {
@@ -79,6 +82,76 @@ Scene::Scene(std::string_view name):m_name(name)
     m_active_space=root_space;
 }
 
+Scene::~Scene()
+{
+    destroy_textures();
+}
+
+Scene::Scene(Scene&& other) noexcept
+    : m_meshes(std::move(other.m_meshes))
+    , m_textures(std::move(other.m_textures))
+    , m_materials(std::move(other.m_materials))
+    , d_materials(std::move(other.d_materials))
+    , root_node(std::move(other.root_node))
+    , default_scene(other.default_scene)
+    , root_space(other.root_space)
+    , as(std::move(other.as))
+    , m_is_loaded(other.m_is_loaded)
+    , m_name(std::move(other.m_name))
+    , m_active_space(other.m_active_space)
+    , m_root_box(other.m_root_box)
+{
+    other.m_textures.clear();
+    other.m_is_loaded = false;
+}
+
+Scene& Scene::operator=(Scene&& other) noexcept
+{
+    if (this != &other)
+    {
+        destroy_textures();
+        m_meshes = std::move(other.m_meshes);
+        m_textures = std::move(other.m_textures);
+        m_materials = std::move(other.m_materials);
+        d_materials = std::move(other.d_materials);
+        root_node = std::move(other.root_node);
+        default_scene = other.default_scene;
+        root_space = other.root_space;
+        as = std::move(other.as);
+        m_is_loaded = other.m_is_loaded;
+        m_name = std::move(other.m_name);
+        m_active_space = other.m_active_space;
+        m_root_box = other.m_root_box;
+
+        other.m_textures.clear();
+        other.m_is_loaded = false;
+    }
+    return *this;
+}
+
+void Scene::destroy_textures()
+{
+    for (auto& tex : m_textures)
+    {
+        if (tex.texObj != 0)
+        {
+            cudaDestroyTextureObject(tex.texObj);
+            tex.texObj = 0;
+        }
+        if (tex.cudaArray != nullptr)
+        {
+            cudaFreeArray(tex.cudaArray);
+            tex.cudaArray = nullptr;
+        }
+    }
+    m_textures.clear();
+}
+
+void Scene::sync_materials_to_device()
+{
+    d_materials = m_materials;
+}
+
 void Scene::load(std::string_view data)
 {
     tg3_parse_options opts;
@@ -106,10 +179,13 @@ void Scene::load(std::string_view data)
         return;
     }
 
-    std::vector<uint32_t> materialIds = loadMaterials(model,{});
-    std::vector<uint32_t> meshIds = loadMeshes(model,materialIds);
+    std::vector<uint32_t> textureIds = loadTextures(model);
+    std::vector<uint32_t> materialIds = loadMaterials(model, textureIds);
+    std::vector<uint32_t> meshIds = loadMeshes(model, materialIds);
 
     load_nodes(model, meshIds);
+
+    sync_materials_to_device();
 
     // 4. Clean up allocated arena memory
     tg3_model_free(&model);
@@ -231,7 +307,201 @@ namespace
             return 0;
         }
     }
+
+    cudaTextureAddressMode mapWrapMode(int32_t wrap)
+    {
+        switch (wrap)
+        {
+        case TG3_TEXTURE_WRAP_CLAMP_TO_EDGE:
+            return cudaAddressModeClamp;
+        case TG3_TEXTURE_WRAP_MIRRORED_REPEAT:
+            return cudaAddressModeMirror;
+        case TG3_TEXTURE_WRAP_REPEAT:
+        default:
+            return cudaAddressModeWrap;
+        }
+    }
+
+    cudaTextureFilterMode mapFilterMode(int32_t magFilter, int32_t minFilter)
+    {
+        if (magFilter == TG3_TEXTURE_FILTER_NEAREST ||
+            minFilter == TG3_TEXTURE_FILTER_NEAREST ||
+            minFilter == TG3_TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST ||
+            minFilter == TG3_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR)
+        {
+            return cudaFilterModePoint;
+        }
+        return cudaFilterModeLinear;
+    }
+
+    int b64DecodeChar(unsigned char c)
+    {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    }
+
+    std::vector<uint8_t> decodeDataUri(const char* uri, uint32_t uri_len)
+    {
+        if (!uri || uri_len < 5 || std::memcmp(uri, "data:", 5) != 0)
+            return {};
+        const char* p = uri + 5;
+        const char* end = uri + uri_len;
+        while (p < end && *p != ';') ++p;
+        if (p >= end) return {};
+        ++p;
+        if (static_cast<size_t>(end - p) < 7 || std::memcmp(p, "base64,", 7) != 0)
+            return {};
+        p += 7;
+        size_t input_len = static_cast<size_t>(end - p);
+        while (input_len > 0 && p[input_len - 1] == '=') --input_len;
+
+        std::vector<uint8_t> out;
+        out.reserve((input_len * 3) / 4 + 1);
+        uint32_t accum = 0;
+        int bits = 0;
+        for (size_t i = 0; i < input_len; ++i)
+        {
+            int val = b64DecodeChar(static_cast<unsigned char>(p[i]));
+            if (val < 0) continue;
+            accum = (accum << 6) | static_cast<uint32_t>(val);
+            bits += 6;
+            if (bits >= 8)
+            {
+                bits -= 8;
+                out.push_back(static_cast<uint8_t>((accum >> bits) & 0xFFu));
+            }
+        }
+        return out;
+    }
 } // namespace
+
+std::vector<uint32_t> Scene::loadTextures(const tg3_model& model)
+{
+    std::vector<uint32_t> textureIds(model.textures_count, 0);
+    if (model.textures_count == 0)
+        return textureIds;
+
+    m_textures.reserve(m_textures.size() + model.textures_count);
+
+    for (uint32_t i = 0; i < model.textures_count; ++i)
+    {
+        const tg3_texture* tg3tex = &model.textures[i];
+        Texture tex;
+        tex.name = (tg3tex->name.data != nullptr && tg3tex->name.len > 0)
+            ? std::string(tg3tex->name.data, tg3tex->name.len)
+            : ("Texture " + std::to_string(i));
+
+        if (tg3tex->sampler >= 0 && static_cast<uint32_t>(tg3tex->sampler) < model.samplers_count)
+        {
+            const tg3_sampler* samp = &model.samplers[tg3tex->sampler];
+            tex.minFilter = samp->min_filter;
+            tex.magFilter = samp->mag_filter;
+            tex.wrapS = samp->wrap_s;
+            tex.wrapT = samp->wrap_t;
+        }
+
+        if (tg3tex->source >= 0 && static_cast<uint32_t>(tg3tex->source) < model.images_count)
+        {
+            const tg3_image* img = &model.images[tg3tex->source];
+            if ((tex.name.empty() || tex.name.starts_with("Texture ")) && img->name.data != nullptr && img->name.len > 0)
+            {
+                tex.name = std::string(img->name.data, img->name.len);
+            }
+
+            const uint8_t* rawData = nullptr;
+            size_t rawSize = 0;
+            std::vector<uint8_t> decodedUriBuffer;
+
+            if (img->image.data != nullptr && img->image.count > 0)
+            {
+                rawData = img->image.data;
+                rawSize = static_cast<size_t>(img->image.count);
+            }
+            else if (img->buffer_view >= 0 && static_cast<uint32_t>(img->buffer_view) < model.buffer_views_count)
+            {
+                const tg3_buffer_view* bv = &model.buffer_views[img->buffer_view];
+                if (bv->buffer >= 0 && static_cast<uint32_t>(bv->buffer) < model.buffers_count)
+                {
+                    const tg3_buffer* buf = &model.buffers[bv->buffer];
+                    if (buf->data.data != nullptr && bv->byte_offset + bv->byte_length <= buf->data.count)
+                    {
+                        rawData = buf->data.data + bv->byte_offset;
+                        rawSize = static_cast<size_t>(bv->byte_length);
+                    }
+                }
+            }
+            else if (img->uri.data != nullptr && img->uri.len > 0 && tg3_is_data_uri(img->uri.data, img->uri.len))
+            {
+                decodedUriBuffer = decodeDataUri(img->uri.data, img->uri.len);
+                rawData = decodedUriBuffer.data();
+                rawSize = decodedUriBuffer.size();
+            }
+
+            if (rawData != nullptr && rawSize > 0)
+            {
+                int w = 0, h = 0, comp = 0;
+                stbi_uc* pixels = nullptr;
+                bool freeStbi = false;
+
+                if (img->as_is == 0 && img->width > 0 && img->height > 0 && img->component == 4 &&
+                    rawSize == static_cast<size_t>(img->width) * static_cast<size_t>(img->height) * 4)
+                {
+                    w = img->width;
+                    h = img->height;
+                    comp = img->component;
+                    pixels = const_cast<stbi_uc*>(rawData);
+                }
+                else
+                {
+                    pixels = stbi_load_from_memory(rawData, static_cast<int>(rawSize), &w, &h, &comp, STBI_rgb_alpha);
+                    freeStbi = true;
+                }
+
+                if (pixels != nullptr && w > 0 && h > 0)
+                {
+                    tex.width = w;
+                    tex.height = h;
+                    tex.channels = comp;
+
+                    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
+                    CUDA_CHECK(cudaMallocArray(&tex.cudaArray, &channelDesc, static_cast<size_t>(w), static_cast<size_t>(h)));
+                    CUDA_CHECK(cudaMemcpy2DToArray(
+                        tex.cudaArray, 0, 0,
+                        pixels, static_cast<size_t>(w) * sizeof(uchar4),
+                        static_cast<size_t>(w) * sizeof(uchar4), static_cast<size_t>(h),
+                        cudaMemcpyHostToDevice));
+
+                    cudaResourceDesc resDesc{};
+                    resDesc.resType = cudaResourceTypeArray;
+                    resDesc.res.array.array = tex.cudaArray;
+
+                    cudaTextureDesc texDesc{};
+                    texDesc.addressMode[0] = mapWrapMode(tex.wrapS);
+                    texDesc.addressMode[1] = mapWrapMode(tex.wrapT);
+                    texDesc.filterMode = mapFilterMode(tex.magFilter, tex.minFilter);
+                    texDesc.readMode = cudaReadModeNormalizedFloat;
+                    texDesc.normalizedCoords = 1;
+
+                    CUDA_CHECK(cudaCreateTextureObject(&tex.texObj, &resDesc, &texDesc, nullptr));
+                }
+
+                if (freeStbi && pixels != nullptr)
+                {
+                    stbi_image_free(pixels);
+                }
+            }
+        }
+
+        m_textures.push_back(std::move(tex));
+        textureIds[i] = static_cast<uint32_t>(m_textures.size());
+    }
+
+    return textureIds;
+}
 
 std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds)
 {
@@ -311,7 +581,7 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
                 continue;
             }
 
-            if (primitive->material >= 0)
+            if (primitive->material >= 0 && static_cast<uint32_t>(primitive->material) < materialIds.size())
                 subMeshes[s].materialId = materialIds[primitive->material];
 
 
@@ -439,9 +709,9 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
             auto start = mesh.triangles.allocate(number_of_triangles);
             for (size_t t = 0; t < number_of_triangles; ++t)
             {
-                mesh.triangles[start + t].v1 = submesh.vertexStart + indices[submesh.indexStart + t * 3];
-                mesh.triangles[start + t].v2 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 1];
-                mesh.triangles[start + t].v3 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 2];
+                mesh.triangles[start + t].v0 = submesh.vertexStart + indices[submesh.indexStart + t * 3];
+                mesh.triangles[start + t].v1 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 1];
+                mesh.triangles[start + t].v2 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 2];
                 mesh.triangles[start + t].material_id = submesh.materialId;
             }
         }
@@ -455,23 +725,70 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
 std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds)
 {
     std::vector<uint32_t> materialIds(model.materials_count);
-    m_materials.reserve(m_materials.size() + model.materials_count);
+    m_materials.reserve(m_materials.size() + model.materials_count + 1);
+
+    // Ensure slot 0 is a default fallback material (when primitive->material == -1)
+    if (m_materials.empty())
+    {
+        auto idx0 = m_materials.allocate(1);
+        m_materials[idx0].baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        m_materials[idx0].metallicFactor = 1.0f;
+        m_materials[idx0].roughnessFactor = 1.0f;
+        m_materials[idx0].emissiveFactor = glm::vec3(0.0f, 0.0f, 0.0f);
+        m_materials[idx0].baseColorTextureIndex = 0;
+        m_materials[idx0].normalTextureIndex = 0;
+        m_materials[idx0].baseColorTexture = 0;
+        m_materials[idx0].normalTexture = 0;
+    }
+
     for (uint32_t i = 0; i < model.materials_count; ++i)
     {
         const tg3_material *tg3mat = &model.materials[i];
-        m_materials.push_back(Material
+        auto matIdx = m_materials.allocate(1);
+        auto&& mat = m_materials[matIdx];
+
+        mat.baseColor = glm::vec4(
+            static_cast<float>(tg3mat->pbr_metallic_roughness.base_color_factor[0]),
+            static_cast<float>(tg3mat->pbr_metallic_roughness.base_color_factor[1]),
+            static_cast<float>(tg3mat->pbr_metallic_roughness.base_color_factor[2]),
+            static_cast<float>(tg3mat->pbr_metallic_roughness.base_color_factor[3]));
+        mat.metallicFactor = static_cast<float>(tg3mat->pbr_metallic_roughness.metallic_factor);
+        mat.roughnessFactor = static_cast<float>(tg3mat->pbr_metallic_roughness.roughness_factor);
+        mat.emissiveFactor = glm::vec3(
+            static_cast<float>(tg3mat->emissive_factor[0]),
+            static_cast<float>(tg3mat->emissive_factor[1]),
+            static_cast<float>(tg3mat->emissive_factor[2]));
+
+        uint32_t baseTexId = 0;
+        cudaTextureObject_t baseTexObj = 0;
+        int32_t gltfBaseTexIdx = tg3mat->pbr_metallic_roughness.base_color_texture.index;
+        if (gltfBaseTexIdx >= 0 && static_cast<uint32_t>(gltfBaseTexIdx) < textureIds.size())
+        {
+            baseTexId = textureIds[gltfBaseTexIdx];
+            if (baseTexId > 0 && baseTexId - 1 < m_textures.size())
             {
-                .baseColor = glm::vec4(
-                    tg3mat->pbr_metallic_roughness.base_color_factor[0],
-                    tg3mat->pbr_metallic_roughness.base_color_factor[1],
-                    tg3mat->pbr_metallic_roughness.base_color_factor[2],
-                    tg3mat->pbr_metallic_roughness.base_color_factor[3]),
-                .textureIndex = 0
-                // .textureIndex = tg3mat->pbr_metallic_roughness.base_color_texture.index != -1
-                // 	? textureIds[tg3mat->pbr_metallic_roughness.base_color_texture.index] - 1
-                // 	: 0
-            });
-        materialIds[i] = m_materials.size();
+                baseTexObj = m_textures[baseTexId - 1].texObj;
+            }
+        }
+
+        uint32_t normTexId = 0;
+        cudaTextureObject_t normTexObj = 0;
+        int32_t gltfNormTexIdx = tg3mat->normal_texture.index;
+        if (gltfNormTexIdx >= 0 && static_cast<uint32_t>(gltfNormTexIdx) < textureIds.size())
+        {
+            normTexId = textureIds[gltfNormTexIdx];
+            if (normTexId > 0 && normTexId - 1 < m_textures.size())
+            {
+                normTexObj = m_textures[normTexId - 1].texObj;
+            }
+        }
+
+        mat.baseColorTextureIndex = baseTexId;
+        mat.normalTextureIndex = normTexId;
+        mat.baseColorTexture = baseTexObj;
+        mat.normalTexture = normTexObj;
+
+        materialIds[i] = static_cast<uint32_t>(matIdx);
     }
     return materialIds;
 }

@@ -104,9 +104,9 @@ public:
                 auto&& dst_triangle = triangles[triangles_start + i];
 
                 dst_triangle.material_id = src_triangle.material_id;
+                dst_triangle.v0 = src_triangle.v0 + vertices_start;
                 dst_triangle.v1 = src_triangle.v1 + vertices_start;
                 dst_triangle.v2 = src_triangle.v2 + vertices_start;
-                dst_triangle.v3 = src_triangle.v3 + vertices_start;
             }
 
             //copy vertices

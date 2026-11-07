@@ -21,6 +21,7 @@ void Raytracer::update_parameters(Scene& scene, uint32_t width, uint32_t height)
 
     parameters.vertices=scene.as.d_vertices.view();
     parameters.triangles=scene.as.d_triangles.view();
+    parameters.materials=scene.d_materials.view();
     parameters.as=scene.as.d_as.view();
     parameters.containers=scene.as.d_box_content.view();
     parameters.primitives=scene.as.d_primitives.view();

@@ -480,23 +480,14 @@ struct BoxStack
         return result;
     }
 
-    __host__ __device__ __forceinline__ [[nodiscard]]
-    float box_size() const
-    {
-        return static_cast<float>(1) / (1<<depth());
+    __host__ __device__ __forceinline__ float exp2_neg(int exp) const {
+        return std::bit_cast<float>((127 - exp) << 23);
     }
 
-    __host__ __device__ __forceinline__ [[nodiscard]]
-    float half_box_size() const
-    {
-        return static_cast<float>(1) / (1<<(depth()+1));
-    }
+    __host__ __device__ __forceinline__ float box_size() const         { return exp2_neg(depth()); }
+    __host__ __device__ __forceinline__ float half_box_size() const    { return exp2_neg(depth() + 1); }
+    __host__ __device__ __forceinline__ float quarter_box_size() const { return exp2_neg(depth() + 2); }
 
-    __host__ __device__ __forceinline__ [[nodiscard]]
-    float quarter_box_size() const
-    {
-        return static_cast<float>(1) / (1<<(depth()+2));
-    }
 
     __host__ __device__ __forceinline__
     void set_outside(bool outside)

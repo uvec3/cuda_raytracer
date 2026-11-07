@@ -21,7 +21,7 @@ inline __global__ void map_triangles_to_first_entry(soa::soa_view<Triangle> tria
     if (i < list_size)
     {
         auto&& tri = triangles[i];
-        uint32_t ids[3] = {tri.v1 - offset, tri.v2 - offset, tri.v3 - offset};
+        uint32_t ids[3] = {tri.v0 - offset, tri.v1 - offset, tri.v2 - offset};
         for (uint32_t element_id : ids)
         {
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> map_ref{map[element_id]};
@@ -36,9 +36,9 @@ inline __global__ void remap_triangle_vertices(soa::soa_view<Triangle> triangles
     if (i < size)
     {
         auto&& tri = triangles[i];
+        tri.v0 = map[tri.v0 - vertices_start];
         tri.v1 = map[tri.v1 - vertices_start];
         tri.v2 = map[tri.v2 - vertices_start];
-        tri.v3 = map[tri.v3 - vertices_start];
     }
 }
 
@@ -100,7 +100,7 @@ inline __global__ void calculate_morton_codes(soa::soa_view<Vertex> vertices, so
     if (i<size)
     {
         auto&& tri = triangles[i];
-        glm::vec3 center=(vertices[tri.v1].position+vertices[tri.v2].position+vertices[tri.v3].position)/3.f;
+        glm::vec3 center=(vertices[tri.v0].position+vertices[tri.v1].position+vertices[tri.v2].position)/3.f;
         auto x_bits=bits_division_from_float(center.x);
         auto y_bits=bits_division_from_float(center.y);
         auto z_bits=bits_division_from_float(center.z);

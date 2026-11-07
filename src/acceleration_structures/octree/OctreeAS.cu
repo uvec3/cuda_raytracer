@@ -46,7 +46,7 @@ void OctreeAS::register_containers(ContainerExplorer& explorer)
     explorer.register_container("octree.primitives", primitives);
     explorer.register_container("octree.box_content", box_content);
     explorer.register_container("octree.vertices", vertices);
-    explorer.register_container("octree.triangles", triangles);
+    // explorer.register_container("octree.triangles", triangles);
 }
 
 OctreeAS::OctreeAS()
@@ -247,12 +247,12 @@ void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vert
 
     if (t_id<first_triangle+number_of_triangles)
     {
-        auto v1=vertices[triangles[t_id].v1].position;
-        auto v2=vertices[triangles[t_id].v2].position;
-        auto v3=vertices[triangles[t_id].v3].position;
-        auto n1=vertices[triangles[t_id].v1].normal;
-        auto n2=vertices[triangles[t_id].v2].normal;
-        auto n3=vertices[triangles[t_id].v3].normal;
+        auto v1=vertices[triangles[t_id].v0].position;
+        auto v2=vertices[triangles[t_id].v1].position;
+        auto v3=vertices[triangles[t_id].v2].position;
+        auto n1=vertices[triangles[t_id].v0].normal;
+        auto n2=vertices[triangles[t_id].v1].normal;
+        auto n3=vertices[triangles[t_id].v2].normal;
         auto rel=find_triangle_cube_relation(box.get_center(),box.half_box_size(),v1,v2,v3,n1,n2,n3);
 
         if (rel!=TriangleCubeRelation::Outside)
@@ -302,9 +302,9 @@ void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vert
             bool descend=box.depth()<DEPTH_MAX;
             if (descend && box.depth()>=DEPTH_MIN)
             {
-                auto v0=vertices[triangles[t_id].v1].position;
-                auto v1=vertices[triangles[t_id].v2].position;
-                auto v2=vertices[triangles[t_id].v3].position;
+                auto v0=vertices[triangles[t_id].v0].position;
+                auto v1=vertices[triangles[t_id].v1].position;
+                auto v2=vertices[triangles[t_id].v2].position;
 
                 glm::vec3 aabb_max=glm::max(glm::max(v0,v1),v2);
                 glm::vec3 aabb_min=glm::min(glm::min(v0,v1),v2);
@@ -320,12 +320,12 @@ void evaluate_triangle_box(soa::soa_view<Triangle> triangles, soa::soa_view<Vert
 
             if (descend)//recursive check
             {
-                auto v0=vertices[triangles[t_id].v1].position;
-                auto v1=vertices[triangles[t_id].v2].position;
-                auto v2=vertices[triangles[t_id].v3].position;
-                auto n0=vertices[triangles[t_id].v1].normal;
-                auto n1=vertices[triangles[t_id].v2].normal;
-                auto n2=vertices[triangles[t_id].v3].normal;
+                auto v0=vertices[triangles[t_id].v0].position;
+                auto v1=vertices[triangles[t_id].v1].position;
+                auto v2=vertices[triangles[t_id].v2].position;
+                auto n0=vertices[triangles[t_id].v0].normal;
+                auto n1=vertices[triangles[t_id].v1].normal;
+                auto n2=vertices[triangles[t_id].v2].normal;
 
                 box.descend(0);
                 for (int branch=0;branch<8;++branch)
@@ -614,12 +614,12 @@ __global__ void expand_number_id(
             int child_start = as[node];
             if (child_start > 0)
             {
-                auto v0 = vertices[triangles[t_id].v1].position;
-                auto v1 = vertices[triangles[t_id].v2].position;
-                auto v2 = vertices[triangles[t_id].v3].position;
-                auto n0 = vertices[triangles[t_id].v1].normal;
-                auto n1 = vertices[triangles[t_id].v2].normal;
-                auto n2 = vertices[triangles[t_id].v3].normal;
+                auto v0 = vertices[triangles[t_id].v0].position;
+                auto v1 = vertices[triangles[t_id].v1].position;
+                auto v2 = vertices[triangles[t_id].v2].position;
+                auto n0 = vertices[triangles[t_id].v0].normal;
+                auto n1 = vertices[triangles[t_id].v1].normal;
+                auto n2 = vertices[triangles[t_id].v2].normal;
 
                 for (int branch = 0; branch < 8; ++branch)
                 {
@@ -902,19 +902,19 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, uint32_t triangle_first, 
     if (d_box_content.size() < box_content.size()) d_box_content.resize(box_content.size());
     if (d_primitives.size() < primitives.size()) d_primitives.resize(primitives.size());
 
-    d_as.range(as_start, as_size).copy_from(d_local_as);
-    d_box_content.range(box_content_start, total_contents + 1).copy_from(d_local_box_content);
+    d_as.range(as_start) = d_local_as;
+    d_box_content.range(box_content_start) = d_local_box_content;
     if (total_primitives > 0)
     {
-        d_primitives.range(primitives_start, total_primitives).copy_from(d_local_primitives);
+        d_primitives.range(primitives_start) = d_local_primitives;
     }
 
     // Download to host pools for UI & debug
-    as.range(as_start, as_size).copy_from(d_as.range(as_start, as_size));
-    box_content.range(box_content_start, total_contents + 1).copy_from(d_box_content.range(box_content_start, total_contents + 1));
+    as.range(as_start) = d_as.range(as_start, as_size);
+    box_content.range(box_content_start) = d_box_content.range(box_content_start, total_contents + 1);
     if (total_primitives > 0)
     {
-        primitives.range(primitives_start, total_primitives).copy_from(d_primitives.range(primitives_start, total_primitives));
+        primitives.range(primitives_start) = d_primitives.range(primitives_start, total_primitives);
     }
 }
 
@@ -1046,12 +1046,12 @@ void OctreeAS::insert_triangles_recursive(int box_id, BoxStack stack, InsertionC
             for (auto i=start;i<start+size;++i)
             {
                 auto t_id=ic.num_id[i].id;
-                auto v0=vertices[triangles[t_id].v1].position;
-                auto v1=vertices[triangles[t_id].v2].position;
-                auto v2=vertices[triangles[t_id].v3].position;
-                auto n0=vertices[triangles[t_id].v1].normal;
-                auto n1=vertices[triangles[t_id].v2].normal;
-                auto n2=vertices[triangles[t_id].v3].normal;
+                auto v0=vertices[triangles[t_id].v0].position;
+                auto v1=vertices[triangles[t_id].v1].position;
+                auto v2=vertices[triangles[t_id].v2].position;
+                auto n0=vertices[triangles[t_id].v0].normal;
+                auto n1=vertices[triangles[t_id].v1].normal;
+                auto n2=vertices[triangles[t_id].v2].normal;
                 auto rel=find_triangle_cube_relation(stack.get_center(),stack.half_box_size(),v0,v1,v2,n0,n1,n2);
                 if (rel!=TriangleCubeRelation::Outside)
                 {

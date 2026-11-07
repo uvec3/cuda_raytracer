@@ -7,25 +7,14 @@ struct TriangleNumberId
     uint32_t& id;
 };
 
+struct Box
+{
+    uint32_t is_leaf:1;
+    uint32_t index: 31;
+};
+
+
 #define BOX_SIZE 1
-
-__host__ __device__
-inline float get_quarter_block_size(int depth)
-{
-    return static_cast<float>(BOX_SIZE) / (1<<(depth + 2));
-}
-
-__host__ __device__
-inline float get_half_block_size(int depth)
-{
-    return static_cast<float>(BOX_SIZE) / (1<<(depth + 1));
-}
-
-__host__ __device__
-inline float get_block_size(int depth)
-{
-    return static_cast<float>(BOX_SIZE) / (1<<(depth));
-}
 
 
 __host__ __device__
