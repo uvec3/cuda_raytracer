@@ -389,10 +389,10 @@ struct alignas(16) GPUNagataPatch {
 };
 
 // GPU Hardware Intrinsics Emulation (Single-cycle on NVIDIA/AMD GPUs)
-inline glm::vec2 min3(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+inline CUDA_HOST_DEVICE glm::vec2 min3(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
     return glm::min(glm::min(a, b), c);
 }
-inline glm::vec2 max3(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+inline CUDA_HOST_DEVICE glm::vec2 max3(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
     return glm::max(glm::max(a, b), c);
 }
 
@@ -513,6 +513,119 @@ inline bool intersectNagataGPU(
 
     outT  = t;
     outUV = glm::vec2(u, v);
+    return true;
+}
+
+// =============================================================================
+// Direct Precomputed Nagata Intersection (X1..X3, C12..C31)
+// Used when NagataPatch is stored as a first-class primitive in PrimitiveChunk16
+// =============================================================================
+inline CUDA_HOST_DEVICE bool intersectNagataPrecomputed(
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDir,
+    float tMin,
+    float tMax,
+    const glm::vec3& X1,
+    const glm::vec3& X2,
+    const glm::vec3& X3,
+    const glm::vec3& C12,
+    const glm::vec3& C23,
+    const glm::vec3& C31,
+    float& outT,
+    float& outU,
+    float& outV)
+{
+    // 1. Build 2D Ray Basis (Pixar Duff et al.)
+    glm::vec3 E1, E2;
+    buildBasisGPU(rayDir, E1, E2);
+
+    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
+        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
+    };
+
+    // 2. Stream & Project Directly to 2D
+    glm::vec2 x3 = proj2D(X3 - rayOrigin);
+    glm::vec2 e1 = proj2D(X1 - X3);
+    glm::vec2 e2 = proj2D(X2 - X3);
+
+    glm::vec2 c12 = proj2D(C12);
+    glm::vec2 c23 = proj2D(C23);
+    glm::vec2 c31 = proj2D(C31);
+
+    // 3. Branchless 2D Control-Hull Compute + Early Exit
+    glm::vec2 x1 = x3 + e1;
+    glm::vec2 x2 = x3 + e2;
+    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
+    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
+    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
+
+    glm::vec2 hMin = glm::min(min3(x1, x2, x3), min3(b12, b23, b31));
+    glm::vec2 hMax = glm::max(max3(x1, x2, x3), max3(b12, b23, b31));
+
+    if ((hMin.x > 0.0f) | (hMax.x < 0.0f) | (hMin.y > 0.0f) | (hMax.y < 0.0f)) {
+        return false;
+    }
+
+    // 4. Branchless Flat-Triangle Initial Guess
+    float scale2 = glm::dot(e1, e1) + glm::dot(e2, e2);
+    float detFlat = glm::fma(e1.x, e2.y, -e1.y * e2.x);
+    float u = 1.0f / 3.0f;
+    float v = 1.0f / 3.0f;
+    if (std::abs(detFlat) > 1e-6f * scale2 && std::abs(detFlat) > 1e-20f) {
+        float invDetFlat = 1.0f / detFlat;
+        u = glm::clamp(glm::fma(-x3.x, e2.y,  x3.y * e2.x) * invDetFlat, 0.0f, 1.0f);
+        v = glm::clamp(glm::fma( e1.x, -x3.y, -e1.y * -x3.x) * invDetFlat, 0.0f, 1.0f);
+        float sumUV = u + v;
+        if (sumUV > 1.0f) {
+            float invSum = 1.0f / sumUV;
+            u *= invSum;
+            v *= invSum;
+        }
+    }
+
+    // 5. Unrolled 5-Step Branchless Newton-Raphson Solver
+    #pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        float w = 1.0f - u - v;
+
+        glm::vec2 F = x3 + u * e1 + v * e2
+                    - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
+
+        glm::vec2 J_u = e1 - v * c12 + v * c23 - (w - u) * c31;
+        glm::vec2 J_v = e2 - u * c12 - (w - v) * c23 + u * c31;
+
+        float detJ = glm::fma(J_u.x, J_v.y, -J_u.y * J_v.x);
+        float invDetJ = (std::abs(detJ) > 1e-7f * scale2 && std::abs(detJ) > 1e-20f) ? (1.0f / detJ) : 0.0f;
+
+        u = glm::clamp(u - glm::fma( J_v.y, F.x, -J_v.x * F.y) * invDetJ, -0.5f, 1.5f);
+        v = glm::clamp(v - glm::fma(-J_u.y, F.x,  J_u.x * F.y) * invDetJ, -0.5f, 1.5f);
+    }
+
+    // 6. Fast Barycentric & Scale-Invariant Residual Verification
+    float w = 1.0f - u - v;
+    const float BARY_EPS = -1e-4f;
+    if ((u < BARY_EPS) | (v < BARY_EPS) | (w < BARY_EPS)) {
+        return false;
+    }
+
+    glm::vec2 finalF = x3 + u * e1 + v * e2
+                     - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
+    if (glm::dot(finalF, finalF) > 1e-9f * scale2) {
+        return false;
+    }
+
+    // 7. Reconstruct 3D Hit Depth `t`
+    glm::vec3 hitPos = u * X1 + v * X2 + w * X3
+                     - ((u * v) * C12 + (v * w) * C23 + (w * u) * C31);
+
+    float t = glm::dot(hitPos - rayOrigin, rayDir);
+    if (t < tMin || t > tMax) {
+        return false;
+    }
+
+    outT = t;
+    outU = v;             // Barycentric weight of X2 (vertex 1), matching tuv[1] / w1 convention
+    outV = 1.0f - u - v;  // Barycentric weight of X3 (vertex 2), matching tuv[2] / w2 convention
     return true;
 }
 

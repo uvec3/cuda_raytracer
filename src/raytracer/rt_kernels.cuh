@@ -163,6 +163,16 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
         glm::vec2 uv2 = glm::unpackHalf2x16(ftri.uv_2);
         uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
     }
+    else if (chunk0.type() == PrimitiveType::NagataPatch)
+    {
+        NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, primitive_id, chunk0);
+        normal = patch.evaluateNormal(w0, w1);
+
+        glm::vec2 uv0 = glm::unpackHalf2x16(patch.uv_0);
+        glm::vec2 uv1 = glm::unpackHalf2x16(patch.uv_1);
+        glm::vec2 uv2 = glm::unpackHalf2x16(patch.uv_2);
+        uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
+    }
 
     vec3 intersection=ray_src+ray_dir*tuv[0];
 
@@ -268,28 +278,17 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                         Triangle tri = chunk0.as<Triangle>();
 
                         glm::vec3 tuv;
-
-                        bool hit;
-                        if (p.renderNagata)
-                        {
-                            hit=intersectNagataOnTheFly(source,direction,current_box.t_min,current_box.t_max,
-                                                        p.vertices[tri.v0].position,p.vertices[tri.v1].position,p.vertices[tri.v2].position,
-                                                        p.vertices[tri.v0].normal,p.vertices[tri.v1].normal,p.vertices[tri.v2].normal,
-                                                        tuv[0],tuv[1],tuv[2]);
-                        }
-                        else
-                        {
-                            hit=intersectRayTriangle(source,direction, current_box.t_min, current_box.t_max,
-                                                     p.vertices[tri.v0].position,p.vertices[tri.v1].position,p.vertices[tri.v2].position,
-                                                     tuv.x,tuv.y,tuv.z);
-                        }
+                        bool hit = intersectRayTriangle(
+                            source, direction, current_box.t_min, current_box.t_max,
+                            p.vertices[tri.v0].position, p.vertices[tri.v1].position, p.vertices[tri.v2].position,
+                            tuv.x, tuv.y, tuv.z);
 
                         if (hit)
                         {
-                            if (tuv[0]<closest_tuv[0])
+                            if (tuv[0] < closest_tuv[0])
                             {
                                 closest_tuv = tuv;
-                                closest_triangle=prim_id;
+                                closest_triangle = prim_id;
                             }
                         }
                     }
@@ -298,29 +297,36 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                         FullTriangle ftri = load_primitive<FullTriangle>(p.primitives, prim_id, chunk0);
 
                         glm::vec3 tuv;
-                        bool hit;
-                        if (p.renderNagata)
-                        {
-                            hit=intersectNagataOnTheFly(source,direction,current_box.t_min,current_box.t_max,
-                                                        ftri.v0,ftri.v1,ftri.v2,
-                                                        ftri.n0_compressed.unpack(),
-                                                        ftri.n1_compressed.unpack(),
-                                                        ftri.n2_compressed.unpack(),
-                                                        tuv[0],tuv[1],tuv[2]);
-                        }
-                        else
-                        {
-                            hit=intersectRayTriangle(source,direction, current_box.t_min, current_box.t_max,
-                                                     ftri.v0,ftri.v1,ftri.v2,
-                                                     tuv.x,tuv.y,tuv.z);
-                        }
+                        bool hit = intersectRayTriangle(
+                            source, direction, current_box.t_min, current_box.t_max,
+                            ftri.v0, ftri.v1, ftri.v2,
+                            tuv.x, tuv.y, tuv.z);
 
                         if (hit)
                         {
-                            if (tuv[0]<closest_tuv[0])
+                            if (tuv[0] < closest_tuv[0])
                             {
                                 closest_tuv = tuv;
-                                closest_triangle=prim_id;
+                                closest_triangle = prim_id;
+                            }
+                        }
+                    }
+                    else if (chunk0.type() == PrimitiveType::NagataPatch)
+                    {
+                        NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, prim_id, chunk0);
+
+                        glm::vec3 tuv;
+                        bool hit = intersectNagataPrecomputed(
+                            source, direction, current_box.t_min, current_box.t_max,
+                            patch.X1, patch.X2, patch.X3, patch.C12, patch.C23, patch.C31,
+                            tuv.x, tuv.y, tuv.z);
+
+                        if (hit)
+                        {
+                            if (tuv[0] < closest_tuv[0])
+                            {
+                                closest_tuv = tuv;
+                                closest_triangle = prim_id;
                             }
                         }
                     }

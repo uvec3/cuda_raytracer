@@ -141,9 +141,11 @@ public:
             sort_space(space_id, d_temp_triangles);
         }
 
-        uint32_t occupied_slots = (config.triangle_type == PrimitiveType::FullTriangle)
-            ? FullTriangle::occupied_slots
-            : Triangle::occupied_slots;
+        uint32_t occupied_slots = Triangle::occupied_slots;
+        if (config.triangle_type == PrimitiveType::FullTriangle)
+            occupied_slots = FullTriangle::occupied_slots;
+        else if (config.triangle_type == PrimitiveType::NagataPatch)
+            occupied_slots = NagataPatchPrimitive::occupied_slots;
 
         pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size));
 
@@ -176,7 +178,6 @@ public:
 
         bool use_gpu = true;
         bool sort_space = true;
-        PrimitiveApproximation primitive_approximation = PrimitiveApproximation::Precise;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 

@@ -212,6 +212,82 @@ TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
     EXPECT_GT(hit_count, 15);
 }
 
+TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
+
+    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    EXPECT_EQ(scene.as.spaces[space_id].vertices_size, 0u); // vertices freed for NagataPatch
+
+    int root_box = scene.as.spaces[space_id].root_box;
+    EXPECT_GE(root_box, 0);
+
+    int hit_count = 0;
+    for (float x = 0.3f; x <= 0.7f; x += 0.05f)
+    {
+        for (float z = 0.3f; z <= 0.7f; z += 0.05f)
+        {
+            glm::vec3 origin(x, -0.5f, z);
+            glm::vec3 current_source = origin;
+            glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+            CurrentBox current_box{.id = root_box};
+            int it = 0;
+            int32_t container_id = INT32_MAX;
+            bool hit_triangle = false;
+
+            while (container_id != 0 && !hit_triangle && it < 500)
+            {
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                container_id = result.content;
+                if (container_id > 0)
+                {
+                    for (; !hit_triangle; ++container_id)
+                    {
+                        auto bc = scene.as.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        if (chunk0.type() == PrimitiveType::NagataPatch)
+                        {
+                            NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(scene.as.primitives, bc.id(), chunk0);
+
+                            float t, u, v;
+                            if (intersectNagataPrecomputed(origin, dir, current_box.t_min, current_box.t_max,
+                                                           patch.X1, patch.X2, patch.X3, patch.C12, patch.C23, patch.C31,
+                                                           t, u, v))
+                            {
+                                hit_triangle = true;
+                                break;
+                            }
+                        }
+                        if (bc.is_last()) break;
+                    }
+                }
+                if (current_box.stack.depth() == 0) break;
+            }
+            if (hit_triangle) ++hit_count;
+        }
+    }
+
+    std::cout << "Rays hitting NagataPatch teapot patches: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
 TEST(OctreeAS, BuildAndTraverseTeapotCPU)
 {
     Scene scene("Teapot");

@@ -47,6 +47,16 @@ __host__ __device__ inline void get_primitive_triangle_vertices(
         n1 = ftri.n1_compressed.unpack();
         n2 = ftri.n2_compressed.unpack();
     }
+    else if (chunk0.type() == PrimitiveType::NagataPatch)
+    {
+        NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(primitives, prim_slot_id, chunk0);
+        v0 = patch.X1;
+        v1 = patch.X2;
+        v2 = patch.X3;
+        n0 = patch.evaluateNormal(1.0f, 0.0f);
+        n1 = patch.evaluateNormal(0.0f, 1.0f);
+        n2 = patch.evaluateNormal(0.0f, 0.0f);
+    }
 }
 
 void OctreeAS::config_ui()
@@ -59,18 +69,18 @@ void OctreeAS::config_ui()
     ImGui::Checkbox("Build on GPU", &config.use_gpu);
     ImGui::Checkbox("Sort space", &config.sort_space);
 
-    const char* approx_names[] = {"Precise", "Approximate", "Nagata"};
-    int approx = static_cast<int>(config.primitive_approximation);
-    if (ImGui::Combo("Primitive approximation", &approx, approx_names, 3))
-    {
-        config.primitive_approximation = static_cast<PrimitiveApproximation>(approx);
-    }
+    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
+    int tri_type_idx = 0;
+    if (config.triangle_type == PrimitiveType::FullTriangle)
+        tri_type_idx = 1;
+    else if (config.triangle_type == PrimitiveType::NagataPatch)
+        tri_type_idx = 2;
 
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)"};
-    int tri_type_idx = (config.triangle_type == PrimitiveType::FullTriangle) ? 1 : 0;
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 2))
+    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
     {
-        config.triangle_type = (tri_type_idx == 1) ? PrimitiveType::FullTriangle : PrimitiveType::Triangle;
+        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
+        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
+        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
     }
 }
 
@@ -938,18 +948,13 @@ void OctreeAS::insert_triangles(uint32_t space_id, uint32_t primitives_start, ui
         }
     };
 
-    switch (config.primitive_approximation)
+    if (config.triangle_type == PrimitiveType::NagataPatch)
     {
-    case PrimitiveApproximation::Approximate:
-        dispatch(FindCubeIntersection<PrimitiveApproximation::Approximate>{});
-        break;
-    case PrimitiveApproximation::Nagata:
         dispatch(FindCubeIntersection<PrimitiveApproximation::Nagata>{});
-        break;
-    case PrimitiveApproximation::Precise:
-    default:
+    }
+    else
+    {
         dispatch(FindCubeIntersection<PrimitiveApproximation::Precise>{});
-        break;
     }
 }
 
@@ -1139,6 +1144,47 @@ __global__ void pack_full_triangles_kernel(
     store_primitive(dst_primitives, dst_slot, ftri);
 }
 
+__global__ void pack_nagata_patches_kernel(
+    soa::soa_view<Triangle> src_triangles,
+    soa::soa_view<Vertex> vertices,
+    uint32_t triangles_count,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= triangles_count) return;
+
+    Triangle tri = src_triangles[i];
+    glm::vec3 v0 = vertices[tri.v0].position;
+    glm::vec3 v1 = vertices[tri.v1].position;
+    glm::vec3 v2 = vertices[tri.v2].position;
+    glm::vec3 n0 = vertices[tri.v0].normal;
+    glm::vec3 n1 = vertices[tri.v1].normal;
+    glm::vec3 n2 = vertices[tri.v2].normal;
+
+    NagataPatch patch = NagataPatch::fromTriangle(v0, v1, v2, n0, n1, n2);
+
+    NagataPatchPrimitive prim{};
+    prim.type = PrimitiveType::NagataPatch;
+    prim.material_id = tri.material_id;
+    prim.X1 = patch.X1;
+    prim.X2 = patch.X2;
+    prim.X3 = patch.X3;
+    prim.C12 = patch.C12;
+    prim.C23 = patch.C23;
+    prim.C31 = patch.C31;
+
+    glm::vec3 uv0 = vertices[tri.v0].uv;
+    glm::vec3 uv1 = vertices[tri.v1].uv;
+    glm::vec3 uv2 = vertices[tri.v2].uv;
+    prim.uv_0 = glm::packHalf2x16(glm::vec2(uv0.x, uv0.y));
+    prim.uv_1 = glm::packHalf2x16(glm::vec2(uv1.x, uv1.y));
+    prim.uv_2 = glm::packHalf2x16(glm::vec2(uv2.x, uv2.y));
+
+    uint32_t dst_slot = primitives_start + i * NagataPatchPrimitive::occupied_slots;
+    store_primitive(dst_primitives, dst_slot, prim);
+}
+
 void OctreeAS::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<Triangle>& d_temp_triangles, uint32_t triangles_count)
 {
     if (triangles_count == 0)
@@ -1166,6 +1212,36 @@ void OctreeAS::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<
         primitives.range(primitives_start) = d_primitives.range(primitives_start, primitives_size);
 
         // Free vertices for this space since FullTriangle embeds all vertex attributes inline
+        if (spaces[space_id].vertices_size > 0)
+        {
+            vertices.free(spaces[space_id].vertices_start);
+            spaces[space_id].vertices_start = 0;
+            spaces[space_id].vertices_size = 0;
+            d_vertices = vertices;
+        }
+    }
+    else if (config.triangle_type == PrimitiveType::NagataPatch)
+    {
+        uint32_t primitives_size = triangles_count * NagataPatchPrimitive::occupied_slots;
+        auto primitives_start = primitives.alloc(primitives_size);
+        spaces[space_id].primitives_start = primitives_start;
+        spaces[space_id].primitives_size = primitives_size;
+
+        if (d_primitives.size() < primitives.size())
+            d_primitives.resize(primitives.size());
+
+        uint32_t blocks = (triangles_count - 1) / 256 + 1;
+        pack_nagata_patches_kernel<<<blocks, 256>>>(
+            const_cast<soa::cuda_device_vector<Triangle>&>(d_temp_triangles).view(),
+            d_vertices.view(),
+            triangles_count,
+            d_primitives.view(),
+            primitives_start);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        primitives.range(primitives_start) = d_primitives.range(primitives_start, primitives_size);
+
+        // Free vertices for this space since NagataPatch embeds all vertex attributes inline
         if (spaces[space_id].vertices_size > 0)
         {
             vertices.free(spaces[space_id].vertices_start);

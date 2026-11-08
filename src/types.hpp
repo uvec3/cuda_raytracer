@@ -189,6 +189,53 @@ struct alignas(16) FullTriangle
 };
 static_assert(sizeof(FullTriangle) == 64);
 
+struct alignas(16) NagataPatchPrimitive
+{
+    static constexpr int occupied_slots = 6; // 6 x 16-byte slots = 96 bytes
+
+    // Slot 0 (16 bytes): header (4B) + X1 (12B)
+    PrimitiveType type = PrimitiveType::NagataPatch;
+    uint16_t material_id = 0;
+    glm::vec3 X1;
+
+    // Slot 1 (16 bytes): X2 (12B) + uv_0 (4B, half2)
+    glm::vec3 X2;
+    uint32_t uv_0 = 0;
+
+    // Slot 2 (16 bytes): X3 (12B) + uv_1 (4B, half2)
+    glm::vec3 X3;
+    uint32_t uv_1 = 0;
+
+    // Slot 3 (16 bytes): C12 (12B) + uv_2 (4B, half2)
+    glm::vec3 C12;
+    uint32_t uv_2 = 0;
+
+    // Slot 4 (16 bytes): C23 (12B) + pad0 (4B)
+    glm::vec3 C23;
+    uint32_t pad0 = 0;
+
+    // Slot 5 (16 bytes): C31 (12B) + pad1 (4B)
+    glm::vec3 C31;
+    uint32_t pad1 = 0;
+
+    // Fast analytic normal evaluation at barycentrics (u, v), w = 1 - u - v
+    [[nodiscard]] __host__ __device__ inline glm::vec3 evaluateNormal(float u, float v) const
+    {
+        glm::vec3 dXdu = (X1 - X3)
+                       - v * C12
+                       + v * C23
+                       - (1.0f - 2.0f * u - v) * C31;
+
+        glm::vec3 dXdv = (X2 - X3)
+                       - u * C12
+                       - (1.0f - u - 2.0f * v) * C23
+                       + u * C31;
+
+        return glm::normalize(glm::cross(dXdu, dXdv));
+    }
+};
+static_assert(sizeof(NagataPatchPrimitive) == 96);
+
 
 struct alignas(16) Sphere
 {
