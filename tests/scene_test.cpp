@@ -69,12 +69,6 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
     uint32_t space_id = scene.as.create_space_for_models(meshes);
 
     std::cout << "primitives_size = " << scene.as.spaces[space_id].primitives_size << std::endl;
-    for (int i = 0; i < std::min(10, (int)scene.as.spaces[space_id].primitives_size); ++i)
-    {
-        auto prim_id = scene.as.primitives[scene.as.spaces[space_id].primitives_start + i].id;
-        std::cout << "prim " << i << ": tri_id = " << prim_id << std::endl;
-    }
-
     std::cout << "as_size = " << scene.as.spaces[space_id].as_size << std::endl;
     std::cout << "box_content_size = " << scene.as.spaces[space_id].box_content_size << std::endl;
 
@@ -93,6 +87,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
         for (float z = 0.3f; z <= 0.7f; z += 0.05f)
         {
             glm::vec3 origin(x, -0.5f, z);
+            glm::vec3 current_source = origin;
             glm::vec3 dir(0.0f, 1.0f, 0.0f);
 
             CurrentBox current_box{.id = root_box};
@@ -102,28 +97,29 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
-                    auto count = scene.as.box_content[container_id].number_of_primitives;
-                    auto start = scene.as.box_content[container_id].start;
-                    for (uint32_t i = 0; i < count; ++i)
+                    for (; !hit_triangle; ++container_id)
                     {
-                        if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
+                        auto bc = scene.as.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        if (chunk0.type() == PrimitiveType::Triangle)
                         {
-                            auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
+                            const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
+                            auto v1 = scene.as.vertices[tri.v0].position;
+                            auto v2 = scene.as.vertices[tri.v1].position;
+                            auto v3 = scene.as.vertices[tri.v2].position;
 
                             float t, u, v;
-                            if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
+                            if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
                             {
                                 hit_triangle = true;
                                 break;
                             }
                         }
+                        if (bc.is_last()) break;
                     }
                 }
                 if (current_box.stack.depth() == 0) break;
@@ -133,6 +129,86 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
     }
 
     std::cout << "Rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as.config.stretch = false;
+    scene.as.config.swapYZ = true;
+    scene.as.config.min_depth = 1;
+    scene.as.config.max_depth = 10;
+    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.as.create_space_for_models(meshes);
+
+    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    EXPECT_EQ(scene.as.spaces[space_id].vertices_size, 0u); // vertices freed for FullTriangle
+
+    int root_box = scene.as.spaces[space_id].root_box;
+    EXPECT_GE(root_box, 0);
+
+    int hit_count = 0;
+    for (float x = 0.3f; x <= 0.7f; x += 0.05f)
+    {
+        for (float z = 0.3f; z <= 0.7f; z += 0.05f)
+        {
+            glm::vec3 origin(x, -0.5f, z);
+            glm::vec3 current_source = origin;
+            glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+            CurrentBox current_box{.id = root_box};
+            int it = 0;
+            int32_t container_id = INT32_MAX;
+            bool hit_triangle = false;
+
+            while (container_id != 0 && !hit_triangle && it < 500)
+            {
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                container_id = result.content;
+                if (container_id > 0)
+                {
+                    for (; !hit_triangle; ++container_id)
+                    {
+                        auto bc = scene.as.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        if (chunk0.type() == PrimitiveType::FullTriangle)
+                        {
+                            PrimitiveChunk16 chunks[4] = {
+                                chunk0,
+                                scene.as.primitives[bc.id() + 1],
+                                scene.as.primitives[bc.id() + 2],
+                                scene.as.primitives[bc.id() + 3]
+                            };
+                            const FullTriangle& ftri = reinterpret_cast<const FullTriangle&>(chunks);
+
+                            float t, u, v;
+                            if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, ftri.v0, ftri.v1, ftri.v2, t, u, v))
+                            {
+                                hit_triangle = true;
+                                break;
+                            }
+                        }
+                        if (bc.is_last()) break;
+                    }
+                }
+                if (current_box.stack.depth() == 0) break;
+            }
+            if (hit_triangle) ++hit_count;
+        }
+    }
+
+    std::cout << "Rays hitting FullTriangle teapot triangles: " << hit_count << " / 81" << std::endl;
     EXPECT_GT(hit_count, 15);
 }
 
@@ -167,6 +243,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
         for (float z = 0.3f; z <= 0.7f; z += 0.05f)
         {
             glm::vec3 origin(x, -0.5f, z);
+            glm::vec3 current_source = origin;
             glm::vec3 dir(0.0f, 1.0f, 0.0f);
 
             CurrentBox current_box{.id = root_box};
@@ -176,28 +253,29 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
-                    auto count = scene.as.box_content[container_id].number_of_primitives;
-                    auto start = scene.as.box_content[container_id].start;
-                    for (uint32_t i = 0; i < count; ++i)
+                    for (; !hit_triangle; ++container_id)
                     {
-                        if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
+                        auto bc = scene.as.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        if (chunk0.type() == PrimitiveType::Triangle)
                         {
-                            auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
+                            const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
+                            auto v1 = scene.as.vertices[tri.v0].position;
+                            auto v2 = scene.as.vertices[tri.v1].position;
+                            auto v3 = scene.as.vertices[tri.v2].position;
 
                             float t, u, v;
-                            if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
+                            if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
                             {
                                 hit_triangle = true;
                                 break;
                             }
                         }
+                        if (bc.is_last()) break;
                     }
                 }
                 if (current_box.stack.depth() == 0) break;
@@ -243,6 +321,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
         for (float z = 0.3f; z <= 0.7f; z += 0.05f)
         {
             glm::vec3 origin(x, -0.5f, z);
+            glm::vec3 current_source = origin;
             glm::vec3 dir(0.0f, 1.0f, 0.0f);
 
             CurrentBox current_box{.id = root_box};
@@ -252,28 +331,29 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, dir, it);
+                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
-                    auto count = scene.as.box_content[container_id].number_of_primitives;
-                    auto start = scene.as.box_content[container_id].start;
-                    for (uint32_t i = 0; i < count; ++i)
+                    for (; !hit_triangle; ++container_id)
                     {
-                        if (scene.as.primitives[start + i].type == PrimitiveType::Triangle)
+                        auto bc = scene.as.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        if (chunk0.type() == PrimitiveType::Triangle)
                         {
-                            auto t_id = scene.as.primitives[start + i].id;
-                            auto v1 = scene.as.vertices[scene.as.triangles[t_id].v0].position;
-                            auto v2 = scene.as.vertices[scene.as.triangles[t_id].v1].position;
-                            auto v3 = scene.as.vertices[scene.as.triangles[t_id].v2].position;
+                            const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
+                            auto v1 = scene.as.vertices[tri.v0].position;
+                            auto v2 = scene.as.vertices[tri.v1].position;
+                            auto v3 = scene.as.vertices[tri.v2].position;
 
                             float t, u, v;
-                            if (intersectRayTriangle(origin, dir, v1, v2, v3, t, u, v))
+                            if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
                             {
                                 hit_triangle = true;
                                 break;
                             }
                         }
+                        if (bc.is_last()) break;
                     }
                 }
                 if (current_box.stack.depth() == 0) break;

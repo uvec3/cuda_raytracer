@@ -19,19 +19,6 @@ option(CONTAINER_EXPLORER_BUILD_EXAMPLES "Build demo application for imgui_conta
 include(FetchContent)
 
 # -----------------------------------------------------------------------------
-# Dependencies: Boost.PFR (from git)
-# -----------------------------------------------------------------------------
-if (NOT TARGET Boost::pfr)
-    FetchContent_Declare(
-        boost_pfr
-        GIT_REPOSITORY https://github.com/boostorg/pfr.git
-        GIT_TAG master
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(boost_pfr)
-endif()
-
-# -----------------------------------------------------------------------------
 # Optional GLM discovery (from Vulkan SDK or system)
 # -----------------------------------------------------------------------------
 find_package(Vulkan QUIET)
@@ -49,7 +36,9 @@ target_include_directories(imgui_container_explorer
 )
 
 target_compile_features(imgui_container_explorer INTERFACE cxx_std_20)
-target_link_libraries(imgui_container_explorer INTERFACE Boost::pfr)
+target_compile_definitions(imgui_container_explorer INTERFACE
+    CONTAINER_EXPLORER_PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
 
 if (Vulkan_FOUND)
     target_include_directories(imgui_container_explorer INTERFACE ${Vulkan_INCLUDE_DIRS})

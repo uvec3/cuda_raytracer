@@ -241,7 +241,6 @@ bool RaytracerController::ui_debug_pixel()
                 raytracer->update_parameters(*scene,current_image_size.x, current_image_size.y);
                 RenderParameters host_params = raytracer->parameters;
                 host_params.vertices = scene->as.vertices.view();
-                host_params.triangles = scene->as.triangles.view();
                 host_params.materials = scene->m_materials.view();
                 host_params.as = scene->as.as.view();
                 host_params.containers = scene->as.box_content.view();

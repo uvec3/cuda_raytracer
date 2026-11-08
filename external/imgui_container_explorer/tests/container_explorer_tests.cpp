@@ -171,11 +171,10 @@ namespace
     };
 } // namespace
 
-TEST(ContainerExplorerReflection, BoostPfrColumnNamesForNestedStructs)
+TEST(ContainerExplorerReflection, ColumnNamesForNestedStructs)
 {
     auto cols = container_explorer_detail::get_leaf_column_names<ComplexEntity>();
 
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
     ASSERT_GE(cols.size(), 7u);
     EXPECT_EQ(cols[0], "id");
     EXPECT_EQ(cols[1], "status");
@@ -189,7 +188,6 @@ TEST(ContainerExplorerReflection, BoostPfrColumnNamesForNestedStructs)
     ASSERT_EQ(cols.size(), 9u);
     EXPECT_EQ(cols[8], "velocity");
 #endif
-#endif
 }
 
 TEST(ContainerExplorerReflection, DecomposesSoaRefWrapperAndReferenceMembers)
@@ -200,14 +198,12 @@ TEST(ContainerExplorerReflection, DecomposesSoaRefWrapperAndReferenceMembers)
     auto cols = container_explorer_detail::get_leaf_column_names<ElemRef>();
     ASSERT_EQ(cols.size(), 6u);
 
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
-    EXPECT_EQ(cols[0], "field_0");
-    EXPECT_EQ(cols[1], "field_1");
-    EXPECT_EQ(cols[2], "nested1.field_0");
-    EXPECT_EQ(cols[3], "nested1.field_1");
-    EXPECT_EQ(cols[4], "nested2.field_0");
-    EXPECT_EQ(cols[5], "nested2.field_1");
-#endif
+    EXPECT_TRUE(cols[0] == "a" || cols[0] == "field_0");
+    EXPECT_TRUE(cols[1] == "b" || cols[1] == "field_1");
+    EXPECT_TRUE(cols[2] == "nested1.n1" || cols[2] == "nested1.field_0");
+    EXPECT_TRUE(cols[3] == "nested1.n2" || cols[3] == "nested1.field_1");
+    EXPECT_TRUE(cols[4] == "nested2.n1" || cols[4] == "nested2.field_0");
+    EXPECT_TRUE(cols[5] == "nested2.n2" || cols[5] == "nested2.field_1");
 }
 
 TEST(ContainerExplorerReflection, SupportsSoaVectorWithAosValueStruct)
@@ -219,14 +215,12 @@ TEST(ContainerExplorerReflection, SupportsSoaVectorWithAosValueStruct)
     auto cols = container_explorer_detail::get_leaf_column_names<ElemRef>();
     ASSERT_EQ(cols.size(), 6u);
 
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
     EXPECT_EQ(cols[0], "a");
     EXPECT_EQ(cols[1], "b");
     EXPECT_EQ(cols[2], "nested1.n1");
     EXPECT_EQ(cols[3], "nested1.n2");
     EXPECT_EQ(cols[4], "nested2.n1");
     EXPECT_EQ(cols[5], "nested2.n2");
-#endif
 
     AosSoaVec vec(2);
     vec[0] = SoaTypeValue{1.0f, 2, {3.0f, 4.0}, {5.0f, 6.0}};
@@ -253,24 +247,20 @@ TEST(ContainerExplorerReflection, ReflectsSoaReferenceLeafNamesViaValueTypeAndBe
     auto named_cols = container_explorer_detail::get_leaf_column_names<NamedElemRef>();
     ASSERT_EQ(named_cols.size(), 6u);
 
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
     EXPECT_EQ(named_cols[0], "a");
     EXPECT_EQ(named_cols[1], "b");
     EXPECT_EQ(named_cols[2], "nested1.n1");
     EXPECT_EQ(named_cols[3], "nested1.n2");
     EXPECT_EQ(named_cols[4], "nested2.n1");
     EXPECT_EQ(named_cols[5], "nested2.n2");
-#endif
 
     auto wide_cols = container_explorer_detail::get_leaf_column_names<SoaWideMixedRef>();
     ASSERT_EQ(wide_cols.size(), 12u);
 
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
-    EXPECT_EQ(wide_cols[8], "ninth_sub.field_0");
-    EXPECT_EQ(wide_cols[9], "ninth_sub.field_1");
-    EXPECT_EQ(wide_cols[10], "tenth_sub.field_0");
-    EXPECT_EQ(wide_cols[11], "tenth_sub.field_1");
-#endif
+    EXPECT_TRUE(wide_cols[8] == "ninth_sub.n1" || wide_cols[8] == "ninth_sub.field_0");
+    EXPECT_TRUE(wide_cols[9] == "ninth_sub.n2" || wide_cols[9] == "ninth_sub.field_1");
+    EXPECT_TRUE(wide_cols[10] == "tenth_sub.n1" || wide_cols[10] == "tenth_sub.field_0");
+    EXPECT_TRUE(wide_cols[11] == "tenth_sub.n2" || wide_cols[11] == "tenth_sub.field_1");
 }
 
 TEST(ContainerExplorerReflection, MutatesLeavesThroughVisitorOnStdAndSoaContainers)

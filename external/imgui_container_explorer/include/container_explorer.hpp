@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -17,11 +19,46 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/pfr.hpp>
 #include "imgui.h"
+
+#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202500L && __has_include(<meta>)
+#include <meta>
+#define CONTAINER_EXPLORER_HAS_CPP26_REFLECTION 1
+#else
+#define CONTAINER_EXPLORER_HAS_CPP26_REFLECTION 0
+#endif
+
+#if !CONTAINER_EXPLORER_HAS_CPP26_REFLECTION && defined(__clang__)
+#if __has_builtin(__builtin_dump_struct)
+#define CONTAINER_EXPLORER_HAS_CLANG_DUMP_STRUCT 1
+#endif
+#endif
+#ifndef CONTAINER_EXPLORER_HAS_CLANG_DUMP_STRUCT
+#define CONTAINER_EXPLORER_HAS_CLANG_DUMP_STRUCT 0
+#endif
+
+#if !CONTAINER_EXPLORER_HAS_CPP26_REFLECTION && defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#undef min
+#undef max
+#undef near
+#undef far
+#define CONTAINER_EXPLORER_HAS_MSVC_PDB_REFLECTION 1
+#else
+#define CONTAINER_EXPLORER_HAS_MSVC_PDB_REFLECTION 0
+#endif
 
 #if __has_include(<glm/glm.hpp>)
 #include <glm/glm.hpp>
@@ -196,16 +233,16 @@ namespace container_explorer_detail
         return false;
     }
 
-    template <typename T, std::size_t N = 0, std::size_t Max = 64>
+    template <typename T, std::size_t N = 32>
     constexpr std::size_t find_top_aggregate_arity()
     {
         if constexpr (test_top_init<T>(std::make_index_sequence<N>{}))
         {
             return N;
         }
-        else if constexpr (N < Max)
+        else if constexpr (N > 0)
         {
-            return find_top_aggregate_arity<T, N + 1, Max>();
+            return find_top_aggregate_arity<T, N - 1>();
         }
         else
         {
@@ -217,14 +254,12 @@ namespace container_explorer_detail
     constexpr std::size_t aggregate_field_count()
     {
         using Clean = std::remove_cvref_t<T>;
-        if constexpr (requires { sizeof(Clean{}); })
-        {
-            return boost::pfr::tuple_size_v<Clean>;
-        }
-        else
-        {
-            return find_top_aggregate_arity<Clean>();
-        }
+#if CONTAINER_EXPLORER_HAS_CPP26_REFLECTION
+        constexpr auto ctx = std::meta::access_context::current();
+        return std::meta::nonstatic_data_members_of(^^Clean, ctx).size();
+#else
+        return find_top_aggregate_arity<Clean>();
+#endif
     }
 
     // -------------------------------------------------------------------------
@@ -308,24 +343,23 @@ namespace container_explorer_detail
     using resolve_schema_type_t = typename decltype(select_schema_type<T>())::type;
 
     // -------------------------------------------------------------------------
-    // Boost.PFR Field Name Extraction (with safe fallback for reference members)
+    // Self-Contained Aggregate Reflection (Zero Boost.PFR Dependency)
     // -------------------------------------------------------------------------
-    template <typename T, std::size_t I, std::size_t N>
-    constexpr bool is_value_member_at()
+    template <typename T>
+    extern const T fake_object_v;
+
+    template <typename T>
+    consteval const T& fake_object() noexcept
     {
-        using Clean = std::remove_cvref_t<T>;
-        // In Boost.PFR's tie_as_tuple(const Clean&), value members become const Field&,
-        // whereas non-const reference members (e.g. float& in SOA reference structs) remain non-const Field&.
-        using TiedConstTuple = decltype(boost::pfr::detail::tie_as_tuple(
-            std::declval<const Clean&>(), boost::pfr::detail::size_t_<N>{}));
-        using ElemRef = decltype(boost::pfr::detail::sequence_tuple::get<I>(std::declval<TiedConstTuple>()));
-        return std::is_const_v<std::remove_reference_t<ElemRef>>;
+        return fake_object_v<T>;
     }
 
 #define CONTAINER_EXPLORER_COMMA() ,
 #define CONTAINER_EXPLORER_EMPTY()
 #define CONTAINER_EXPLORER_BIND(i) a##i
 #define CONTAINER_EXPLORER_RET(i) if constexpr (I == (i)) return std::addressof(a##i);
+#define CONTAINER_EXPLORER_TYPE_RET(i) if constexpr (I == (i)) return std::type_identity<std::remove_cvref_t<decltype(a##i)>>{};
+#define CONTAINER_EXPLORER_IS_VAL_RET(i) if constexpr (I == (i)) return std::is_const_v<decltype(a##i)> && requires { std::addressof(a##i); };
 
 #define CONTAINER_EXPLORER_REP_1(M, S)  M(0)
 #define CONTAINER_EXPLORER_REP_2(M, S)  CONTAINER_EXPLORER_REP_1(M, S) S() M(1)
@@ -360,9 +394,66 @@ namespace container_explorer_detail
 #define CONTAINER_EXPLORER_REP_31(M, S) CONTAINER_EXPLORER_REP_30(M, S) S() M(30)
 #define CONTAINER_EXPLORER_REP_32(M, S) CONTAINER_EXPLORER_REP_31(M, S) S() M(31)
 
+#define CONTAINER_EXPLORER_IS_VAL_CASE(K) \
+    else if constexpr (N == (K)) { \
+        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = fake_object<Clean>(); \
+        CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_IS_VAL_RET, CONTAINER_EXPLORER_EMPTY) \
+    }
+
+    template <typename T, std::size_t I, std::size_t N>
+    consteval bool is_value_member_at()
+    {
+        using Clean = std::remove_cvref_t<T>;
+        if constexpr (N == 0) {
+            return false;
+        }
+        CONTAINER_EXPLORER_IS_VAL_CASE(1)  CONTAINER_EXPLORER_IS_VAL_CASE(2)  CONTAINER_EXPLORER_IS_VAL_CASE(3)  CONTAINER_EXPLORER_IS_VAL_CASE(4)
+        CONTAINER_EXPLORER_IS_VAL_CASE(5)  CONTAINER_EXPLORER_IS_VAL_CASE(6)  CONTAINER_EXPLORER_IS_VAL_CASE(7)  CONTAINER_EXPLORER_IS_VAL_CASE(8)
+        CONTAINER_EXPLORER_IS_VAL_CASE(9)  CONTAINER_EXPLORER_IS_VAL_CASE(10) CONTAINER_EXPLORER_IS_VAL_CASE(11) CONTAINER_EXPLORER_IS_VAL_CASE(12)
+        CONTAINER_EXPLORER_IS_VAL_CASE(13) CONTAINER_EXPLORER_IS_VAL_CASE(14) CONTAINER_EXPLORER_IS_VAL_CASE(15) CONTAINER_EXPLORER_IS_VAL_CASE(16)
+        CONTAINER_EXPLORER_IS_VAL_CASE(17) CONTAINER_EXPLORER_IS_VAL_CASE(18) CONTAINER_EXPLORER_IS_VAL_CASE(19) CONTAINER_EXPLORER_IS_VAL_CASE(20)
+        CONTAINER_EXPLORER_IS_VAL_CASE(21) CONTAINER_EXPLORER_IS_VAL_CASE(22) CONTAINER_EXPLORER_IS_VAL_CASE(23) CONTAINER_EXPLORER_IS_VAL_CASE(24)
+        CONTAINER_EXPLORER_IS_VAL_CASE(25) CONTAINER_EXPLORER_IS_VAL_CASE(26) CONTAINER_EXPLORER_IS_VAL_CASE(27) CONTAINER_EXPLORER_IS_VAL_CASE(28)
+        CONTAINER_EXPLORER_IS_VAL_CASE(29) CONTAINER_EXPLORER_IS_VAL_CASE(30) CONTAINER_EXPLORER_IS_VAL_CASE(31) CONTAINER_EXPLORER_IS_VAL_CASE(32)
+        return false;
+    }
+
+#undef CONTAINER_EXPLORER_IS_VAL_CASE
+
+#define CONTAINER_EXPLORER_TYPE_CASE(K) \
+    else if constexpr (N == (K)) { \
+        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = fake_object<Clean>(); \
+        CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_TYPE_RET, CONTAINER_EXPLORER_EMPTY) \
+    }
+
+    template <typename T, std::size_t I, std::size_t N>
+    consteval auto field_type_at()
+    {
+        using Clean = std::remove_cvref_t<T>;
+        if constexpr (N == 0) {
+            return std::type_identity<void>{};
+        }
+        CONTAINER_EXPLORER_TYPE_CASE(1)  CONTAINER_EXPLORER_TYPE_CASE(2)  CONTAINER_EXPLORER_TYPE_CASE(3)  CONTAINER_EXPLORER_TYPE_CASE(4)
+        CONTAINER_EXPLORER_TYPE_CASE(5)  CONTAINER_EXPLORER_TYPE_CASE(6)  CONTAINER_EXPLORER_TYPE_CASE(7)  CONTAINER_EXPLORER_TYPE_CASE(8)
+        CONTAINER_EXPLORER_TYPE_CASE(9)  CONTAINER_EXPLORER_TYPE_CASE(10) CONTAINER_EXPLORER_TYPE_CASE(11) CONTAINER_EXPLORER_TYPE_CASE(12)
+        CONTAINER_EXPLORER_TYPE_CASE(13) CONTAINER_EXPLORER_TYPE_CASE(14) CONTAINER_EXPLORER_TYPE_CASE(15) CONTAINER_EXPLORER_TYPE_CASE(16)
+        CONTAINER_EXPLORER_TYPE_CASE(17) CONTAINER_EXPLORER_TYPE_CASE(18) CONTAINER_EXPLORER_TYPE_CASE(19) CONTAINER_EXPLORER_TYPE_CASE(20)
+        CONTAINER_EXPLORER_TYPE_CASE(21) CONTAINER_EXPLORER_TYPE_CASE(22) CONTAINER_EXPLORER_TYPE_CASE(23) CONTAINER_EXPLORER_TYPE_CASE(24)
+        CONTAINER_EXPLORER_TYPE_CASE(25) CONTAINER_EXPLORER_TYPE_CASE(26) CONTAINER_EXPLORER_TYPE_CASE(27) CONTAINER_EXPLORER_TYPE_CASE(28)
+        CONTAINER_EXPLORER_TYPE_CASE(29) CONTAINER_EXPLORER_TYPE_CASE(30) CONTAINER_EXPLORER_TYPE_CASE(31) CONTAINER_EXPLORER_TYPE_CASE(32)
+        else {
+            return std::type_identity<void>{};
+        }
+    }
+
+#undef CONTAINER_EXPLORER_TYPE_CASE
+
+    template <typename T, std::size_t I, std::size_t N>
+    using field_type_at_t = typename decltype(field_type_at<T, I, N>())::type;
+
 #define CONTAINER_EXPLORER_ADDR_CASE(K) \
     else if constexpr (N == (K)) { \
-        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = boost::pfr::detail::fake_object<T>(); \
+        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = fake_object<T>(); \
         CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_RET, CONTAINER_EXPLORER_EMPTY) \
     }
 
@@ -381,55 +472,11 @@ namespace container_explorer_detail
         CONTAINER_EXPLORER_ADDR_CASE(25) CONTAINER_EXPLORER_ADDR_CASE(26) CONTAINER_EXPLORER_ADDR_CASE(27) CONTAINER_EXPLORER_ADDR_CASE(28)
         CONTAINER_EXPLORER_ADDR_CASE(29) CONTAINER_EXPLORER_ADDR_CASE(30) CONTAINER_EXPLORER_ADDR_CASE(31) CONTAINER_EXPLORER_ADDR_CASE(32)
         else {
-            return std::addressof(
-                boost::pfr::detail::sequence_tuple::get<I>(
-                    boost::pfr::detail::tie_as_tuple(boost::pfr::detail::fake_object<T>(), boost::pfr::detail::size_t_<N>{})));
+            return nullptr;
         }
     }
 
 #undef CONTAINER_EXPLORER_ADDR_CASE
-#undef CONTAINER_EXPLORER_REP_32
-#undef CONTAINER_EXPLORER_REP_31
-#undef CONTAINER_EXPLORER_REP_30
-#undef CONTAINER_EXPLORER_REP_29
-#undef CONTAINER_EXPLORER_REP_28
-#undef CONTAINER_EXPLORER_REP_27
-#undef CONTAINER_EXPLORER_REP_26
-#undef CONTAINER_EXPLORER_REP_25
-#undef CONTAINER_EXPLORER_REP_24
-#undef CONTAINER_EXPLORER_REP_23
-#undef CONTAINER_EXPLORER_REP_22
-#undef CONTAINER_EXPLORER_REP_21
-#undef CONTAINER_EXPLORER_REP_20
-#undef CONTAINER_EXPLORER_REP_19
-#undef CONTAINER_EXPLORER_REP_18
-#undef CONTAINER_EXPLORER_REP_17
-#undef CONTAINER_EXPLORER_REP_16
-#undef CONTAINER_EXPLORER_REP_15
-#undef CONTAINER_EXPLORER_REP_14
-#undef CONTAINER_EXPLORER_REP_13
-#undef CONTAINER_EXPLORER_REP_12
-#undef CONTAINER_EXPLORER_REP_11
-#undef CONTAINER_EXPLORER_REP_10
-#undef CONTAINER_EXPLORER_REP_9
-#undef CONTAINER_EXPLORER_REP_8
-#undef CONTAINER_EXPLORER_REP_7
-#undef CONTAINER_EXPLORER_REP_6
-#undef CONTAINER_EXPLORER_REP_5
-#undef CONTAINER_EXPLORER_REP_4
-#undef CONTAINER_EXPLORER_REP_3
-#undef CONTAINER_EXPLORER_REP_2
-#undef CONTAINER_EXPLORER_REP_1
-#undef CONTAINER_EXPLORER_RET
-#undef CONTAINER_EXPLORER_BIND
-#undef CONTAINER_EXPLORER_EMPTY
-#undef CONTAINER_EXPLORER_COMMA
-
-    template <typename T, std::size_t N, std::size_t... Is>
-    constexpr bool all_value_members_impl(std::index_sequence<Is...>)
-    {
-        return (is_value_member_at<T, Is, N>() && ...);
-    }
 
     template <typename T>
     struct field_ptr_wrapper
@@ -451,9 +498,9 @@ namespace container_explorer_detail
     consteval auto name_of_wrapped_field() noexcept
     {
 #if defined(__FUNCSIG__)
-        constexpr std::string_view sv = boost::pfr::detail::clang_workaround<MsvcWorkaround>(__FUNCSIG__);
+        constexpr std::string_view sv = __FUNCSIG__;
 #elif defined(__PRETTY_FUNCTION__) || defined(__GNUC__) || defined(__clang__)
-        constexpr std::string_view sv = boost::pfr::detail::clang_workaround<MsvcWorkaround>(__PRETTY_FUNCTION__);
+        constexpr std::string_view sv = __PRETTY_FUNCTION__;
 #else
         constexpr std::string_view sv = "";
 #endif
@@ -490,18 +537,616 @@ namespace container_explorer_detail
         field_ptr_wrapper{address_of_value_field<T, I, N>()}
     >();
 
+#if CONTAINER_EXPLORER_HAS_CLANG_DUMP_STRUCT
+    struct clang_dummy_ref_provider
+    {
+        void* ptr;
+        template <typename U>
+        operator U&() const noexcept
+        {
+            return *static_cast<U*>(ptr);
+        }
+    };
+
+    template <typename T, std::size_t... Is>
+    T make_clang_dummy_aggregate(void* buf, std::index_sequence<Is...>)
+    {
+        return T{((void)Is, clang_dummy_ref_provider{buf})...};
+    }
+
+    template <typename T, std::size_t N>
+    std::vector<std::string> clang_dump_struct_member_names()
+    {
+        alignas(64) std::byte buf[1024]{};
+        T dummy = make_clang_dummy_aggregate<T>(buf, std::make_index_sequence<N>{});
+
+        std::vector<std::string> names;
+        auto cb = [&](const char*, const auto&... args)
+        {
+            if constexpr (sizeof...(args) >= 3)
+            {
+                auto tup = std::forward_as_tuple(args...);
+                if constexpr (std::is_convertible_v<decltype(std::get<0>(tup)), std::string_view> &&
+                              std::is_convertible_v<decltype(std::get<2>(tup)), std::string_view>)
+                {
+                    std::string_view indent(std::get<0>(tup));
+                    std::string_view fname(std::get<2>(tup));
+                    if (indent == "  " && !fname.empty())
+                    {
+                        names.emplace_back(fname);
+                    }
+                }
+            }
+        };
+        __builtin_dump_struct(&dummy, cb);
+        return names;
+    }
+#endif
+
+    template <typename T>
+    constexpr std::string_view extract_clean_udt_name() noexcept
+    {
+#if defined(__FUNCSIG__)
+        std::string_view sig = __FUNCSIG__;
+        const std::size_t open = sig.find("extract_clean_udt_name<");
+        if (open == std::string_view::npos)
+            return {};
+        const std::size_t start = open + 23;
+        const std::size_t close = sig.rfind('>');
+        if (close == std::string_view::npos || close <= start)
+            return {};
+        std::string_view name = sig.substr(start, close - start);
+#elif defined(__PRETTY_FUNCTION__)
+        std::string_view sig = __PRETTY_FUNCTION__;
+        const std::size_t eq = sig.find("T = ");
+        if (eq == std::string_view::npos)
+            return {};
+        const std::size_t start = eq + 4;
+        const std::size_t close = sig.find_first_of(";]", start);
+        if (close == std::string_view::npos || close <= start)
+            return {};
+        std::string_view name = sig.substr(start, close - start);
+#else
+        std::string_view name = {};
+#endif
+        while (!name.empty() && name.front() == ' ')
+            name.remove_prefix(1);
+        while (!name.empty() && name.back() == ' ')
+            name.remove_suffix(1);
+        if (name.starts_with("struct "))
+            name.remove_prefix(7);
+        else if (name.starts_with("class "))
+            name.remove_prefix(6);
+        return name;
+    }
+
+    inline std::string strip_cpp_comments(std::string_view src)
+    {
+        std::string out;
+        out.reserve(src.size());
+        std::size_t i = 0;
+        while (i < src.size())
+        {
+            if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '/')
+            {
+                i += 2;
+                while (i < src.size() && src[i] != '\n')
+                    ++i;
+            }
+            else if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/'))
+                    ++i;
+                if (i + 1 < src.size())
+                    i += 2;
+            }
+            else
+            {
+                out.push_back(src[i]);
+                ++i;
+            }
+        }
+        return out;
+    }
+
+    inline std::string_view trim_sv(std::string_view s) noexcept
+    {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n'))
+            s.remove_prefix(1);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
+            s.remove_suffix(1);
+        return s;
+    }
+
+    inline std::vector<std::string> parse_struct_body_members(std::string_view body)
+    {
+        std::vector<std::string> fields;
+        std::size_t i = 0;
+        while (i < body.size())
+        {
+            std::size_t stmt_start = i;
+            int paren_depth = 0;
+            int angle_depth = 0;
+            int brace_depth = 0;
+            bool saw_paren_before_eq = false;
+            bool saw_eq_or_colon = false;
+            bool skipped_block = false;
+
+            while (i < body.size())
+            {
+                char c = body[i];
+                if (c == '(')
+                {
+                    if (!saw_eq_or_colon && brace_depth == 0)
+                        saw_paren_before_eq = true;
+                    ++paren_depth;
+                }
+                else if (c == ')')
+                {
+                    if (paren_depth > 0) --paren_depth;
+                }
+                else if (c == '<')
+                {
+                    if (paren_depth == 0 && brace_depth == 0) ++angle_depth;
+                }
+                else if (c == '>')
+                {
+                    if (paren_depth == 0 && brace_depth == 0 && angle_depth > 0) --angle_depth;
+                }
+                else if ((c == '=' || c == ':') && paren_depth == 0 && brace_depth == 0 && angle_depth == 0)
+                {
+                    if (c == ':' && i + 1 < body.size() && body[i + 1] == ':')
+                    {
+                        ++i;
+                    }
+                    else
+                    {
+                        saw_eq_or_colon = true;
+                    }
+                }
+                else if (c == '{')
+                {
+                    ++brace_depth;
+                }
+                else if (c == '}')
+                {
+                    if (brace_depth > 0)
+                    {
+                        --brace_depth;
+                        if (brace_depth == 0 && saw_paren_before_eq)
+                        {
+                            ++i;
+                            while (i < body.size() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n' || body[i] == ';'))
+                                ++i;
+                            skipped_block = true;
+                            break;
+                        }
+                    }
+                }
+                else if (c == ';' && paren_depth == 0 && brace_depth == 0)
+                {
+                    break;
+                }
+                ++i;
+            }
+
+            if (skipped_block)
+                continue;
+            if (i >= body.size())
+                break;
+
+            std::string_view stmt = trim_sv(body.substr(stmt_start, i - stmt_start));
+            ++i; // skip ';'
+
+            if (stmt.empty())
+                continue;
+            if (stmt.starts_with("public:") || stmt.starts_with("private:") || stmt.starts_with("protected:"))
+            {
+                auto colon_pos = stmt.find(':');
+                stmt = trim_sv(stmt.substr(colon_pos + 1));
+                if (stmt.empty())
+                    continue;
+            }
+            if (stmt.starts_with("static ") || stmt.starts_with("using ") || stmt.starts_with("typedef ") ||
+                stmt.starts_with("friend ") || stmt.starts_with("constexpr ") || stmt.starts_with("template") ||
+                stmt.starts_with("struct ") || stmt.starts_with("class ") || stmt.starts_with("enum "))
+            {
+                continue;
+            }
+            if (saw_paren_before_eq)
+                continue;
+
+            // Strip trailing initializer (= ... or {...}) or bit-field width (: ...)
+            std::size_t cut = std::string_view::npos;
+            int p_depth = 0;
+            int a_depth = 0;
+            for (std::size_t k = 0; k < stmt.size(); ++k)
+            {
+                char ch = stmt[k];
+                if (ch == '(') ++p_depth;
+                else if (ch == ')' && p_depth > 0) --p_depth;
+                else if (ch == '<') ++a_depth;
+                else if (ch == '>' && a_depth > 0) --a_depth;
+                else if (p_depth == 0 && a_depth == 0)
+                {
+                    if (ch == '=' || ch == '{')
+                    {
+                        cut = k;
+                        break;
+                    }
+                    if (ch == ':')
+                    {
+                        if (k + 1 < stmt.size() && stmt[k + 1] == ':')
+                        {
+                            ++k;
+                        }
+                        else
+                        {
+                            cut = k;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (cut != std::string_view::npos)
+                stmt = trim_sv(stmt.substr(0, cut));
+
+            // Strip array suffix [N] if present
+            while (!stmt.empty() && stmt.back() == ']')
+            {
+                auto open_br = stmt.rfind('[');
+                if (open_br == std::string_view::npos)
+                    break;
+                stmt = trim_sv(stmt.substr(0, open_br));
+            }
+
+            // Extract trailing identifier
+            std::size_t end_id = stmt.size();
+            std::size_t start_id = end_id;
+            while (start_id > 0 && is_ident_char(stmt[start_id - 1]))
+                --start_id;
+            if (start_id < end_id && start_id > 0)
+            {
+                fields.emplace_back(stmt.substr(start_id, end_id - start_id));
+            }
+        }
+        return fields;
+    }
+
+    inline void index_structs_in_source(std::string_view raw_source, std::unordered_map<std::string, std::vector<std::string>>& out_map)
+    {
+        std::string clean = strip_cpp_comments(raw_source);
+        std::string_view sv(clean);
+        std::size_t pos = 0;
+        while (pos < sv.size())
+        {
+            std::size_t kw = sv.find("struct", pos);
+            if (kw == std::string_view::npos)
+                break;
+            if ((kw > 0 && is_ident_char(sv[kw - 1])) || (kw + 6 < sv.size() && is_ident_char(sv[kw + 6])))
+            {
+                pos = kw + 6;
+                continue;
+            }
+            std::size_t cur = kw + 6;
+            while (cur < sv.size())
+            {
+                while (cur < sv.size() && (sv[cur] == ' ' || sv[cur] == '\t' || sv[cur] == '\r' || sv[cur] == '\n'))
+                    ++cur;
+                if (sv.substr(cur).starts_with("alignas"))
+                {
+                    cur += 7;
+                    while (cur < sv.size() && sv[cur] != '(') ++cur;
+                    int pd = 0;
+                    while (cur < sv.size())
+                    {
+                        if (sv[cur] == '(') ++pd;
+                        else if (sv[cur] == ')') { --pd; if (pd == 0) { ++cur; break; } }
+                        ++cur;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            std::size_t name_start = cur;
+            while (cur < sv.size() && is_ident_char(sv[cur]))
+                ++cur;
+            std::string_view struct_name = sv.substr(name_start, cur - name_start);
+            if (struct_name.empty())
+            {
+                pos = cur + 1;
+                continue;
+            }
+            while (cur < sv.size() && sv[cur] != '{' && sv[cur] != ';')
+                ++cur;
+            if (cur >= sv.size() || sv[cur] != '{')
+            {
+                pos = cur + 1;
+                continue;
+            }
+            std::size_t body_start = cur + 1;
+            int bd = 1;
+            std::size_t body_end = body_start;
+            while (body_end < sv.size() && bd > 0)
+            {
+                if (sv[body_end] == '{') ++bd;
+                else if (sv[body_end] == '}') --bd;
+                if (bd > 0) ++body_end;
+            }
+            if (bd == 0)
+            {
+                auto parsed = parse_struct_body_members(sv.substr(body_start, body_end - body_start));
+                if (!parsed.empty())
+                {
+                    out_map[std::string(struct_name)] = std::move(parsed);
+                }
+                pos = body_end + 1;
+            }
+            else
+            {
+                pos = body_start;
+            }
+        }
+    }
+
+    inline const std::unordered_map<std::string, std::vector<std::string>>& get_project_source_struct_map()
+    {
+        static const std::unordered_map<std::string, std::vector<std::string>> cache = []()
+        {
+            std::unordered_map<std::string, std::vector<std::string>> map;
+            std::vector<std::filesystem::path> roots;
+#ifdef CONTAINER_EXPLORER_PROJECT_SOURCE_DIR
+            roots.emplace_back(CONTAINER_EXPLORER_PROJECT_SOURCE_DIR);
+#endif
+            std::error_code ec;
+            auto cwd = std::filesystem::current_path(ec);
+            if (!ec && !cwd.empty())
+                roots.push_back(cwd);
+
+            for (const auto& root : roots)
+            {
+                for (const char* sub : {"src", "include", "tests"})
+                {
+                    auto dir = root / sub;
+                    if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec))
+                        continue;
+                    for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec))
+                    {
+                        if (!entry.is_regular_file(ec))
+                            continue;
+                        auto ext = entry.path().extension().string();
+                        if (ext == ".hpp" || ext == ".h" || ext == ".cuh" || ext == ".cpp")
+                        {
+                            std::ifstream ifs(entry.path(), std::ios::binary);
+                            if (ifs)
+                            {
+                                std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                                index_structs_in_source(content, map);
+                            }
+                        }
+                    }
+                }
+            }
+            return map;
+        }();
+        return cache;
+    }
+
+    template <typename T>
+    std::vector<std::string> source_header_get_nonstatic_member_names()
+    {
+        std::string_view full_name = extract_clean_udt_name<T>();
+        if (full_name.empty())
+            return {};
+        auto last_colon = full_name.rfind("::");
+        std::string short_name(last_colon == std::string_view::npos ? full_name : full_name.substr(last_colon + 2));
+        const auto& map = get_project_source_struct_map();
+        auto it = map.find(short_name);
+        if (it != map.end())
+            return it->second;
+        return {};
+    }
+
+#if CONTAINER_EXPLORER_HAS_MSVC_PDB_REFLECTION
+    template <typename T>
+    constexpr std::string_view msvc_extract_udt_name() noexcept
+    {
+        return extract_clean_udt_name<T>();
+    }
+
+#define CONTAINER_EXPLORER_PDB_ANCHOR_CASE(K) \
+    else if constexpr (N == (K)) { \
+        const auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = *p; \
+        (void)a0; \
+    }
+
+    template <typename T, std::size_t N>
+    __declspec(noinline) const void* msvc_pdb_anchor_type(const T* p) noexcept
+    {
+        if (p != nullptr)
+        {
+            if constexpr (N == 0) {}
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(1)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(2)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(3)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(4)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(5)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(6)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(7)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(8)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(9)  CONTAINER_EXPLORER_PDB_ANCHOR_CASE(10) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(11) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(12)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(13) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(14) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(15) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(16)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(17) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(18) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(19) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(20)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(21) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(22) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(23) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(24)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(25) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(26) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(27) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(28)
+            CONTAINER_EXPLORER_PDB_ANCHOR_CASE(29) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(30) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(31) CONTAINER_EXPLORER_PDB_ANCHOR_CASE(32)
+        }
+        return reinterpret_cast<const void*>(&msvc_pdb_anchor_type<T, N>);
+    }
+
+#undef CONTAINER_EXPLORER_PDB_ANCHOR_CASE
+
+    struct pdb_enum_type_context
+    {
+        HANDLE proc;
+        DWORD64 mod_base;
+        ULONG best_type_index = 0;
+        DWORD best_children_count = 0;
+    };
+
+    inline BOOL CALLBACK msvc_pdb_enum_types_cb(PSYMBOL_INFO pSymInfo, ULONG, PVOID UserContext)
+    {
+        auto* ctx = static_cast<pdb_enum_type_context*>(UserContext);
+        if (pSymInfo != nullptr)
+        {
+            DWORD count = 0;
+            if (SymGetTypeInfo(ctx->proc, ctx->mod_base, pSymInfo->TypeIndex, TI_GET_CHILDRENCOUNT, &count) && count > ctx->best_children_count)
+            {
+                ctx->best_type_index = pSymInfo->TypeIndex;
+                ctx->best_children_count = count;
+                return FALSE; // Stop enumeration once complete UDT definition is found
+            }
+        }
+        return TRUE;
+    }
+
+    template <typename T, std::size_t N>
+    std::vector<std::string> msvc_pdb_get_nonstatic_member_names()
+    {
+        const void* anchor_addr = msvc_pdb_anchor_type<T, N>(nullptr);
+        static bool sym_ready = []()
+        {
+            HANDLE proc = GetCurrentProcess();
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            if (!SymInitialize(proc, nullptr, TRUE))
+            {
+                SymRefreshModuleList(proc);
+            }
+            return true;
+        }();
+        (void)sym_ready;
+
+        std::vector<std::string> result;
+        std::string struct_name(msvc_extract_udt_name<T>());
+        if (struct_name.empty())
+            return result;
+
+        HANDLE proc = GetCurrentProcess();
+        DWORD64 mod_base = SymGetModuleBase64(proc, reinterpret_cast<DWORD64>(anchor_addr));
+        if (mod_base == 0)
+        {
+            HMODULE hmod = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(anchor_addr), &hmod))
+            {
+                WCHAR mod_path[MAX_PATH]{};
+                if (GetModuleFileNameW(hmod, mod_path, MAX_PATH) > 0)
+                {
+                    mod_base = SymLoadModuleExW(proc, nullptr, mod_path, nullptr, reinterpret_cast<DWORD64>(hmod), 0, nullptr, 0);
+                }
+            }
+        }
+
+        pdb_enum_type_context enum_ctx{proc, mod_base, 0, 0};
+        SymEnumTypesByName(proc, mod_base, struct_name.c_str(), msvc_pdb_enum_types_cb, &enum_ctx);
+
+        if (enum_ctx.best_children_count == 0)
+        {
+            SYMBOL_INFO_PACKAGE sip{};
+            sip.si.SizeOfStruct = sizeof(SYMBOL_INFO);
+            sip.si.MaxNameLen = MAX_SYM_NAME;
+            if (SymGetTypeFromName(proc, mod_base, struct_name.c_str(), &sip.si))
+            {
+                DWORD count = 0;
+                if (SymGetTypeInfo(proc, mod_base, sip.si.TypeIndex, TI_GET_CHILDRENCOUNT, &count) && count > 0)
+                {
+                    enum_ctx.best_type_index = sip.si.TypeIndex;
+                    enum_ctx.best_children_count = count;
+                }
+            }
+        }
+
+        if (enum_ctx.best_children_count == 0)
+            return result;
+
+        ULONG type_index = enum_ctx.best_type_index;
+        DWORD children_count = enum_ctx.best_children_count;
+
+        std::vector<std::byte> buf(sizeof(TI_FINDCHILDREN_PARAMS) + children_count * sizeof(ULONG));
+        auto* params = reinterpret_cast<TI_FINDCHILDREN_PARAMS*>(buf.data());
+        params->Count = children_count;
+        params->Start = 0;
+
+        if (!SymGetTypeInfo(proc, mod_base, type_index, TI_FINDCHILDREN, params))
+            return result;
+
+        for (DWORD i = 0; i < children_count; ++i)
+        {
+            ULONG child_id = params->ChildId[i];
+            DWORD sym_tag = 0;
+            DWORD data_kind = 0;
+            // SymTagData == 7, DataIsMember == 7 (non-static data member, including reference & bit-field members)
+            if (SymGetTypeInfo(proc, mod_base, child_id, TI_GET_SYMTAG, &sym_tag) && sym_tag == 7 &&
+                SymGetTypeInfo(proc, mod_base, child_id, TI_GET_DATAKIND, &data_kind) && data_kind == 7)
+            {
+                WCHAR* wname = nullptr;
+                if (SymGetTypeInfo(proc, mod_base, child_id, TI_GET_SYMNAME, &wname) && wname != nullptr)
+                {
+                    int len = WideCharToMultiByte(CP_UTF8, 0, wname, -1, nullptr, 0, nullptr, nullptr);
+                    if (len > 1)
+                    {
+                        std::string s(static_cast<std::size_t>(len - 1), '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, wname, -1, s.data(), len, nullptr, nullptr);
+                        result.push_back(std::move(s));
+                    }
+                    LocalFree(wname);
+                }
+            }
+        }
+        return result;
+    }
+#endif
+
     template <typename T, std::size_t I>
     std::string get_struct_field_name()
     {
-        using Clean = resolve_schema_type_t<std::remove_cvref_t<T>>;
+        using RawClean = std::remove_cvref_t<T>;
+#if CONTAINER_EXPLORER_HAS_CPP26_REFLECTION
+        constexpr auto ctx = std::meta::access_context::current();
+        constexpr auto members = std::meta::nonstatic_data_members_of(^^RawClean, ctx);
+        if constexpr (I < members.size())
+        {
+            constexpr std::string_view sv = std::meta::identifier_of(members[I]);
+            if (!sv.empty())
+                return std::string(sv);
+        }
+#else
+        using Clean = resolve_schema_type_t<RawClean>;
         constexpr std::size_t N = aggregate_field_count<Clean>();
-#if defined(BOOST_PFR_CORE_NAME_ENABLED) && BOOST_PFR_CORE_NAME_ENABLED
-        if constexpr (N > 0 && is_value_member_at<Clean, I, N>() &&
-                      (N <= 32 || all_value_members_impl<Clean, N>(std::make_index_sequence<N>{})))
+        if constexpr (N > 0 && N <= 32 && is_value_member_at<Clean, I, N>())
         {
             std::string_view sv(stored_field_name<Clean, I, N>.data());
             if (!sv.empty())
                 return std::string(sv);
+        }
+#if CONTAINER_EXPLORER_HAS_CLANG_DUMP_STRUCT
+        if constexpr (N > 0 && N <= 32)
+        {
+            static const std::vector<std::string> clang_names = clang_dump_struct_member_names<RawClean, N>();
+            if (I < clang_names.size() && !clang_names[I].empty())
+                return clang_names[I];
+        }
+#endif
+#if CONTAINER_EXPLORER_HAS_MSVC_PDB_REFLECTION
+        if constexpr (N > 0 && N <= 32)
+        {
+            static const std::vector<std::string> pdb_names = msvc_pdb_get_nonstatic_member_names<RawClean, N>();
+            if (I < pdb_names.size() && !pdb_names[I].empty())
+                return pdb_names[I];
+        }
+#endif
+        if constexpr (N > 0 && N <= 32)
+        {
+            static const std::vector<std::string> src_names = source_header_get_nonstatic_member_names<RawClean>();
+            if (src_names.size() == N && I < src_names.size() && !src_names[I].empty())
+                return src_names[I];
         }
 #endif
         return "field_" + std::to_string(I);
@@ -784,15 +1429,21 @@ namespace container_explorer_detail
     template <typename T, std::size_t... Is>
     void collect_aggregate_names(std::vector<std::string>& names, std::string_view prefix, std::index_sequence<Is...>)
     {
+#if CONTAINER_EXPLORER_HAS_CPP26_REFLECTION
+        using Clean = std::remove_cvref_t<T>;
+        constexpr auto ctx = std::meta::access_context::current();
+        (collect_leaf_names_impl<
+             std::remove_reference_t<typename [:std::meta::type_of(std::meta::nonstatic_data_members_of(^^Clean, ctx)[Is]):]>>(
+             names, join_path(prefix, get_struct_field_name<Clean, Is>())),
+         ...);
+#else
         using Schema = resolve_schema_type_t<std::remove_cvref_t<T>>;
         constexpr std::size_t N = sizeof...(Is);
-        using TiedTuple = decltype(boost::pfr::detail::tie_as_tuple(
-            std::declval<Schema&>(), boost::pfr::detail::size_t_<N>{}));
 
-        (collect_leaf_names_impl<
-             std::remove_reference_t<decltype(boost::pfr::detail::sequence_tuple::get<Is>(std::declval<TiedTuple>()))>>(
+        (collect_leaf_names_impl<field_type_at_t<Schema, Is, N>>(
              names, join_path(prefix, get_struct_field_name<Schema, Is>())),
          ...);
+#endif
     }
 
     template <typename T>
@@ -888,23 +1539,108 @@ namespace container_explorer_detail
         (visit_leaves_impl<ForceConst>(std::get<Is>(tup), cb), ...);
     }
 
+#define CONTAINER_EXPLORER_VISIT_FIELD(i) \
+    if constexpr (requires { std::addressof(a##i); }) { \
+        visit_leaves_impl<ForceConst>(a##i, cb); \
+    } else if constexpr (ForceConst || IsConstObj) { \
+        const auto bf_copy_##i = a##i; \
+        visit_leaves_impl<true>(bf_copy_##i, cb); \
+    } else { \
+        auto bf_copy_##i = a##i; \
+        visit_leaves_impl<false>(bf_copy_##i, cb); \
+        a##i = bf_copy_##i; \
+    }
+
+#define CONTAINER_EXPLORER_VISIT_CASE(K) \
+    else if constexpr (N == (K)) { \
+        auto& [CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_BIND, CONTAINER_EXPLORER_COMMA)] = target_ref; \
+        CONTAINER_EXPLORER_REP_##K(CONTAINER_EXPLORER_VISIT_FIELD, CONTAINER_EXPLORER_EMPTY) \
+    }
+
+    template <bool ForceConst, bool IsConstObj, std::size_t N, typename RefT, typename Callback>
+    void visit_aggregate_structured(RefT& target_ref, Callback& cb)
+    {
+        if constexpr (N == 0) {}
+        CONTAINER_EXPLORER_VISIT_CASE(1)  CONTAINER_EXPLORER_VISIT_CASE(2)  CONTAINER_EXPLORER_VISIT_CASE(3)  CONTAINER_EXPLORER_VISIT_CASE(4)
+        CONTAINER_EXPLORER_VISIT_CASE(5)  CONTAINER_EXPLORER_VISIT_CASE(6)  CONTAINER_EXPLORER_VISIT_CASE(7)  CONTAINER_EXPLORER_VISIT_CASE(8)
+        CONTAINER_EXPLORER_VISIT_CASE(9)  CONTAINER_EXPLORER_VISIT_CASE(10) CONTAINER_EXPLORER_VISIT_CASE(11) CONTAINER_EXPLORER_VISIT_CASE(12)
+        CONTAINER_EXPLORER_VISIT_CASE(13) CONTAINER_EXPLORER_VISIT_CASE(14) CONTAINER_EXPLORER_VISIT_CASE(15) CONTAINER_EXPLORER_VISIT_CASE(16)
+        CONTAINER_EXPLORER_VISIT_CASE(17) CONTAINER_EXPLORER_VISIT_CASE(18) CONTAINER_EXPLORER_VISIT_CASE(19) CONTAINER_EXPLORER_VISIT_CASE(20)
+        CONTAINER_EXPLORER_VISIT_CASE(21) CONTAINER_EXPLORER_VISIT_CASE(22) CONTAINER_EXPLORER_VISIT_CASE(23) CONTAINER_EXPLORER_VISIT_CASE(24)
+        CONTAINER_EXPLORER_VISIT_CASE(25) CONTAINER_EXPLORER_VISIT_CASE(26) CONTAINER_EXPLORER_VISIT_CASE(27) CONTAINER_EXPLORER_VISIT_CASE(28)
+        CONTAINER_EXPLORER_VISIT_CASE(29) CONTAINER_EXPLORER_VISIT_CASE(30) CONTAINER_EXPLORER_VISIT_CASE(31) CONTAINER_EXPLORER_VISIT_CASE(32)
+    }
+
+#undef CONTAINER_EXPLORER_VISIT_CASE
+#undef CONTAINER_EXPLORER_VISIT_FIELD
+#undef CONTAINER_EXPLORER_REP_32
+#undef CONTAINER_EXPLORER_REP_31
+#undef CONTAINER_EXPLORER_REP_30
+#undef CONTAINER_EXPLORER_REP_29
+#undef CONTAINER_EXPLORER_REP_28
+#undef CONTAINER_EXPLORER_REP_27
+#undef CONTAINER_EXPLORER_REP_26
+#undef CONTAINER_EXPLORER_REP_25
+#undef CONTAINER_EXPLORER_REP_24
+#undef CONTAINER_EXPLORER_REP_23
+#undef CONTAINER_EXPLORER_REP_22
+#undef CONTAINER_EXPLORER_REP_21
+#undef CONTAINER_EXPLORER_REP_20
+#undef CONTAINER_EXPLORER_REP_19
+#undef CONTAINER_EXPLORER_REP_18
+#undef CONTAINER_EXPLORER_REP_17
+#undef CONTAINER_EXPLORER_REP_16
+#undef CONTAINER_EXPLORER_REP_15
+#undef CONTAINER_EXPLORER_REP_14
+#undef CONTAINER_EXPLORER_REP_13
+#undef CONTAINER_EXPLORER_REP_12
+#undef CONTAINER_EXPLORER_REP_11
+#undef CONTAINER_EXPLORER_REP_10
+#undef CONTAINER_EXPLORER_REP_9
+#undef CONTAINER_EXPLORER_REP_8
+#undef CONTAINER_EXPLORER_REP_7
+#undef CONTAINER_EXPLORER_REP_6
+#undef CONTAINER_EXPLORER_REP_5
+#undef CONTAINER_EXPLORER_REP_4
+#undef CONTAINER_EXPLORER_REP_3
+#undef CONTAINER_EXPLORER_REP_2
+#undef CONTAINER_EXPLORER_REP_1
+#undef CONTAINER_EXPLORER_IS_VAL_RET
+#undef CONTAINER_EXPLORER_TYPE_RET
+#undef CONTAINER_EXPLORER_RET
+#undef CONTAINER_EXPLORER_BIND
+#undef CONTAINER_EXPLORER_EMPTY
+#undef CONTAINER_EXPLORER_COMMA
+
     template <bool ForceConst, typename T, typename Callback, std::size_t... Is>
     void visit_aggregate_leaves(T&& obj, Callback& cb, std::index_sequence<Is...>)
     {
         using Clean = std::remove_cvref_t<T>;
-        constexpr std::size_t N = sizeof...(Is);
+#if CONTAINER_EXPLORER_HAS_CPP26_REFLECTION
+        constexpr auto ctx = std::meta::access_context::current();
         if constexpr (!std::is_lvalue_reference_v<T&&> || std::is_const_v<std::remove_reference_t<T>> || ForceConst)
         {
             const Clean& const_ref = obj;
-            auto tied = boost::pfr::detail::tie_as_tuple(const_ref, boost::pfr::detail::size_t_<N>{});
-            (visit_leaves_impl<ForceConst>(boost::pfr::detail::sequence_tuple::get<Is>(tied), cb), ...);
+            (visit_leaves_impl<ForceConst>(const_ref.[:std::meta::nonstatic_data_members_of(^^Clean, ctx)[Is]:], cb), ...);
         }
         else
         {
             Clean& mut_ref = obj;
-            auto tied = boost::pfr::detail::tie_as_tuple(mut_ref, boost::pfr::detail::size_t_<N>{});
-            (visit_leaves_impl<ForceConst>(boost::pfr::detail::sequence_tuple::get<Is>(tied), cb), ...);
+            (visit_leaves_impl<ForceConst>(mut_ref.[:std::meta::nonstatic_data_members_of(^^Clean, ctx)[Is]:], cb), ...);
         }
+#else
+        constexpr std::size_t N = sizeof...(Is);
+        if constexpr (!std::is_lvalue_reference_v<T&&> || std::is_const_v<std::remove_reference_t<T>> || ForceConst)
+        {
+            const Clean& const_ref = obj;
+            visit_aggregate_structured<ForceConst, true, N>(const_ref, cb);
+        }
+        else
+        {
+            Clean& mut_ref = obj;
+            visit_aggregate_structured<ForceConst, false, N>(mut_ref, cb);
+        }
+#endif
     }
 
     template <bool ForceConst, typename T, typename Callback>

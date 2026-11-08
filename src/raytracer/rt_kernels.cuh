@@ -16,10 +16,10 @@ struct RenderParameters
     glm::vec2 az_c;
 
     glm::vec2 mouse_pos;
-    glm::vec3 view_pos{0.5,0,0.5};
+    glm::vec3 view_pos{0.5,0,0.3};
     double t;
-    float az;
-    float ax;
+    float az{0};
+    float ax{-0.5};
     glm::mat3 rotation;
     float near_ = 1;
 
@@ -44,8 +44,7 @@ struct RenderParameters
     //as
     soa::soa_view<int> as;
     soa::soa_view<BoxContent> containers;
-    soa::soa_view<Primitive> primitives;
-    soa::soa_view<Triangle> triangles;
+    soa::soa_view<PrimitiveChunk16> primitives;
     soa::soa_view<Vertex> vertices;
 
     //scene
@@ -110,29 +109,59 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
 {
     using namespace glm;
 
-    auto tri = p.triangles[primitive_id];
-    auto v0_id = tri.v0;
-    auto v1_id = tri.v1;
-    auto v2_id = tri.v2;
     float w0 = 1.0f - tuv[1] - tuv[2];
     float w1 = tuv[1];
     float w2 = tuv[2];
 
-    glm::vec3 normal;
-    if (p.use_fake_normals)
+    PrimitiveChunk16 chunk0 = p.primitives[primitive_id];
+    uint32_t mat_id = chunk0.material_id();
+    glm::vec3 normal(0.0f, 0.0f, 1.0f);
+    glm::vec2 uv_interp(0.0f);
+
+    if (chunk0.type() == PrimitiveType::Triangle)
     {
-        auto n0=p.vertices[v0_id].normal;
-        auto n1=p.vertices[v1_id].normal;
-        auto n2=p.vertices[v2_id].normal;
-        normal = n0*w0 + n1*w1 + n2*w2;
-        normal = normalize(normal);
+        Triangle tri = chunk0.as<Triangle>();
+
+        if (p.use_fake_normals)
+        {
+            auto n0 = p.vertices[tri.v0].normal;
+            auto n1 = p.vertices[tri.v1].normal;
+            auto n2 = p.vertices[tri.v2].normal;
+            normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
+        }
+        else
+        {
+            auto v0 = p.vertices[tri.v0].position;
+            auto v1 = p.vertices[tri.v1].position;
+            auto v2 = p.vertices[tri.v2].position;
+            normal = glm::normalize(glm::cross(v1 - v0, v2 - v0));
+        }
+
+        auto uv0 = glm::vec2(p.vertices[tri.v0].uv);
+        auto uv1 = glm::vec2(p.vertices[tri.v1].uv);
+        auto uv2 = glm::vec2(p.vertices[tri.v2].uv);
+        uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
     }
-    else
+    else if (chunk0.type() == PrimitiveType::FullTriangle)
     {
-        auto v0=p.vertices[v0_id].position;
-        auto v1=p.vertices[v1_id].position;
-        auto v2=p.vertices[v2_id].position;
-        normal=glm::normalize(glm::cross(v1-v0, v2-v0));
+        FullTriangle ftri = load_primitive<FullTriangle>(p.primitives, primitive_id, chunk0);
+
+        if (p.use_fake_normals)
+        {
+            auto n0 = ftri.n0_compressed.unpack();
+            auto n1 = ftri.n1_compressed.unpack();
+            auto n2 = ftri.n2_compressed.unpack();
+            normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
+        }
+        else
+        {
+            normal = glm::normalize(glm::cross(ftri.v1 - ftri.v0, ftri.v2 - ftri.v0));
+        }
+
+        glm::vec2 uv0 = glm::unpackHalf2x16(ftri.uv_0);
+        glm::vec2 uv1 = glm::unpackHalf2x16(ftri.uv_1);
+        glm::vec2 uv2 = glm::unpackHalf2x16(ftri.uv_2);
+        uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
     }
 
     vec3 intersection=ray_src+ray_dir*tuv[0];
@@ -152,7 +181,6 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
     glm::vec4 base_color(1.0f);
     glm::vec3 emissive(0.0f);
 
-    uint32_t mat_id = tri.material_id;
     if (mat_id < p.materials.size())
     {
         auto mat = p.materials[mat_id];
@@ -163,11 +191,7 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
         cudaTextureObject_t tex = mat.baseColorTexture;
         if (tex != 0)
         {
-            auto uv0 = p.vertices[v0_id].uv;
-            auto uv1 = p.vertices[v1_id].uv;
-            auto uv2 = p.vertices[v2_id].uv;
-            glm::vec3 uv = uv0 * w0 + uv1 * w1 + uv2 * w2;
-            float4 sampled = tex2D<float4>(tex, uv.x, uv.y);
+            float4 sampled = tex2D<float4>(tex, uv_interp.x, uv_interp.y);
             base_color *= glm::vec4(sampled.x, sampled.y, sampled.z, sampled.w);
         }
 #endif
@@ -194,7 +218,6 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
         }
         else
             return false;
-
     }
 
     return false;
@@ -235,17 +258,14 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
 
             if (p.show_triangles)
             {
-                auto primitives_count=p.containers[container_id].number_of_primitives;
-                auto primitives_start=p.containers[container_id].start;
-                for (auto i=0;i<primitives_count;++i)
+                for (;;++container_id)
                 {
-                    auto triangle_id=p.primitives[primitives_start+i].id;
-                    if (p.primitives[primitives_start+i].type == PrimitiveType::Triangle)
+                    auto primitive=p.containers[container_id];
+                    uint32_t prim_id=primitive.id();
+                    PrimitiveChunk16 chunk0=p.primitives[prim_id];
+                    if (chunk0.type() == PrimitiveType::Triangle)
                     {
-
-                        auto v0_id=p.triangles[triangle_id].v0;
-                        auto v1_id=p.triangles[triangle_id].v1;
-                        auto v2_id=p.triangles[triangle_id].v2;
+                        Triangle tri = chunk0.as<Triangle>();
 
                         glm::vec3 tuv;
 
@@ -253,14 +273,14 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                         if (p.renderNagata)
                         {
                             hit=intersectNagataOnTheFly(source,direction,current_box.t_min,current_box.t_max,
-                                                        p.vertices[v0_id].position,p.vertices[v1_id].position,p.vertices[v2_id].position,
-                                                        p.vertices[v0_id].normal,p.vertices[v1_id].normal,p.vertices[v2_id].normal,
+                                                        p.vertices[tri.v0].position,p.vertices[tri.v1].position,p.vertices[tri.v2].position,
+                                                        p.vertices[tri.v0].normal,p.vertices[tri.v1].normal,p.vertices[tri.v2].normal,
                                                         tuv[0],tuv[1],tuv[2]);
                         }
                         else
                         {
                             hit=intersectRayTriangle(source,direction, current_box.t_min, current_box.t_max,
-                                                     p.vertices[v0_id].position,p.vertices[v1_id].position,p.vertices[v2_id].position,
+                                                     p.vertices[tri.v0].position,p.vertices[tri.v1].position,p.vertices[tri.v2].position,
                                                      tuv.x,tuv.y,tuv.z);
                         }
 
@@ -269,10 +289,44 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                             if (tuv[0]<closest_tuv[0])
                             {
                                 closest_tuv = tuv;
-                                closest_triangle=triangle_id;
+                                closest_triangle=prim_id;
                             }
                         }
                     }
+                    else if (chunk0.type() == PrimitiveType::FullTriangle)
+                    {
+                        FullTriangle ftri = load_primitive<FullTriangle>(p.primitives, prim_id, chunk0);
+
+                        glm::vec3 tuv;
+                        bool hit;
+                        if (p.renderNagata)
+                        {
+                            hit=intersectNagataOnTheFly(source,direction,current_box.t_min,current_box.t_max,
+                                                        ftri.v0,ftri.v1,ftri.v2,
+                                                        ftri.n0_compressed.unpack(),
+                                                        ftri.n1_compressed.unpack(),
+                                                        ftri.n2_compressed.unpack(),
+                                                        tuv[0],tuv[1],tuv[2]);
+                        }
+                        else
+                        {
+                            hit=intersectRayTriangle(source,direction, current_box.t_min, current_box.t_max,
+                                                     ftri.v0,ftri.v1,ftri.v2,
+                                                     tuv.x,tuv.y,tuv.z);
+                        }
+
+                        if (hit)
+                        {
+                            if (tuv[0]<closest_tuv[0])
+                            {
+                                closest_tuv = tuv;
+                                closest_triangle=prim_id;
+                            }
+                        }
+                    }
+
+                    if (primitive.is_last())//if it is the last in chain
+                        break;
                 }
             }
 

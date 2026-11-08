@@ -28,6 +28,10 @@ add_executable(Raytracer main.cpp
         external/OffsetAllocator/offsetAllocator.cpp external/OffsetAllocator/offsetAllocator.hpp
 )
 
+set_source_files_properties(src/core/RaytracerController.cpp
+        PROPERTIES CXX_STANDARD 26
+)
+
 
 set(VKBASE_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/assets/Scenes ${CMAKE_CURRENT_SOURCE_DIR}/assets/Fonts)
 add_subdirectory(vkbase)

@@ -14,7 +14,6 @@
 #include <glm/glm.hpp>
 
 #include "../../vkbase/extensions/cuda/cuda.hpp"
-#include <container_explorer.hpp>
 
 
 struct WindowInfo
@@ -38,12 +37,13 @@ class Raytracer;
 class CudaVulkanSwapChain;
 class Scene;
 class Node;
+class ContainerExplorer;
 
 
 struct SceneData
 {
     std::unique_ptr<Scene> scene;
-    ContainerExplorer explorer;
+    std::unique_ptr<ContainerExplorer> explorer;
     Node* selected_node = nullptr;
 
     SceneData();
@@ -86,7 +86,7 @@ public:
     glm::uvec2 current_image_size{0};
 
     int resolution_mode = 0; // 0: Window (Dynamic), 1: 720p, 2: 1080p, 3: 1440p, 4: UWQHD, 5: 4K, 6: 8K, 7: Custom
-    int last_fixed_mode = 2; // Default fixed preset: 1080p
+    int last_fixed_mode = 3; // Default fixed preset: 1440p
     int custom_resolution[2] = {1920, 1080};
     bool scale_display_to_window = true;
 

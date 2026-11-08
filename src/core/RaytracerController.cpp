@@ -1,6 +1,7 @@
 #include "RaytracerController.hpp"
 
 #include "../raytracer/Scene.hpp"
+#include <container_explorer.hpp>
 #include <cuda_profiler_api.h>
 #include <numeric>
 #include <vkbase_core.hpp>
@@ -12,10 +13,20 @@
 #include "../../vkbase/extensions/Assets/assets.h"
 #include <ranges>
 
-SceneData::SceneData() = default;
+SceneData::SceneData() : explorer(std::make_unique<ContainerExplorer>()) {}
 SceneData::~SceneData() = default;
 SceneData::SceneData(SceneData&&) noexcept = default;
 SceneData& SceneData::operator=(SceneData&&) noexcept = default;
+
+void OctreeAS::register_containers(ContainerExplorer& explorer)
+{
+    explorer.register_container("octree.spaces", spaces);
+    explorer.register_container("octree.as", as);
+    explorer.register_container("octree.primitives", primitives);
+    explorer.register_container("octree.box_content", box_content);
+    explorer.register_container("octree.vertices", vertices);
+
+}
 
 
 RaytracerController::RaytracerController()
@@ -95,9 +106,13 @@ void RaytracerController::initScenes()
         s.scene=std::make_unique<Scene>(scene_name);
         s.scene->load(scene_data);
 
-        s.scene->as.register_containers(s.explorer);
-        s.explorer.register_container("scene.materials", s.scene->m_materials, [sc = s.scene.get()](std::size_t) { sc->sync_materials_to_device(); });
-        s.explorer.register_container("scene.textures", s.scene->m_textures);
+        s.scene->as.register_containers(*s.explorer);
+        s.explorer->register_container("scene.materials", s.scene->m_materials, [this, sc = s.scene.get()](std::size_t)
+        {
+            std::lock_guard lock(device_data_mutex);
+            sc->sync_materials_to_device();
+        });
+        s.explorer->register_container("scene.textures", s.scene->m_textures);
 
         scenes.push_back(std::move(s));
     }
@@ -678,10 +693,5 @@ void RaytracerController::next_frame()
 
 bool RaytracerController::ui_table()
 {
-    bool data_available = !cuda_is_running && device_data_mutex.try_lock();
-    bool open = scenes[active_scene_number].explorer.draw("Table", data_available);
-    if (data_available)
-        device_data_mutex.unlock();
-
-    return open;
+    return scenes[active_scene_number].explorer->draw("Table");
 }
