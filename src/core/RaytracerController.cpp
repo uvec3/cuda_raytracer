@@ -1,5 +1,5 @@
 #include "RaytracerController.hpp"
-
+#include "../types.hpp"
 #include "../raytracer/Scene.hpp"
 #include <container_explorer.hpp>
 #include <cuda_profiler_api.h>
@@ -58,7 +58,7 @@ RaytracerController::RaytracerController()
 
     windows.push_back({"Debug info",vkbase::imgui::showDebugWindow});
     windows.push_back({"Frame info", WRAP_MEMBER_FUNC(ui_frame_info)});
-    windows.push_back({"Parameters", WRAP_MEMBER_FUNC(ui_show_parameters)});
+    windows.push_back({"Parameters", WRAP_MEMBER_FUNC(ui_rendering_parameters)});
     windows.push_back({"Log", vkbase::imgui::drawEngineMessagesLog});
     windows.push_back({"Table",WRAP_MEMBER_FUNC(ui_table)});
     windows.push_back({"Debug pixel",WRAP_MEMBER_FUNC(ui_debug_pixel)});
@@ -77,8 +77,6 @@ RaytracerController::RaytracerController()
 
 
     initScenes();
-
-    // play();
 }
 
 RaytracerController::~RaytracerController()
@@ -113,6 +111,12 @@ void RaytracerController::initScenes()
             sc->sync_materials_to_device();
         });
         s.explorer->register_container("scene.textures", s.scene->m_textures);
+        s.explorer->register_container("scene.meshes",s.scene->m_meshes);
+        for (auto& mesh: s.scene->m_meshes)
+        {
+            s.explorer->register_container(mesh.name+".triangles",mesh.triangles);
+            s.explorer->register_container(mesh.name+".vertices",mesh.vertices);
+        }
 
         scenes.push_back(std::move(s));
     }
@@ -340,7 +344,6 @@ void RaytracerController::ui_image()
 
 void RaytracerController::ui_toolbar()
 {
-
     if (cuda_is_running)
     {
         if (ImGui::Button("||"))

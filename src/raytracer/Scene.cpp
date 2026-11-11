@@ -1,5 +1,5 @@
-#include "glm/glm.hpp"
 #include "Scene.hpp"
+#include "glm/glm.hpp"
 #include "../cuda_common.hpp"
 #include "../../external/tiny_gltf_v3.h"
 #include "../../external/stb_image.h"

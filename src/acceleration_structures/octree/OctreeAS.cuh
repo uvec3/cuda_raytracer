@@ -143,7 +143,7 @@ public:
 
         uint32_t occupied_slots = Triangle::occupied_slots;
         if (config.triangle_type == PrimitiveType::FullTriangle)
-            occupied_slots = FullTriangle::occupied_slots;
+            occupied_slots = InlinedTriangle::occupied_slots;
         else if (config.triangle_type == PrimitiveType::NagataPatch)
             occupied_slots = NagataPatchPrimitive::occupied_slots;
 

@@ -29,15 +29,20 @@ struct RenderParameters
     bool fixed_light_source=false;
     glm::vec3 light_source{0.5, 0.5,1.5};
 
-    bool show_iterations=true;
+    bool show_iterations=false;
     bool measure_time=false;
     bool show_triangles=true;
-    bool show_boxes=true;
+    bool show_boxes=false;
     bool use_fake_normals=true;
     bool renderNagata=false;
 
     bool enableShadows=false;
+    bool enableReflection=false;
     bool enableRefraction=false;
+
+    glm::vec4 background_color=glm::vec4(0,0,0,1);
+    cudaTextureObject_t skybox;
+    bool use_skybox=true;
 
     int time_max=50000;
 
@@ -99,13 +104,14 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
 );
 
     // WRITE TO SURFACE
-    // The X coordinate in surf2Dwrite is in BYTES, not elements!
+    // The X coordinate in surf2Dwrite is in BYTES, not elements
     surf2Dwrite(pixelColor, surface, x * sizeof(uchar4), y);
 }
 
 
+//returns whether to continue tracing the ray
  __host__ __device__ inline
-bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv,const RenderParameters& p)
+bool fragment_hit_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv,const RenderParameters& p)
 {
     using namespace glm;
 
@@ -124,16 +130,16 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
 
         if (p.use_fake_normals)
         {
-            auto n0 = p.vertices[tri.v0].normal;
-            auto n1 = p.vertices[tri.v1].normal;
-            auto n2 = p.vertices[tri.v2].normal;
+            glm::vec3 n0 = glm::vec3(p.vertices[tri.v0].normal);
+            glm::vec3 n1 = glm::vec3(p.vertices[tri.v1].normal);
+            glm::vec3 n2 = glm::vec3(p.vertices[tri.v2].normal);
             normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
         }
         else
         {
-            auto v0 = p.vertices[tri.v0].position;
-            auto v1 = p.vertices[tri.v1].position;
-            auto v2 = p.vertices[tri.v2].position;
+            glm::vec3 v0 = glm::vec3(p.vertices[tri.v0].position);
+            glm::vec3 v1 = glm::vec3(p.vertices[tri.v1].position);
+            glm::vec3 v2 = glm::vec3(p.vertices[tri.v2].position);
             normal = glm::normalize(glm::cross(v1 - v0, v2 - v0));
         }
 
@@ -144,7 +150,7 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
     }
     else if (chunk0.type() == PrimitiveType::FullTriangle)
     {
-        FullTriangle ftri = load_primitive<FullTriangle>(p.primitives, primitive_id, chunk0);
+        InlinedTriangle ftri = load_primitive<InlinedTriangle>(p.primitives, primitive_id, chunk0);
 
         if (p.use_fake_normals)
         {
@@ -166,11 +172,25 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
     else if (chunk0.type() == PrimitiveType::NagataPatch)
     {
         NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, primitive_id, chunk0);
-        normal = patch.evaluateNormal(w0, w1);
 
-        glm::vec2 uv0 = glm::unpackHalf2x16(patch.uv_0);
-        glm::vec2 uv1 = glm::unpackHalf2x16(patch.uv_1);
-        glm::vec2 uv2 = glm::unpackHalf2x16(patch.uv_2);
+        if (p.use_fake_normals)
+        {
+            glm::vec3 n0 = glm::vec3(p.vertices[patch.v0].normal);
+            glm::vec3 n1 = glm::vec3(p.vertices[patch.v1].normal);
+            glm::vec3 n2 = glm::vec3(p.vertices[patch.v2].normal);
+            normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
+        }
+        else
+        {
+            glm::vec3 v0 = glm::vec3(p.vertices[patch.v0].position);
+            glm::vec3 v1 = glm::vec3(p.vertices[patch.v1].position);
+            glm::vec3 v2 = glm::vec3(p.vertices[patch.v2].position);
+            normal = evaluateNagataNormal2(v0,v1,v2, patch.C12,patch.C23,patch.C31,w0,w1);
+        }
+
+        glm::vec2 uv0 = p.vertices[patch.v0].uv;
+        glm::vec2 uv1 = p.vertices[patch.v1].uv;
+        glm::vec2 uv2 = p.vertices[patch.v2].uv;
         uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
     }
 
@@ -233,6 +253,11 @@ bool fragment_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray
     return false;
 }
 
+__host__ __device__ inline
+glm::vec4 miss_shader(glm::vec3 ray_src, glm::vec3 ray_dir,const RenderParameters& p)
+{
+
+}
 
 
 __host__ __device__ inline
@@ -280,7 +305,7 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                         glm::vec3 tuv;
                         bool hit = intersectRayTriangle(
                             source, direction, current_box.t_min, current_box.t_max,
-                            p.vertices[tri.v0].position, p.vertices[tri.v1].position, p.vertices[tri.v2].position,
+                            glm::vec3(p.vertices[tri.v0].position), glm::vec3(p.vertices[tri.v1].position), glm::vec3(p.vertices[tri.v2].position),
                             tuv.x, tuv.y, tuv.z);
 
                         if (hit)
@@ -294,7 +319,7 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                     }
                     else if (chunk0.type() == PrimitiveType::FullTriangle)
                     {
-                        FullTriangle ftri = load_primitive<FullTriangle>(p.primitives, prim_id, chunk0);
+                        InlinedTriangle ftri = load_primitive<InlinedTriangle>(p.primitives, prim_id, chunk0);
 
                         glm::vec3 tuv;
                         bool hit = intersectRayTriangle(
@@ -318,7 +343,8 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
                         glm::vec3 tuv;
                         bool hit = intersectNagataPrecomputed(
                             source, direction, current_box.t_min, current_box.t_max,
-                            patch.X1, patch.X2, patch.X3, patch.C12, patch.C23, patch.C31,
+                            glm::vec3(p.vertices[patch.v0].position), glm::vec3(p.vertices[patch.v1].position), glm::vec3(p.vertices[patch.v2].position),
+                            patch.C12, patch.C23, patch.C31,
                             tuv.x, tuv.y, tuv.z);
 
                         if (hit)
@@ -339,11 +365,11 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
             if (closest_triangle!=UINT32_MAX)
             {
 
-                continue_traversal=fragment_shader(hit_primitive_color,closest_triangle,source,direction,closest_tuv,p);
+                continue_traversal=fragment_hit_shader(hit_primitive_color,closest_triangle,source,direction,closest_tuv,p);
                 if (continue_traversal)
                 {
-                    current_box.t_min=1e-9f;
-                    current_box.t_max=1e-9f;
+                    current_box.t_min=1e-4f;
+                    current_box.t_max=1e-4f;
                 }
             }
         }

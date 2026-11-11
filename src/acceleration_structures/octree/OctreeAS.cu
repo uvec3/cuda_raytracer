@@ -30,16 +30,16 @@ __host__ __device__ inline void get_primitive_triangle_vertices(
     if (chunk0.type() == PrimitiveType::Triangle)
     {
         Triangle tri = chunk0.as<Triangle>();
-        v0 = vertices[tri.v0].position;
-        v1 = vertices[tri.v1].position;
-        v2 = vertices[tri.v2].position;
-        n0 = vertices[tri.v0].normal;
-        n1 = vertices[tri.v1].normal;
-        n2 = vertices[tri.v2].normal;
+        v0 = glm::vec3(vertices[tri.v0].position);
+        v1 = glm::vec3(vertices[tri.v1].position);
+        v2 = glm::vec3(vertices[tri.v2].position);
+        n0 = glm::vec3(vertices[tri.v0].normal);
+        n1 = glm::vec3(vertices[tri.v1].normal);
+        n2 = glm::vec3(vertices[tri.v2].normal);
     }
     else if (chunk0.type() == PrimitiveType::FullTriangle)
     {
-        FullTriangle ftri = load_primitive<FullTriangle>(primitives, prim_slot_id, chunk0);
+        InlinedTriangle ftri = load_primitive<InlinedTriangle>(primitives, prim_slot_id, chunk0);
         v0 = ftri.v0;
         v1 = ftri.v1;
         v2 = ftri.v2;
@@ -50,12 +50,12 @@ __host__ __device__ inline void get_primitive_triangle_vertices(
     else if (chunk0.type() == PrimitiveType::NagataPatch)
     {
         NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(primitives, prim_slot_id, chunk0);
-        v0 = patch.X1;
-        v1 = patch.X2;
-        v2 = patch.X3;
-        n0 = patch.evaluateNormal(1.0f, 0.0f);
-        n1 = patch.evaluateNormal(0.0f, 1.0f);
-        n2 = patch.evaluateNormal(0.0f, 0.0f);
+        v0 = glm::vec3(vertices[patch.v0].position);
+        v1 = glm::vec3(vertices[patch.v1].position);
+        v2 = glm::vec3(vertices[patch.v2].position);
+        n0 = glm::vec3(vertices[patch.v0].normal);
+        n1 = glm::vec3(vertices[patch.v1].normal);
+        n2 = glm::vec3(vertices[patch.v2].normal);
     }
 }
 
@@ -1120,27 +1120,27 @@ __global__ void pack_full_triangles_kernel(
     if (i >= triangles_count) return;
 
     Triangle tri = src_triangles[i];
-    FullTriangle ftri{};
+    InlinedTriangle ftri{};
     ftri.type = PrimitiveType::FullTriangle;
     ftri.material_id = tri.material_id;
 
-    glm::vec3 uv0 = vertices[tri.v0].uv;
-    glm::vec3 uv1 = vertices[tri.v1].uv;
-    glm::vec3 uv2 = vertices[tri.v2].uv;
+    glm::vec2 uv0 = vertices[tri.v0].uv;
+    glm::vec2 uv1 = vertices[tri.v1].uv;
+    glm::vec2 uv2 = vertices[tri.v2].uv;
     ftri.uv_0 = glm::packHalf2x16(glm::vec2(uv0.x, uv0.y));
     ftri.uv_1 = glm::packHalf2x16(glm::vec2(uv1.x, uv1.y));
     ftri.uv_2 = glm::packHalf2x16(glm::vec2(uv2.x, uv2.y));
 
-    ftri.v0 = vertices[tri.v0].position;
-    ftri.n0_compressed.pack(vertices[tri.v0].normal);
+    ftri.v0 = glm::vec3(vertices[tri.v0].position);
+    ftri.n0_compressed.pack(glm::vec3(vertices[tri.v0].normal));
 
-    ftri.v1 = vertices[tri.v1].position;
-    ftri.n1_compressed.pack(vertices[tri.v1].normal);
+    ftri.v1 = glm::vec3(vertices[tri.v1].position);
+    ftri.n1_compressed.pack(glm::vec3(vertices[tri.v1].normal));
 
-    ftri.v2 = vertices[tri.v2].position;
-    ftri.n2_compressed.pack(vertices[tri.v2].normal);
+    ftri.v2 = glm::vec3(vertices[tri.v2].position);
+    ftri.n2_compressed.pack(glm::vec3(vertices[tri.v2].normal));
 
-    uint32_t dst_slot = primitives_start + i * FullTriangle::occupied_slots;
+    uint32_t dst_slot = primitives_start + i * InlinedTriangle::occupied_slots;
     store_primitive(dst_primitives, dst_slot, ftri);
 }
 
@@ -1155,31 +1155,27 @@ __global__ void pack_nagata_patches_kernel(
     if (i >= triangles_count) return;
 
     Triangle tri = src_triangles[i];
-    glm::vec3 v0 = vertices[tri.v0].position;
-    glm::vec3 v1 = vertices[tri.v1].position;
-    glm::vec3 v2 = vertices[tri.v2].position;
-    glm::vec3 n0 = vertices[tri.v0].normal;
-    glm::vec3 n1 = vertices[tri.v1].normal;
-    glm::vec3 n2 = vertices[tri.v2].normal;
+    glm::vec3 v0 = glm::vec3(vertices[tri.v0].position);
+    glm::vec3 v1 = glm::vec3(vertices[tri.v1].position);
+    glm::vec3 v2 = glm::vec3(vertices[tri.v2].position);
+    glm::vec3 n0 = glm::vec3(vertices[tri.v0].normal);
+    glm::vec3 n1 = glm::vec3(vertices[tri.v1].normal);
+    glm::vec3 n2 = glm::vec3(vertices[tri.v2].normal);
 
     NagataPatch patch = NagataPatch::fromTriangle(v0, v1, v2, n0, n1, n2);
 
     NagataPatchPrimitive prim{};
     prim.type = PrimitiveType::NagataPatch;
     prim.material_id = tri.material_id;
-    prim.X1 = patch.X1;
-    prim.X2 = patch.X2;
-    prim.X3 = patch.X3;
+
+    prim.v0=tri.v0;
+    prim.v1=tri.v1;
+    prim.v2=tri.v2;
+
     prim.C12 = patch.C12;
     prim.C23 = patch.C23;
     prim.C31 = patch.C31;
 
-    glm::vec3 uv0 = vertices[tri.v0].uv;
-    glm::vec3 uv1 = vertices[tri.v1].uv;
-    glm::vec3 uv2 = vertices[tri.v2].uv;
-    prim.uv_0 = glm::packHalf2x16(glm::vec2(uv0.x, uv0.y));
-    prim.uv_1 = glm::packHalf2x16(glm::vec2(uv1.x, uv1.y));
-    prim.uv_2 = glm::packHalf2x16(glm::vec2(uv2.x, uv2.y));
 
     uint32_t dst_slot = primitives_start + i * NagataPatchPrimitive::occupied_slots;
     store_primitive(dst_primitives, dst_slot, prim);
@@ -1192,7 +1188,7 @@ void OctreeAS::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<
 
     if (config.triangle_type == PrimitiveType::FullTriangle)
     {
-        uint32_t primitives_size = triangles_count * FullTriangle::occupied_slots;
+        uint32_t primitives_size = triangles_count * InlinedTriangle::occupied_slots;
         auto primitives_start = primitives.alloc(primitives_size);
         spaces[space_id].primitives_start = primitives_start;
         spaces[space_id].primitives_size = primitives_size;
@@ -1239,16 +1235,9 @@ void OctreeAS::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<
             primitives_start);
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        //host copy
         primitives.range(primitives_start) = d_primitives.range(primitives_start, primitives_size);
-
-        // Free vertices for this space since NagataPatch embeds all vertex attributes inline
-        if (spaces[space_id].vertices_size > 0)
-        {
-            vertices.free(spaces[space_id].vertices_start);
-            spaces[space_id].vertices_start = 0;
-            spaces[space_id].vertices_size = 0;
-            d_vertices = vertices;
-        }
+        static_cast<soa::soa_vector<Vertex>&>(vertices) = d_vertices;
     }
     else
     {

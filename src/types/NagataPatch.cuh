@@ -1,9 +1,7 @@
 #pragma once
 
-#include <iostream>
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
-#define NOMINMAX
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/system/cuda/config.h>
@@ -155,6 +153,31 @@ struct NagataPatch {
 
         return alpha * N_avg + beta * N_diff;
     }
+
+    // CUDA_HOST_DEVICE inline static  glm::vec3 computeEdgeCurvature(
+    // const glm::vec3& X_start, const glm::vec3& X_end,
+    // const glm::vec3& N_start, const glm::vec3& N_end)
+    // {
+    //     glm::vec3 n0 = glm::normalize(N_start);
+    //     glm::vec3 n1 = glm::normalize(N_end);
+    //     glm::vec3 d  = X_end - X_start;
+    //
+    //     glm::vec3 v  = 0.5f * (n0 + n1);
+    //     glm::vec3 dv = 0.5f * (n0 - n1);
+    //
+    //     float dv_d = glm::dot(d, v);
+    //     float d_dv = glm::dot(d, dv);
+    //
+    //     // Cancellation-free: dc = (1 - dot(n0, n1)) / 2 == dot(dv, dv) in [0, 1]
+    //     float dc = glm::dot(dv, dv);
+    //
+    //     // Term 1 denominator is (1 - dc) ~ 1.0 for small angles -> NEVER zero out for small dc!
+    //     float term1 = (1.0f - dc > 1e-7f) ? (d_dv / (1.0f - dc)) : 0.0f;
+    //     // Term 2 denominator is dc -> only guard against dc -> 0
+    //     float term2 = (dc > 1e-7f)        ? (dv_d / dc)          : 0.0f;
+    //
+    //     return term1 * v + term2 * dv;
+    // }
 
     // Construct the patch from 3 vertices and 3 unit normals
     CUDA_HOST_DEVICE static NagataPatch fromTriangle(
@@ -377,17 +400,6 @@ inline bool intersectNagataPatch(const Ray_& ray, const NagataPatch& patch, HitR
 
 //---------------------------------------------------------------------
 
-// Packed 16-byte aligned structure for GPU StructuredBuffer / SSBO
-// Using vec4 packs cleanly into 4x 128-bit memory loads (v_load_dwordx4)
-struct alignas(16) GPUNagataPatch {
-    glm::vec4 X1_pad;  // xyz = X1
-    glm::vec4 X2_pad;  // xyz = X2
-    glm::vec4 X3_pad;  // xyz = X3
-    glm::vec4 C12_pad; // xyz = C12
-    glm::vec4 C23_pad; // xyz = C23
-    glm::vec4 C31_pad; // xyz = C31
-};
-
 // GPU Hardware Intrinsics Emulation (Single-cycle on NVIDIA/AMD GPUs)
 inline CUDA_HOST_DEVICE glm::vec2 min3(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
     return glm::min(glm::min(a, b), c);
@@ -406,259 +418,11 @@ void buildBasisGPU(const glm::vec3& D, glm::vec3& E1, glm::vec3& E2) {
     E2 = glm::vec3(b, glm::fma(D.y * D.y, a, s), -D.y);
 }
 
-// =============================================================================
-// GPU-Optimized Intersection Kernel (Minimized VGPR Register Pressure)
-// Returns true and outputs (t, u, v) ONLY. Normal is deferred to Closest-Hit!
-// =============================================================================
-inline bool intersectNagataGPU(
-    const glm::vec3& rayOrigin,
-    const glm::vec3& rayDir,
-    float tMin,
-    float tMax,
-    const GPUNagataPatch& patch, // Passed by const ref (SSBO/Global Load on GPU)
-    float& outT,
-    glm::vec2& outUV)
-{
-    // 1. Build 2D Ray Basis (6 VGPRs, immediately consumed during projection)
-    glm::vec3 E1, E2;
-    buildBasisGPU(rayDir, E1, E2);
 
-    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
-        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
-    };
 
-    // 2. Stream & Project Directly to 2D (Saves 6 VGPRs by not keeping 3D coords live)
-    glm::vec2 x3 = proj2D(glm::vec3(patch.X3_pad) - rayOrigin);
-    glm::vec2 e1 = proj2D(glm::vec3(patch.X1_pad) - glm::vec3(patch.X3_pad)); // x1 - x3
-    glm::vec2 e2 = proj2D(glm::vec3(patch.X2_pad) - glm::vec3(patch.X3_pad)); // x2 - x3
-
-    glm::vec2 c12 = proj2D(glm::vec3(patch.C12_pad));
-    glm::vec2 c23 = proj2D(glm::vec3(patch.C23_pad));
-    glm::vec2 c31 = proj2D(glm::vec3(patch.C31_pad));
-
-    // 3. Branchless 2D Control-Hull Compute + Single Warp-Coherent Early Exit
-    glm::vec2 x1 = x3 + e1;
-    glm::vec2 x2 = x3 + e2;
-    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
-    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
-    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
-
-    glm::vec2 hMin = glm::min(min3(x1, x2, x3), min3(b12, b23, b31));
-    glm::vec2 hMax = glm::max(max3(x1, x2, x3), max3(b12, b23, b31));
-
-    if ((hMin.x > 0.0f) | (hMax.x < 0.0f) | (hMin.y > 0.0f) | (hMax.y < 0.0f)) {
-        return false;
-    }
-
-    // 4. Branchless Flat-Triangle Initial Guess + Triangle Domain Clamp
-    float scale2 = glm::dot(e1, e1) + glm::dot(e2, e2);
-    float detFlat = glm::fma(e1.x, e2.y, -e1.y * e2.x);
-    float u = 1.0f / 3.0f;
-    float v = 1.0f / 3.0f;
-    if (std::abs(detFlat) > 1e-6f * scale2 && std::abs(detFlat) > 1e-20f) {
-        float invDetFlat = 1.0f / detFlat;
-        u = glm::clamp(glm::fma(-x3.x, e2.y,  x3.y * e2.x) * invDetFlat, 0.0f, 1.0f);
-        v = glm::clamp(glm::fma( e1.x, -x3.y, -e1.y * -x3.x) * invDetFlat, 0.0f, 1.0f);
-        float sumUV = u + v;
-        if (sumUV > 1.0f) {
-            float invSum = 1.0f / sumUV;
-            u *= invSum;
-            v *= invSum;
-        }
-    }
-
-    // 5. Unrolled 5-Step Branchless Newton-Raphson Solver
-    #pragma unroll
-    for (int i = 0; i < 5; ++i) {
-        float w = 1.0f - u - v;
-
-        glm::vec2 F = x3 + u * e1 + v * e2
-                    - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
-
-        glm::vec2 J_u = e1 - v * c12 + v * c23 - (w - u) * c31;
-        glm::vec2 J_v = e2 - u * c12 - (w - v) * c23 + u * c31;
-
-        float detJ = glm::fma(J_u.x, J_v.y, -J_u.y * J_v.x);
-        float invDetJ = (std::abs(detJ) > 1e-7f * scale2 && std::abs(detJ) > 1e-20f) ? (1.0f / detJ) : 0.0f;
-
-        u = glm::clamp(u - glm::fma( J_v.y, F.x, -J_v.x * F.y) * invDetJ, -0.5f, 1.5f);
-        v = glm::clamp(v - glm::fma(-J_u.y, F.x,  J_u.x * F.y) * invDetJ, -0.5f, 1.5f);
-    }
-
-    // 6. Fast Barycentric & Scale-Invariant Residual Verification
-    float w = 1.0f - u - v;
-    const float BARY_EPS = -1e-4f;
-    if ((u < BARY_EPS) | (v < BARY_EPS) | (w < BARY_EPS)) {
-        return false;
-    }
-
-    glm::vec2 finalF = x3 + u * e1 + v * e2
-                     - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
-    if (glm::dot(finalF, finalF) > 1e-9f * scale2) {
-        return false; // Did not converge to the ray
-    }
-
-    // 7. Reconstruct 3D Hit Depth `t` ONLY for Validated Hits!
-    glm::vec3 hitPos = u * glm::vec3(patch.X1_pad)
-                     + v * glm::vec3(patch.X2_pad)
-                     + w * glm::vec3(patch.X3_pad)
-                     - ((u * v) * glm::vec3(patch.C12_pad)
-                      + (v * w) * glm::vec3(patch.C23_pad)
-                      + (w * u) * glm::vec3(patch.C31_pad));
-
-    float t = glm::dot(hitPos - rayOrigin, rayDir);
-    if (t < tMin || t > tMax) {
-        return false;
-    }
-
-    outT  = t;
-    outUV = glm::vec2(u, v);
-    return true;
-}
-
-// =============================================================================
-// Direct Precomputed Nagata Intersection (X1..X3, C12..C31)
-// Used when NagataPatch is stored as a first-class primitive in PrimitiveChunk16
-// =============================================================================
-inline CUDA_HOST_DEVICE bool intersectNagataPrecomputed(
-    const glm::vec3& rayOrigin,
-    const glm::vec3& rayDir,
-    float tMin,
-    float tMax,
-    const glm::vec3& X1,
-    const glm::vec3& X2,
-    const glm::vec3& X3,
-    const glm::vec3& C12,
-    const glm::vec3& C23,
-    const glm::vec3& C31,
-    float& outT,
-    float& outU,
-    float& outV)
-{
-    // 1. Build 2D Ray Basis (Pixar Duff et al.)
-    glm::vec3 E1, E2;
-    buildBasisGPU(rayDir, E1, E2);
-
-    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
-        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
-    };
-
-    // 2. Stream & Project Directly to 2D
-    glm::vec2 x3 = proj2D(X3 - rayOrigin);
-    glm::vec2 e1 = proj2D(X1 - X3);
-    glm::vec2 e2 = proj2D(X2 - X3);
-
-    glm::vec2 c12 = proj2D(C12);
-    glm::vec2 c23 = proj2D(C23);
-    glm::vec2 c31 = proj2D(C31);
-
-    // 3. Branchless 2D Control-Hull Compute + Early Exit
-    glm::vec2 x1 = x3 + e1;
-    glm::vec2 x2 = x3 + e2;
-    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
-    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
-    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
-
-    glm::vec2 hMin = glm::min(min3(x1, x2, x3), min3(b12, b23, b31));
-    glm::vec2 hMax = glm::max(max3(x1, x2, x3), max3(b12, b23, b31));
-
-    if ((hMin.x > 0.0f) | (hMax.x < 0.0f) | (hMin.y > 0.0f) | (hMax.y < 0.0f)) {
-        return false;
-    }
-
-    // 4. Branchless Flat-Triangle Initial Guess
-    float scale2 = glm::dot(e1, e1) + glm::dot(e2, e2);
-    float detFlat = glm::fma(e1.x, e2.y, -e1.y * e2.x);
-    float u = 1.0f / 3.0f;
-    float v = 1.0f / 3.0f;
-    if (std::abs(detFlat) > 1e-6f * scale2 && std::abs(detFlat) > 1e-20f) {
-        float invDetFlat = 1.0f / detFlat;
-        u = glm::clamp(glm::fma(-x3.x, e2.y,  x3.y * e2.x) * invDetFlat, 0.0f, 1.0f);
-        v = glm::clamp(glm::fma( e1.x, -x3.y, -e1.y * -x3.x) * invDetFlat, 0.0f, 1.0f);
-        float sumUV = u + v;
-        if (sumUV > 1.0f) {
-            float invSum = 1.0f / sumUV;
-            u *= invSum;
-            v *= invSum;
-        }
-    }
-
-    // 5. Unrolled 5-Step Branchless Newton-Raphson Solver
-    #pragma unroll
-    for (int i = 0; i < 5; ++i) {
-        float w = 1.0f - u - v;
-
-        glm::vec2 F = x3 + u * e1 + v * e2
-                    - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
-
-        glm::vec2 J_u = e1 - v * c12 + v * c23 - (w - u) * c31;
-        glm::vec2 J_v = e2 - u * c12 - (w - v) * c23 + u * c31;
-
-        float detJ = glm::fma(J_u.x, J_v.y, -J_u.y * J_v.x);
-        float invDetJ = (std::abs(detJ) > 1e-7f * scale2 && std::abs(detJ) > 1e-20f) ? (1.0f / detJ) : 0.0f;
-
-        u = glm::clamp(u - glm::fma( J_v.y, F.x, -J_v.x * F.y) * invDetJ, -0.5f, 1.5f);
-        v = glm::clamp(v - glm::fma(-J_u.y, F.x,  J_u.x * F.y) * invDetJ, -0.5f, 1.5f);
-    }
-
-    // 6. Fast Barycentric & Scale-Invariant Residual Verification
-    float w = 1.0f - u - v;
-    const float BARY_EPS = -1e-4f;
-    if ((u < BARY_EPS) | (v < BARY_EPS) | (w < BARY_EPS)) {
-        return false;
-    }
-
-    glm::vec2 finalF = x3 + u * e1 + v * e2
-                     - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
-    if (glm::dot(finalF, finalF) > 1e-9f * scale2) {
-        return false;
-    }
-
-    // 7. Reconstruct 3D Hit Depth `t`
-    glm::vec3 hitPos = u * X1 + v * X2 + w * X3
-                     - ((u * v) * C12 + (v * w) * C23 + (w * u) * C31);
-
-    float t = glm::dot(hitPos - rayOrigin, rayDir);
-    if (t < tMin || t > tMax) {
-        return false;
-    }
-
-    outT = t;
-    outU = v;             // Barycentric weight of X2 (vertex 1), matching tuv[1] / w1 convention
-    outV = 1.0f - u - v;  // Barycentric weight of X3 (vertex 2), matching tuv[2] / w2 convention
-    return true;
-}
 
 
 //------------
-
-// 16-Byte Indexed Vertex (1 single 128-bit load per vertex!)
-// Pos takes 12B (FP32x3), Normal is packed into 4B (Octahedral 16-bit snorm x2)
-struct alignas(16) GPUVertex {
-    glm::vec3 pos;
-    uint32_t  octNormal;
-
-    // Pack unit normal into 32-bit octahedral representation (Cigolle et al. 2014)
-    inline static uint32_t packOctNormal(glm::vec3 n) {
-        n /= (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
-        if (n.z < 0.0f) {
-            float ox = (1.0f - std::abs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
-            float oy = (1.0f - std::abs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
-            n.x = ox; n.y = oy;
-        }
-        return glm::packSnorm2x16(glm::vec2(n.x, n.y));
-    }
-
-    // Unpack in ~6 GPU instructions
-    inline static glm::vec3 unpackOctNormal(uint32_t packed) {
-        glm::vec2 f = glm::unpackSnorm2x16(packed);
-        glm::vec3 n(f.x, f.y, 1.0f - std::abs(f.x) - std::abs(f.y));
-        float t = glm::clamp(-n.z, 0.0f, 1.0f);
-        n.x += (n.x >= 0.0f) ? -t : t;
-        n.y += (n.y >= 0.0f) ? -t : t;
-        return glm::normalize(n);
-    }
-};
 
 
 // Compute the two scalar weights (w_i, w_j) such that C_ij = w_i * N_i + w_j * N_j
@@ -1271,173 +1035,6 @@ bool intersectNagataPatchAnalytical(const Ray_& ray, const NagataPatch& patch, H
 }
 
 // =============================================================================
-// Analytical Intersection for Precomputed GPUNagataPatch
-// =============================================================================
-inline CUDA_HOST_DEVICE
-bool intersectNagataGPUAnalytical(
-    const glm::vec3& rayOrigin,
-    const glm::vec3& rayDir,
-    float tMin,
-    float tMax,
-    const GPUNagataPatch& patch,
-    float& outT,
-    glm::vec2& outUV)
-{
-    glm::vec3 E1, E2;
-    buildBasisGPU(rayDir, E1, E2);
-    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
-        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
-    };
-
-    glm::vec2 x3  = proj2D(glm::vec3(patch.X3_pad) - rayOrigin);
-    glm::vec2 e1  = proj2D(glm::vec3(patch.X1_pad) - glm::vec3(patch.X3_pad));
-    glm::vec2 e2  = proj2D(glm::vec3(patch.X2_pad) - glm::vec3(patch.X3_pad));
-    glm::vec2 c12 = proj2D(glm::vec3(patch.C12_pad));
-    glm::vec2 c23 = proj2D(glm::vec3(patch.C23_pad));
-    glm::vec2 c31 = proj2D(glm::vec3(patch.C31_pad));
-
-    glm::vec2 x1 = x3 + e1;
-    glm::vec2 x2 = x3 + e2;
-    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
-    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
-    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
-
-    glm::vec2 hMin = glm::min(glm::min(glm::min(x1, x2), x3), glm::min(glm::min(b12, b23), b31));
-    glm::vec2 hMax = glm::max(glm::max(glm::max(x1, x2), x3), glm::max(glm::max(b12, b23), b31));
-    if ((hMin.x > 0.0f) | (hMax.x < 0.0f) | (hMin.y > 0.0f) | (hMax.y < 0.0f)) {
-        return false;
-    }
-
-    glm::vec2 roots[4];
-    int numRoots = solveNagata2DAnalytical(x3, e1, e2, c12, c23, c31, roots);
-    if (numRoots == 0) return false;
-
-    bool found = false;
-    float bestT = tMax;
-    glm::vec2 bestUV(0.0f);
-
-    for (int i = 0; i < numRoots; ++i) {
-        float u = roots[i].x;
-        float v = roots[i].y;
-        float w = 1.0f - u - v;
-        glm::vec3 hitPos = u * glm::vec3(patch.X1_pad)
-                         + v * glm::vec3(patch.X2_pad)
-                         + w * glm::vec3(patch.X3_pad)
-                         - ((u * v) * glm::vec3(patch.C12_pad)
-                          + (v * w) * glm::vec3(patch.C23_pad)
-                          + (w * u) * glm::vec3(patch.C31_pad));
-        float t = glm::dot(hitPos - rayOrigin, rayDir);
-        if (t >= tMin && t <= bestT) {
-            bestT = t;
-            bestUV = roots[i];
-            found = true;
-        }
-    }
-
-    if (!found) return false;
-
-    outT  = bestT;
-    outUV = bestUV;
-    return true;
-}
-
-// =============================================================================
-// Analytical On-the-Fly Nagata Intersection
-// =============================================================================
-inline CUDA_HOST_DEVICE
-bool intersectNagataOnTheFlyAnalytical(
-    const glm::vec3& rayOrigin,
-    const glm::vec3& rayDir,
-    float tMin,
-    float tMax,
-    const glm::vec3 v1, const glm::vec3 v2, const glm::vec3 v3,
-    const glm::vec3 N1, const glm::vec3 N2, const glm::vec3 N3,
-    float& outT,
-    float& outU,
-    float& outV)
-{
-    // 1. Compute scalar Nagata weights (w_i, w_j) for the 3 edges
-    glm::vec2 w12 = computeNagataEdgeWeights(v2 - v1, N1, N2);
-    glm::vec2 w23 = computeNagataEdgeWeights(v3 - v2, N2, N3);
-    glm::vec2 w31 = computeNagataEdgeWeights(v1 - v3, N3, N1);
-
-    // 2. Project vertices AND normals into 2D Ray Space
-    glm::vec3 E1, E2;
-    buildBasisGPU(rayDir, E1, E2);
-    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
-        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
-    };
-
-    glm::vec2 x3 = proj2D(v3 - rayOrigin);
-    glm::vec2 e1 = proj2D(v1 - v3);
-    glm::vec2 e2 = proj2D(v2 - v3);
-
-    glm::vec2 n1_2d = proj2D(N1);
-    glm::vec2 n2_2d = proj2D(N2);
-    glm::vec2 n3_2d = proj2D(N3);
-
-    glm::vec2 c12 = w12.x * n1_2d + w12.y * n2_2d;
-    glm::vec2 c23 = w23.x * n2_2d + w23.y * n3_2d;
-    glm::vec2 c31 = w31.x * n3_2d + w31.y * n1_2d;
-
-    // 3. 2D Bezier Control-Hull Early Reject
-    glm::vec2 x1 = x3 + e1;
-    glm::vec2 x2 = x3 + e2;
-    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
-    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
-    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
-
-    glm::vec2 hMin = glm::min(glm::min(glm::min(x1, x2), x3), glm::min(glm::min(b12, b23), b31));
-    glm::vec2 hMax = glm::max(glm::max(glm::max(x1, x2), x3), glm::max(glm::max(b12, b23), b31));
-    if ((hMin.x > 0.0f) | (hMax.x < 0.0f) | (hMin.y > 0.0f) | (hMax.y < 0.0f)) {
-        return false;
-    }
-
-    // 4. Solve 2D Conic Intersection Analytically + Polish
-    glm::vec2 roots[4];
-    int numRoots = solveNagata2DAnalytical(x3, e1, e2, c12, c23, c31, roots);
-    if (numRoots == 0) return false;
-
-    // 5. Evaluate 1D Ray Depth `t` for all valid roots and pick the closest in [tMin, tMax]
-    float n1_z = glm::dot(N1, rayDir);
-    float n2_z = glm::dot(N2, rayDir);
-    float n3_z = glm::dot(N3, rayDir);
-
-    float c12_z = w12.x * n1_z + w12.y * n2_z;
-    float c23_z = w23.x * n2_z + w23.y * n3_z;
-    float c31_z = w31.x * n3_z + w31.y * n1_z;
-
-    bool found = false;
-    float bestT = tMax;
-    float bestBaryV2 = 0.0f;
-    float bestBaryV3 = 0.0f;
-
-    for (int i = 0; i < numRoots; ++i) {
-        float u = roots[i].x;
-        float v = roots[i].y;
-        float w = 1.0f - u - v;
-
-        glm::vec3 linearPos = u * v1 + v * v2 + w * v3;
-        float t = glm::dot(linearPos - rayOrigin, rayDir)
-                - ((u * v) * c12_z + (v * w) * c23_z + (w * u) * c31_z);
-
-        if (t >= tMin && t <= bestT) {
-            bestT = t;
-            bestBaryV2 = v;
-            bestBaryV3 = w;
-            found = true;
-        }
-    }
-
-    if (!found) return false;
-
-    outT = bestT;
-    outU = bestBaryV2;
-    outV = bestBaryV3;
-    return true;
-}
-
-// =============================================================================
 // On-the-Fly Analytical Surface Normal Evaluator (dX/du x dX/dv)
 // Takes the (baryV2, baryV3) convention returned in (outU, outV)
 // =============================================================================
@@ -1473,66 +1070,6 @@ glm::vec3 evaluateNagataNormalOnTheFly(
     return glm::normalize(glm::cross(dXdu, dXdv));
 }
 
-// Uses the same GPUVertex and computeNagataEdgeWeights from the Intersection Shader
-inline void evaluateNagataClosestHit(
-    uint32_t primID,
-    glm::vec2 uv,
-    const glm::uvec3* indexBuffer,
-    const GPUVertex* vertexBuffer,
-    glm::vec3& outHitPos,
-    glm::vec3& outAnalyticNormal,
-    glm::vec3& outShadingNormal)
-{
-    float u = uv.x;
-    float v = uv.y;
-    float w = 1.0f - u - v;
-
-    // 1. Fetch the 3 vertices (Already hot in L1/L2 cache from the winning hit!)
-    glm::uvec3 tri = indexBuffer[primID];
-    GPUVertex v1 = vertexBuffer[tri.x];
-    GPUVertex v2 = vertexBuffer[tri.y];
-    GPUVertex v3 = vertexBuffer[tri.z];
-
-    glm::vec3 N1 = GPUVertex::unpackOctNormal(v1.octNormal);
-    glm::vec3 N2 = GPUVertex::unpackOctNormal(v2.octNormal);
-    glm::vec3 N3 = GPUVertex::unpackOctNormal(v3.octNormal);
-
-    // 2. Compute scalar edge weights (w_i, w_j)
-    glm::vec3 E1 = v1.pos - v3.pos;
-    glm::vec3 E2 = v2.pos - v3.pos;
-    glm::vec2 w12 = computeNagataEdgeWeights(v2.pos - v1.pos, N1, N2);
-    glm::vec2 w23 = computeNagataEdgeWeights(v3.pos - v2.pos, N2, N3);
-    glm::vec2 w31 = computeNagataEdgeWeights(E1,              N3, N1);
-
-    // 3. Evaluate 3D Hit Position using combined normal weights (No 3D C_ij needed!)
-    float p1 = (u * v) * w12.x + (w * u) * w31.y;
-    float p2 = (u * v) * w12.y + (v * w) * w23.x;
-    float p3 = (v * w) * w23.y + (w * u) * w31.x;
-
-    outHitPos = (u * v1.pos + v * v2.pos + w * v3.pos) - (p1 * N1 + p2 * N2 + p3 * N3);
-
-    // 4. Evaluate Exact Analytic Tangents dX/du and dX/dv via scalar normal weights
-    float wu = w - u; // 1 - 2u - v
-    float wv = w - v; // 1 - u - 2v
-
-    // Scalar weights for dX/du
-    float a1 = v * w12.x + wu * w31.y;
-    float a2 = v * (w12.y - w23.x);
-    float a3 = wu * w31.x - v * w23.y;
-    glm::vec3 dXdu = E1 - (a1 * N1 + a2 * N2 + a3 * N3);
-
-    // Scalar weights for dX/dv
-    float b1 = u * (w12.x - w31.y);
-    float b2 = u * w12.y + wv * w23.x;
-    float b3 = wv * w23.y - u * w31.x;
-    glm::vec3 dXdv = E2 - (b1 * N1 + b2 * N2 + b3 * N3);
-
-    // Exact geometric normal of the quadratic Nagata surface
-    outAnalyticNormal = glm::normalize(glm::cross(dXdu, dXdv));
-
-    // Smooth G1-continuous Phong normal for crease-free specular highlights
-    outShadingNormal  = glm::normalize(u * N1 + v * N2 + w * N3);
-}
 
 
 enum class BoxIntersectionState {
@@ -1699,10 +1236,280 @@ inline CUDA_HOST_DEVICE BoxIntersectionState classifyNagataBoxIntersection(
     return BoxIntersectionState::OUTSIDE;
 }
 
-//
-// soa::cuda_device_vector<NagataPatch> build_nagata_patches(soa::soa_view<Triangle> triangles_d,soa::soa_view<Vertex> vertices_d)
-// {
-//     soa::cuda_device_vector<NagataPatch> result(triangles_d.size());
-//
-//
-// }
+
+
+// Helper: project (u, v) onto the valid barycentric triangle with small margin
+CUDA_HOST_DEVICE inline void clampToTriangle(float& u, float& v, float margin = 0.02f)
+{
+    u = glm::clamp(u, -margin, 1.0f + margin);
+    v = glm::clamp(v, -margin, 1.0f + margin);
+    float sum = u + v;
+    if (sum > 1.0f + margin) {
+        float diff = 0.5f * (sum - (1.0f + margin));
+        u -= diff;
+        v -= diff;
+        u = glm::clamp(u, -margin, 1.0f + margin);
+        v = glm::clamp(v, -margin, 1.0f + margin);
+    }
+}
+
+inline CUDA_HOST_DEVICE bool intersectNagataPrecomputed(
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDir,
+    float tMin,
+    float tMax,
+    const glm::vec3& X1,
+    const glm::vec3& X2,
+    const glm::vec3& X3,
+    const glm::vec3& C12,
+    const glm::vec3& C23,
+    const glm::vec3& C31,
+    float& outT,
+    float& outU,
+    float& outV)
+{
+    // 1. Build 2D Ray Basis
+    glm::vec3 E1, E2;
+    buildBasisGPU(rayDir, E1, E2);
+
+    auto proj2D = [&](const glm::vec3& v) -> glm::vec2 {
+        return glm::vec2(glm::dot(v, E1), glm::dot(v, E2));
+    };
+
+    // 2. Shift ray origin to depth of X3 to avoid FP32 cancellation
+    float t3 = glm::dot(X3 - rayOrigin, rayDir);
+    glm::vec3 localOrigin = rayOrigin + t3 * rayDir;
+
+    glm::vec2 x3  = proj2D(X3 - localOrigin);
+    glm::vec2 e1  = proj2D(X1 - X3);
+    glm::vec2 e2  = proj2D(X2 - X3);
+    glm::vec2 c12 = proj2D(C12);
+    glm::vec2 c23 = proj2D(C23);
+    glm::vec2 c31 = proj2D(C31);
+
+    // 3. 2D Bezier Control-Hull Early Exit (with small FP32 slack)
+    glm::vec2 x1  = x3 + e1;
+    glm::vec2 x2  = x3 + e2;
+    glm::vec2 b12 = 0.5f * (x1 + x2 - c12);
+    glm::vec2 b23 = 0.5f * (x2 + x3 - c23);
+    glm::vec2 b31 = 0.5f * (x3 + x1 - c31);
+
+    glm::vec2 hMin = glm::min(min3(x1, x2, x3), min3(b12, b23, b31));
+    glm::vec2 hMax = glm::max(max3(x1, x2, x3), max3(b12, b23, b31));
+    glm::vec2 hullPad = 1e-4f * (hMax - hMin) + glm::vec2(1e-7f);
+
+    if ((hMin.x > hullPad.x) || (hMax.x < -hullPad.x) ||
+        (hMin.y > hullPad.y) || (hMax.y < -hullPad.y)) {
+        return false;
+    }
+
+    float scale2 = glm::dot(e1, e1) + glm::dot(e2, e2)
+                 + glm::dot(c12, c12) + glm::dot(c23, c23) + glm::dot(c31, c31);
+    if (scale2 < 1e-24f) {
+        return false;
+    }
+
+    auto evalF = [&](float u, float v) -> glm::vec2 {
+        float w = 1.0f - u - v;
+        return x3 + u * e1 + v * e2 - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
+    };
+
+    auto evalDetJ = [&](float u, float v) -> float {
+        float w = 1.0f - u - v;
+        glm::vec2 J_u = e1 - v * c12 + v * c23 - (w - u) * c31;
+        glm::vec2 J_v = e2 - u * c12 - (w - v) * c23 + u * c31;
+        return glm::fma(J_u.x, J_v.y, -J_u.y * J_v.x);
+    };
+
+    // Unclamped damped Newton solver from a given (u0, v0) seed
+    const float regEps = 1e-7f * scale2;
+    auto solveSheet = [&](float u, float v, float& hitT, float& hitU, float& hitV) -> bool {
+        #pragma unroll
+        for (int i = 0; i < 7; ++i) {
+            float w = 1.0f - u - v;
+            glm::vec2 F = x3 + u * e1 + v * e2
+                        - ((u * v) * c12 + (v * w) * c23 + (w * u) * c31);
+
+            glm::vec2 J_u = e1 - v * c12 + v * c23 - (w - u) * c31;
+            glm::vec2 J_v = e2 - u * c12 - (w - v) * c23 + u * c31;
+
+            float detJ = glm::fma(J_u.x, J_v.y, -J_u.y * J_v.x);
+            float invDetJ = detJ / (detJ * detJ + regEps * regEps + 1e-30f);
+
+            float du = glm::fma( J_v.y, F.x, -J_v.x * F.y) * invDetJ;
+            float dv = glm::fma(-J_u.y, F.x,  J_u.x * F.y) * invDetJ;
+
+            float maxStep = glm::max(std::abs(du), std::abs(dv));
+            if (maxStep > 0.5f) {
+                float s = 0.5f / maxStep;
+                du *= s;
+                dv *= s;
+            }
+
+            // Do NOT clamp tightly to the triangle inside the loop (prevents edge lockup)
+            u = glm::clamp(u - du, -0.5f, 1.5f);
+            v = glm::clamp(v - dv, -0.5f, 1.5f);
+        }
+
+        float w = 1.0f - u - v;
+        const float BARY_EPS = -5e-4f;
+        if ((u < BARY_EPS) || (v < BARY_EPS) || (w < BARY_EPS)) {
+            return false;
+        }
+
+        glm::vec2 finalF = evalF(u, v);
+        if (glm::dot(finalF, finalF) > 1e-5f * scale2) {
+            return false;
+        }
+
+        glm::vec3 hitPos = u * X1 + v * X2 + w * X3
+                         - ((u * v) * C12 + (v * w) * C23 + (w * u) * C31);
+        float t = glm::dot(hitPos - rayOrigin, rayDir);
+        if (t < tMin || t > tMax) {
+            return false;
+        }
+
+        hitT = t;
+        hitU = glm::clamp(u, 0.0f, 1.0f);
+        hitV = glm::clamp(v, 0.0f, 1.0f - hitU);
+        return true;
+    };
+
+    // 4. Primary Seed: Flat-triangle projection (clamped to simplex) or centroid
+    float u0 = 1.0f / 3.0f;
+    float v0 = 1.0f / 3.0f;
+    float detFlat = glm::fma(e1.x, e2.y, -e1.y * e2.x);
+    if (std::abs(detFlat) > 1e-6f * scale2) {
+        float invDetFlat = 1.0f / detFlat;
+        float uf = glm::clamp(glm::fma(-x3.x, e2.y,  x3.y * e2.x) * invDetFlat, 0.0f, 1.0f);
+        float vf = glm::clamp(glm::fma( e1.x, -x3.y, e1.y * x3.x) * invDetFlat, 0.0f, 1.0f);
+        float sumUV = uf + vf;
+        if (sumUV > 1.0f) {
+            uf /= sumUV;
+            vf /= sumUV;
+        }
+        glm::vec2 Ff = evalF(uf, vf);
+        glm::vec2 Fc = evalF(u0, v0);
+        if (glm::dot(Ff, Ff) < glm::dot(Fc, Fc)) {
+            u0 = uf;
+            v0 = vf;
+        }
+    }
+
+    // Check if the patch folds in 2D across the ray (detJ changes sign across corners)
+    float d1 = evalDetJ(1.0f, 0.0f);
+    float d2 = evalDetJ(0.0f, 1.0f);
+    float d3 = evalDetJ(0.0f, 0.0f);
+    bool isFolded = (glm::min(glm::min(d1, d2), d3) * glm::max(glm::max(d1, d2), d3) <= 0.0f);
+
+    float bestT = tMax + 1.0f, bestU = 0.0f, bestV = 0.0f;
+    bool hit = solveSheet(u0, v0, bestT, bestU, bestV);
+
+    // 5. If the patch folds near a silhouette (or primary seed missed), test the opposite sheet
+    if (!hit || isFolded) {
+        float d0 = evalDetJ(u0, v0);
+        const float seedU[3] = { 0.85f, 0.075f, 0.075f };
+        const float seedV[3] = { 0.075f, 0.85f, 0.075f };
+
+        // Pick the corner seed on the opposite side of the fold (or smallest residual)
+        float uAlt = 1.0f / 3.0f - (u0 - 1.0f / 3.0f);
+        float vAlt = 1.0f / 3.0f - (v0 - 1.0f / 3.0f);
+        float bestScore = 1e30f;
+
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            float dk = evalDetJ(seedU[k], seedV[k]);
+            glm::vec2 Fk = evalF(seedU[k], seedV[k]);
+            float score = glm::dot(Fk, Fk);
+            // Strongly prefer seeds on the opposite sheet of the fold (dk * d0 < 0)
+            if (dk * d0 < 0.0f) {
+                score *= 0.01f;
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                uAlt = seedU[k];
+                vAlt = seedV[k];
+            }
+        }
+
+        float altT, altU, altV;
+        if (solveSheet(uAlt, vAlt, altT, altU, altV)) {
+            if (!hit || altT < bestT) {
+                bestT = altT;
+                bestU = altU;
+                bestV = altV;
+                hit = true;
+            }
+        }
+    }
+
+    if (!hit) {
+        return false;
+    }
+
+    outT = bestT;
+    outU = bestV;
+    outV =  1-bestU-bestV;
+    return true;
+}
+
+
+CUDA_HOST_DEVICE inline glm::vec3 evaluateNagataNormal(
+    glm::vec3 X1, glm::vec3 X2, glm::vec3 X3,
+    glm::vec3 C12, glm::vec3 C23, glm::vec3 C31,
+    float u, float v)
+{
+    // Here u is the weight of X1, v is the weight of X2, and w = 1 - u - v is the weight of X3.
+    // (If your pipeline passes OptiX convention where outU = v and outV = w,
+    //  uncomment the two lines below:)
+    // float u_orig = 1.0f - u - v;
+    // v = u; u = u_orig;
+
+    glm::vec3 dXdu = (X1 - X3)
+                   - v * C12
+                   + v * C23
+                   - (1.0f - 2.0f * u - v) * C31;
+
+    glm::vec3 dXdv = (X2 - X3)
+                   - u * C12
+                   - (1.0f - u - 2.0f * v) * C23
+                   + u * C31;
+
+    return glm::normalize(glm::cross(dXdu, dXdv));
+}
+
+CUDA_HOST_DEVICE inline glm::vec3 evaluateNagataNormal2(
+    glm::vec3 X1, glm::vec3 X2, glm::vec3 X3,
+    glm::vec3 C12, glm::vec3 C23, glm::vec3 C31,
+    float u, float v)
+{
+    float w = 1.0f - u - v;
+
+    glm::vec3 e1 = X1 - X3;
+    glm::vec3 e2 = X2 - X3;
+
+    // 1. Exact geometric normal at (u, v)
+    glm::vec3 dXdu = e1 - v * C12 + v * C23 - (w - u) * C31;
+    glm::vec3 dXdv = e2 - u * C12 - (w - v) * C23 + u * C31;
+    glm::vec3 nGeom = glm::normalize(glm::cross(dXdu, dXdv));
+
+    // 2. Recover exact vertex normals at the 3 corners (1,0), (0,1), (0,0)
+    //    where the Nagata patch tangents are strictly orthogonal to N1, N2, N3:
+    glm::vec3 n1 = glm::normalize(glm::cross(e1 + C31, e2 - C12 + C31));
+    glm::vec3 n2 = glm::normalize(glm::cross(e1 - C12 + C23, e2 + C23));
+    glm::vec3 n3 = glm::normalize(glm::cross(e1 - C31, e2 - C23));
+
+    // Ensure consistent orientation with nGeom in case of degenerate/folded corners
+    if (glm::dot(n1, nGeom) < 0.0f) n1 = -n1;
+    if (glm::dot(n2, nGeom) < 0.0f) n2 = -n2;
+    if (glm::dot(n3, nGeom) < 0.0f) n3 = -n3;
+
+    // Edge-continuous Phong normal reconstructed purely from the patch data
+    glm::vec3 nContinuous = glm::normalize(u * n1 + v * n2 + w * n3);
+
+    // Optional: blend interior quadratic normal with edge-continuous normal
+    // using bubble = 27*u*v*w (0 on all edges -> zero seams across edges),
+    // or return nContinuous directly for 100% smooth shading everywhere:
+    return nContinuous;
+}
+

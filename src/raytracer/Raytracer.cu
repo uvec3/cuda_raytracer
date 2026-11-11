@@ -1,3 +1,5 @@
+
+#include "../types.hpp"
 #include "Raytracer.cuh"
 
 #include "Scene.hpp"

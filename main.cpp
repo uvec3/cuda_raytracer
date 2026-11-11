@@ -1,4 +1,5 @@
 #include <iostream>
+#include "src/types.hpp"
 #include <vkbase_core.hpp>
 #include "src/core/RaytracerController.hpp"
 #include "src/core/CudaVulkanSwapChain.hpp"

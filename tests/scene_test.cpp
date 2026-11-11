@@ -108,9 +108,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = scene.as.vertices[tri.v0].position;
-                            auto v2 = scene.as.vertices[tri.v1].position;
-                            auto v3 = scene.as.vertices[tri.v2].position;
+                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
+                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
+                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
@@ -190,7 +190,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
                                 scene.as.primitives[bc.id() + 2],
                                 scene.as.primitives[bc.id() + 3]
                             };
-                            const FullTriangle& ftri = reinterpret_cast<const FullTriangle&>(chunks);
+                            const InlinedTriangle& ftri = reinterpret_cast<const InlinedTriangle&>(chunks);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, ftri.v0, ftri.v1, ftri.v2, t, u, v))
@@ -233,7 +233,7 @@ TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
     EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
     EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
-    EXPECT_EQ(scene.as.spaces[space_id].vertices_size, 0u); // vertices freed for NagataPatch
+    EXPECT_GT(scene.as.spaces[space_id].vertices_size, 0u);
 
     int root_box = scene.as.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
@@ -268,7 +268,10 @@ TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
 
                             float t, u, v;
                             if (intersectNagataPrecomputed(origin, dir, current_box.t_min, current_box.t_max,
-                                                           patch.X1, patch.X2, patch.X3, patch.C12, patch.C23, patch.C31,
+                                                           glm::vec3(scene.as.vertices[patch.v0].position),
+                                                           glm::vec3(scene.as.vertices[patch.v1].position),
+                                                           glm::vec3(scene.as.vertices[patch.v2].position),
+                                                           patch.C12, patch.C23, patch.C31,
                                                            t, u, v))
                             {
                                 hit_triangle = true;
@@ -340,9 +343,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = scene.as.vertices[tri.v0].position;
-                            auto v2 = scene.as.vertices[tri.v1].position;
-                            auto v3 = scene.as.vertices[tri.v2].position;
+                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
+                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
+                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
@@ -418,9 +421,9 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = scene.as.vertices[tri.v0].position;
-                            auto v2 = scene.as.vertices[tri.v1].position;
-                            auto v3 = scene.as.vertices[tri.v2].position;
+                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
+                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
+                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))

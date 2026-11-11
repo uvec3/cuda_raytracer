@@ -4,7 +4,6 @@
 #define GLM_FORCE_PURE
 #include <glm/glm.hpp>
 #include <cstdint>
-#define NOMINMAX
 #include "types/NagataPatch.cuh"
 
 #undef min

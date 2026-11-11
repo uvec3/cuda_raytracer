@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/pool/LogicalAllocator.hpp"
-#include "../src/soa/LogicalAllocatorOffset.hpp"
+#include "../src/pool/LogicalAllocatorOffset.hpp"
 
 TEST(Allocation, LogicalAllocator)
 {

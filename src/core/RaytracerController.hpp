@@ -11,7 +11,8 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <glm/glm.hpp>
+
+#include "../types.hpp"
 
 #include "../../vkbase/extensions/cuda/cuda.hpp"
 
@@ -74,7 +75,7 @@ public:
     double last_frame_time=0;
     const int frames_to_track=500;
     std::deque<double> last_frames_time={};
-    bool enable_profiler=true;
+    bool enable_profiler=false;
 
     bool fullscreen=false;
     bool hide_ui=false;
@@ -90,8 +91,7 @@ public:
     int custom_resolution[2] = {1920, 1080};
     bool scale_display_to_window = true;
 
-    glm::uvec2 get_target_resolution(glm::vec2 available_size) const;
-
+    //frame start finish events
     cudaEvent_t start, finish;
 
     float movement_speed=1;
@@ -103,7 +103,6 @@ public:
 
     void createRaytracer();
     void destroyRaytracer();
-
 
     void ui();
 
@@ -117,7 +116,7 @@ public:
 
     void ui_toolbar();
 
-    bool ui_show_parameters();
+    bool ui_rendering_parameters();
 
     bool ui_frame_info();
 
@@ -136,4 +135,6 @@ public:
     bool ui_table();
 
     void draw_cuda(cudaSurfaceObject_t surface, uint32_t width, uint32_t height);
+
+    glm::uvec2 get_target_resolution(glm::vec2 available_size) const;
 };

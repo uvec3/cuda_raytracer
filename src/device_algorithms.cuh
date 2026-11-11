@@ -100,7 +100,7 @@ inline __global__ void calculate_morton_codes(soa::soa_view<Vertex> vertices, so
     if (i<size)
     {
         auto&& tri = triangles[i];
-        glm::vec3 center=(vertices[tri.v0].position+vertices[tri.v1].position+vertices[tri.v2].position)/3.f;
+        glm::vec3 center=(glm::vec3(vertices[tri.v0].position)+glm::vec3(vertices[tri.v1].position)+glm::vec3(vertices[tri.v2].position))/3.f;
         auto x_bits=bits_division_from_float(center.x);
         auto y_bits=bits_division_from_float(center.y);
         auto z_bits=bits_division_from_float(center.z);

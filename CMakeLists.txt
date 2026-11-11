@@ -11,6 +11,8 @@ if (MSVC)
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
     )
 endif()
+add_compile_definitions(NOMINMAX)
+
 add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--threads=0>")
 
 

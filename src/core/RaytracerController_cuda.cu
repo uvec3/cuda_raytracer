@@ -17,11 +17,11 @@ void RaytracerController::destroyRaytracer()
 }
 
 
-bool RaytracerController::ui_show_parameters()
+bool RaytracerController::ui_rendering_parameters()
 {
     bool open=true;
 
-    if (ImGui::Begin("Renderer Parameters",&open))
+    if (ImGui::Begin("Rendering Parameters",&open))
     {
         ImGui::DragFloat("Movement speed",&movement_speed, 0.01f*movement_speed);
         ImGui::Separator();

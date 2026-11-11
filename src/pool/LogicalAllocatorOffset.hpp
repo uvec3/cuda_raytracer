@@ -32,7 +32,7 @@ class LogicalAllocatorOffset
     {
         m_size = size;
         offset_allocation.clear();
-        m_allocator = OffsetAllocator::Allocator(size,size);
+        m_allocator = OffsetAllocator::Allocator(std::max<uint32_t>(static_cast<uint32_t>(size), 1u));
     }
 
     size_t alloc(size_t size)
@@ -63,6 +63,7 @@ class LogicalAllocatorOffset
     }
 
 
+    bool try_realloc(size_t start, [[maybe_unused]] size_t old_size, size_t new_size) { return try_realloc(start, new_size); }
     bool try_realloc(size_t start, size_t new_size)
     {
         auto it = offset_allocation.find(start);
@@ -108,7 +109,7 @@ class LogicalAllocatorOffset
 
     bool is_allocated(uint32_t index)
     {
-        //m_allocator.storageReport();
+        return offset_allocation.contains(index);
     }
 
 
