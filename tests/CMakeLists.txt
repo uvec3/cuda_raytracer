@@ -18,8 +18,9 @@ target_link_libraries(traversal_test PRIVATE gtest_main glm::glm)
 
 
 add_executable(scene_test scene_test.cpp
-        ../src/raytracer/Scene.cpp ../src/raytracer/Scene.hpp
+        ../src/raytracer/Scene.cu ../src/raytracer/Scene.hpp
         ../src/acceleration_structures/octree/OctreeAS.cu
+        ../src/acceleration_structures/optix/OptixAS.cu
         ../external/tinygltf.cpp ../external/tiny_gltf_v3.h
         ../external/stb_image.cpp ../external/stb_image.h
         ../external/OffsetAllocator/offsetAllocator.hpp ../external/OffsetAllocator/offsetAllocator.cpp
@@ -29,6 +30,8 @@ target_compile_options(scene_test PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
+target_include_directories(scene_test PRIVATE ${OptiX_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated)
+add_dependencies(scene_test generate_optix_shaders)
 target_link_libraries(scene_test PRIVATE vkbase::assets vkbase::imgui glm::glm gtest_main vkbase::cuda imgui_container_explorer::imgui_container_explorer)
 vkbase_target_copy_assets(scene_test ${VKBASE_ASSETS})
 

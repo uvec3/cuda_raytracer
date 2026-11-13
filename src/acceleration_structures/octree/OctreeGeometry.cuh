@@ -1,5 +1,10 @@
 #pragma once
 
+struct OctreeASDeviceView
+{
+    soa::soa_view<int> as;
+    soa::soa_view<BoxContent> box_content;
+};
 
 struct TriangleNumberId
 {

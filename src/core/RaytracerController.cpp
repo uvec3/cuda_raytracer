@@ -20,12 +20,8 @@ SceneData& SceneData::operator=(SceneData&&) noexcept = default;
 
 void OctreeAS::register_containers(ContainerExplorer& explorer)
 {
-    explorer.register_container("octree.spaces", spaces);
     explorer.register_container("octree.as", as);
-    explorer.register_container("octree.primitives", primitives);
     explorer.register_container("octree.box_content", box_content);
-    explorer.register_container("octree.vertices", vertices);
-
 }
 
 
@@ -38,8 +34,9 @@ RaytracerController::RaytracerController()
     vkbase::imgui::addOnUiCallback(WRAP_MEMBER_FUNC(ui));
 
 
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&finish));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&render_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&start, cudaEventDefault));
+    CUDA_CHECK(cudaEventCreateWithFlags(&finish, cudaEventBlockingSync));
 
     cuda_loop = std::thread([&]()
     {
@@ -87,6 +84,8 @@ RaytracerController::~RaytracerController()
     if (cuda_loop.joinable())
         cuda_loop.join();
     vkDeviceWaitIdle(vkbase::device);
+    if (render_stream)
+        CUDA_CHECK(cudaStreamDestroy(render_stream));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(finish));
 
@@ -104,7 +103,7 @@ void RaytracerController::initScenes()
         s.scene=std::make_unique<Scene>(scene_name);
         s.scene->load(scene_data);
 
-        s.scene->as.register_containers(*s.explorer);
+        s.scene->as_octree.register_containers(*s.explorer);
         s.explorer->register_container("scene.materials", s.scene->m_materials, [this, sc = s.scene.get()](std::size_t)
         {
             std::lock_guard lock(device_data_mutex);
@@ -416,9 +415,11 @@ static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_s
     std::string label = node.name.empty() ? "Node" : node.name;
     if (node.as_ref.is_valid())
     {
-        label += (node.as_ref.type == ASType::Octree)
-            ? (" [Octree #" + std::to_string(node.as_ref.space_id) + "]")
-            : (" [BVH #" + std::to_string(node.as_ref.space_id) + "]");
+        std::string type_name = "AS";
+        if (node.as_ref.type == ASType::Optix) type_name = "OptiX";
+        else if (node.as_ref.type == ASType::Octree) type_name = "Octree";
+        else if (node.as_ref.type == ASType::BVH) type_name = "BVH";
+        label += " [" + type_name + " #" + std::to_string(node.as_ref.space_id) + "]";
     }
     if (is_active_render)
     {
@@ -549,11 +550,11 @@ bool RaytracerController::ui_scenes_manager()
 
             if (node.as_ref.is_valid())
             {
-                const char* type_str = (node.as_ref.type == ASType::Octree) ? "Octree" : "BVH";
+                const char* type_str = (node.as_ref.type == ASType::Optix) ? "OptiX" : (node.as_ref.type == ASType::Octree) ? "Octree" : "BVH";
                 ImGui::Text("Status: Built (%s, Space #%u)", type_str, node.as_ref.space_id);
-                if (active_scene.as.spaces.is_allocated(node.as_ref.space_id))
+                if (active_scene.spaces.is_allocated(node.as_ref.space_id))
                 {
-                    auto sp = active_scene.as.spaces[node.as_ref.space_id];
+                    auto sp = active_scene.spaces[node.as_ref.space_id];
                     ImGui::Text("  Boxes:      %u", (uint32_t)sp.as_size);
                     ImGui::Text("  Contents:   %u", (uint32_t)sp.box_content_size);
                     ImGui::Text("  Primitives: %u", (uint32_t)sp.primitives_size);
@@ -568,9 +569,9 @@ bool RaytracerController::ui_scenes_manager()
                 ImGui::Text("Status: Not built");
             }
 
-            static int selected_as_type = 0; // 0: Octree, 1: BVH
-            const char* as_type_names[] = {"Octree", "BVH (Coming soon)"};
-            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 2);
+            static int selected_as_type = 0; // 0: Octree, 1: BVH, 2: OptiX
+            const char* as_type_names[] = {"Octree", "BVH (Coming soon)", "OptiX (Hardware RT)"};
+            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 3);
 
             if (ImGui::Button("Build AS"))
             {
@@ -578,16 +579,17 @@ bool RaytracerController::ui_scenes_manager()
                 device_data_mutex.lock();
                 if (node.as_ref.is_valid())
                 {
-                    active_scene.as.free_space(node.as_ref.space_id);
+                    active_scene.free_space(node.as_ref.space_id);
                     node.as_ref = {};
                 }
 
                 auto relative_meshes = active_scene.get_mesh_transform(&node);
                 if (!relative_meshes.empty())
                 {
-                    uint32_t new_space_id = active_scene.as.create_space_for_models(
-                        relative_meshes);
-                    node.as_ref = {new_space_id, ASType::Octree};
+                    ASType as_type = (selected_as_type == 2) ? ASType::Optix : ASType::Octree;
+                    uint32_t new_space_id = active_scene.build_as(
+                        relative_meshes, as_type);
+                    node.as_ref = {new_space_id, as_type};
 
                     if (auto_select)
                     {
@@ -599,16 +601,16 @@ bool RaytracerController::ui_scenes_manager()
                     play();
             }
 
-            active_scene.as.config_ui();
-
+            if (selected_as_type == 0)
+            {
+                active_scene.as_octree.config_ui();
+            }
 
             ImGui::Separator();
 
-
-
             ImGui::Checkbox("Auto select for render after build", &auto_select);
             ImGui::Checkbox("Auto play after build", &auto_play);
-            ImGui::BeginDisabled(sub_triangles == 0 || selected_as_type != 0);
+            ImGui::BeginDisabled(sub_triangles == 0 || (selected_as_type != 0 && selected_as_type != 2));
 
             ImGui::EndDisabled();
 
@@ -632,7 +634,7 @@ bool RaytracerController::ui_scenes_manager()
                 device_data_mutex.lock();
                 if (node.as_ref.is_valid())
                 {
-                    active_scene.as.free_space(node.as_ref.space_id);
+                    active_scene.free_space(node.as_ref.space_id);
                     node.as_ref = {};
                 }
                 device_data_mutex.unlock();

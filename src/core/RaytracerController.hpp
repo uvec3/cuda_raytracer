@@ -93,6 +93,7 @@ public:
 
     //frame start finish events
     cudaEvent_t start, finish;
+    cudaStream_t render_stream = nullptr;
 
     float movement_speed=1;
 

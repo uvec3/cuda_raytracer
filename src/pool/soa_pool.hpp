@@ -19,13 +19,23 @@ public:
 
     soa_pool_generic(const soa_pool_generic&) = delete;
     soa_pool_generic& operator=(const soa_pool_generic&) = delete;
-    bool is_allocated(uint32_t uint32)
+
+    soa_pool_generic(soa_pool_generic&& other) noexcept
+        : Super(std::move(other)), l_allocator(std::move(other.l_allocator))
     {
-        return  true;
+        l_allocator.set_resize_callback([this](auto new_size){resize(new_size*MULT);});
     }
 
-    soa_pool_generic(soa_pool_generic&&) = default;
-    soa_pool_generic& operator=(soa_pool_generic&&) = default;
+    soa_pool_generic& operator=(soa_pool_generic&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Super::operator=(std::move(other));
+            l_allocator = std::move(other.l_allocator);
+            l_allocator.set_resize_callback([this](auto new_size){resize(new_size*MULT);});
+        }
+        return *this;
+    }
 
 
 

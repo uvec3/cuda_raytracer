@@ -30,7 +30,9 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::DragFloat("AX",&p.ax);
         ImGui::DragFloat("AZ",&p.az);
         ImGui::DragFloat3("Pos",&p.view_pos[0],0.01);
-        ImGui::InputFloat("Near",&p.near_,0.01);
+        ImGui::DragFloat("Fov",&p.fov,0.01);
+        ImGui::Checkbox("Perspective projections",&p.perspective_projection);
+        ImGui::Text("Near %f", p.near_);
         ImGui::Checkbox("Show time",&p.measure_time);
         ImGui::Checkbox("Show iterations",&p.show_iterations);
         ImGui::Checkbox("Show triangles",&p.show_triangles);
@@ -43,7 +45,10 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::DragFloat("Diffuse lightning",&p.diffuse_light,0.01);
         ImGui::DragFloat("Ambient lightning",&p.ambient_light,0.01);
 
+        ImGui::ColorEdit4("Background color",&p.background_color[0]);
+
         ImGui::Checkbox("Refraction",&p.enableRefraction);
+        ImGui::Checkbox("Reflection",&p.enableReflection);
         ImGui::Checkbox("Shadows",&p.enableShadows);
 
         ImGui::Separator();
@@ -134,13 +139,21 @@ void RaytracerController::pause()
 
 void RaytracerController::draw_cuda(cudaSurfaceObject_t surface, uint32_t width, uint32_t height)
 {
-    //lock access to the parameters
-    std::lock_guard lock(ui_mutex);
-    auto& scene=scenes[active_scene_number].scene;
+    Scene* scene_ptr = nullptr;
+    {
+        std::lock_guard lock(ui_mutex);
+        scene_ptr = scenes[active_scene_number].scene.get();
+        if (scene_ptr)
+            raytracer->update_parameters(*scene_ptr, width, height);
 
-    CUDA_CHECK(cudaEventRecord(start));
-    raytracer->draw_first_hit(*scene,surface,width, height);
-    CUDA_CHECK(cudaEventRecord(finish));
+
+        if (!scene_ptr)
+            return;
+
+        CUDA_CHECK(cudaEventRecord(start, render_stream));
+        raytracer->draw_first_hit(*scene_ptr, surface, width, height, render_stream);
+        CUDA_CHECK(cudaEventRecord(finish, render_stream));
+    }
 }
 
 
@@ -183,7 +196,7 @@ void RaytracerController::ui_surface_input()
 
         if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))
         {
-            p.near_+=io.MouseWheel*0.01f;
+            p.fov+=io.MouseWheel;
         }
         else
         {
@@ -225,6 +238,11 @@ void RaytracerController::ui_surface_input()
 }
 
 
+__global__ void evaluate_single_pixel_kernel(uint32_t x, uint32_t y, RenderParameters p, glm::vec4* result)
+{
+    *result = trace_pixel_first_hit(x, y, p);
+}
+
 bool RaytracerController::ui_debug_pixel()
 {
     static bool open=true;
@@ -239,13 +257,12 @@ bool RaytracerController::ui_debug_pixel()
             {
                 auto& scene=scenes[active_scene_number].scene;
                 raytracer->update_parameters(*scene,current_image_size.x, current_image_size.y);
-                RenderParameters host_params = raytracer->parameters;
-                host_params.vertices = scene->as.vertices.view();
-                host_params.materials = scene->m_materials.view();
-                host_params.as = scene->as.as.view();
-                host_params.containers = scene->as.box_content.view();
-                host_params.primitives = scene->as.primitives.view();
-                debug_pixel_result=trace_pixel_first_hit(debug_pixel.x,debug_pixel.y,host_params);
+                glm::vec4* d_result = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_result, sizeof(glm::vec4)));
+                evaluate_single_pixel_kernel<<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(&debug_pixel_result, d_result, sizeof(glm::vec4), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaFree(d_result));
             }
             device_data_mutex.unlock();
         }

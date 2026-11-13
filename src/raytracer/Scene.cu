@@ -8,6 +8,14 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cstring>
+#include <optional>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/iterator/zip_iterator.h>
+#include "../device_algorithms.cuh"
+#include "../types/NagataPatch.cuh"
 
 glm::mat4 Node::getTransform()
 {
@@ -77,9 +85,13 @@ size_t Node::count_subtree_vertices(const std::vector<Mesh>& meshes) const
     return count;
 }
 
-Scene::Scene(std::string_view name):m_name(name)
+Scene::Scene(std::string_view name)
+    : m_name(name)
+    , as_octree(&geometry_context)
+    , as_uniform_grid(&geometry_context)
+    , as_optix(&geometry_context)
 {
-    m_active_space=root_space;
+    m_active_space = root_space;
 }
 
 Scene::~Scene()
@@ -95,12 +107,18 @@ Scene::Scene(Scene&& other) noexcept
     , root_node(std::move(other.root_node))
     , default_scene(other.default_scene)
     , root_space(other.root_space)
-    , as(std::move(other.as))
+    , spaces(std::move(other.spaces))
+    , geometry_context(std::move(other.geometry_context))
+    , as_octree(std::move(other.as_octree))
+    , as_uniform_grid(std::move(other.as_uniform_grid))
+    , as_optix(std::move(other.as_optix))
     , m_is_loaded(other.m_is_loaded)
     , m_name(std::move(other.m_name))
     , m_active_space(other.m_active_space)
     , m_root_box(other.m_root_box)
 {
+    as_octree.bind_geometry_context(&geometry_context);
+    as_optix.bind_geometry_context(&geometry_context);
     other.m_textures.clear();
     other.m_is_loaded = false;
 }
@@ -117,12 +135,18 @@ Scene& Scene::operator=(Scene&& other) noexcept
         root_node = std::move(other.root_node);
         default_scene = other.default_scene;
         root_space = other.root_space;
-        as = std::move(other.as);
+        spaces = std::move(other.spaces);
+        geometry_context = std::move(other.geometry_context);
+        as_octree = std::move(other.as_octree);
+        as_uniform_grid = std::move(other.as_uniform_grid);
+        as_optix = std::move(other.as_optix);
         m_is_loaded = other.m_is_loaded;
         m_name = std::move(other.m_name);
         m_active_space = other.m_active_space;
         m_root_box = other.m_root_box;
 
+        as_octree.bind_geometry_context(&geometry_context);
+    as_optix.bind_geometry_context(&geometry_context);
         other.m_textures.clear();
         other.m_is_loaded = false;
     }
@@ -149,7 +173,8 @@ void Scene::destroy_textures()
 
 void Scene::sync_materials_to_device()
 {
-    d_materials = m_materials;
+    geometry_context.materials = m_materials;
+    d_materials = geometry_context.materials;
 }
 
 void Scene::load(std::string_view data)
@@ -161,7 +186,7 @@ void Scene::load(std::string_view data)
     // 1. Initialize tracking structures
     tg3_parse_options_init(&opts);
     opts.borrow_input_buffers = 1;
-    opts.skip_extras_values = 1;
+    opts.skip_extras_values = 0;
     opts.images_as_is = 1;
     tg3_error_stack_init(&errors);
 
@@ -206,9 +231,268 @@ const std::string& Scene::get_name() const
 
 void Scene::set_active_space(uint32_t space_id)
 {
-    TEST_ASSERT(as.spaces.is_allocated(space_id));
-    m_active_space=space_id;
-    m_root_box=as.spaces[m_active_space].root_box;
+    TEST_ASSERT(spaces.is_allocated(space_id));
+    m_active_space = space_id;
+    m_root_box = spaces[m_active_space].root_box;
+}
+
+uint32_t Scene::create_space()
+{
+    auto space_id = static_cast<uint32_t>(spaces.alloc_element());
+    spaces[space_id].root_box = -1;
+    spaces[space_id].as_type = ASType::None;
+    spaces[space_id].vertices_start = 0;
+    spaces[space_id].vertices_size = 0;
+    spaces[space_id].as_start = 0;
+    spaces[space_id].as_size = 0;
+    spaces[space_id].box_content_start = 0;
+    spaces[space_id].box_content_size = 0;
+    spaces[space_id].primitives_start = 0;
+    spaces[space_id].primitives_size = 0;
+    spaces[space_id].normalization_translate = glm::vec3(0.0f);
+    spaces[space_id].normalization_scale = glm::vec3(1.0f);
+    geometry_context.d_spaces = spaces;
+    return space_id;
+}
+
+void Scene::free_space(uint32_t space_id)
+{
+    if (!spaces.is_allocated(space_id))
+        return;
+    auto space = spaces[space_id];
+    as_octree.free_space(space_id, space);
+    as_optix.free_space(space_id, space);
+    if (space.vertices_size > 0)
+    {
+        geometry_context.vertices.free(space.vertices_start);
+    }
+    if (space.primitives_size > 0)
+    {
+        geometry_context.primitives.free(space.primitives_start);
+    }
+    spaces.free(space_id);
+    geometry_context.d_spaces = spaces;
+
+    if (m_active_space == space_id)
+    {
+        m_active_space = UINT32_MAX;
+        m_root_box = -1;
+    }
+}
+
+struct MinVec3 {
+    __device__ glm::vec3 operator()(const glm::vec3& a, const glm::vec3& b) const {
+        return glm::min(a, b);
+    }
+};
+
+struct MaxVec3 {
+    __device__ glm::vec3 operator()(const glm::vec3& a, const glm::vec3& b) const {
+        return glm::max(a, b);
+    }
+};
+
+void Scene::normalize_space(uint32_t space_id, bool stretch)
+{
+    auto vertices_start = &geometry_context.vertices[spaces[space_id].vertices_start].position;
+    auto vertices_size = spaces[space_id].vertices_size;
+
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    auto aabb_min = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(inf), MinVec3{});
+    auto aabb_max = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(-inf), MaxVec3{});
+    auto aabb_size = aabb_max - aabb_min;
+
+    glm::vec3 normalization_translate = -aabb_min;
+    glm::vec3 normalization_scale;
+    if (stretch)
+    {
+        normalization_scale = glm::vec3(1) / (aabb_size) * 0.98f;
+    }
+    else
+    {
+        normalization_scale = glm::vec3(1) / glm::vec3(glm::max(glm::max(aabb_size.x, aabb_size.y), aabb_size.z)) * 0.98f;
+    }
+
+    thrust::transform(thrust::device, vertices_start, vertices_start + vertices_size, vertices_start, [=] __device__(const glm::vec3& v)
+    {
+        return (v + normalization_translate) * normalization_scale + 0.01f;
+    });
+
+    spaces[space_id].normalization_translate = normalization_translate;
+    spaces[space_id].normalization_scale = normalization_scale;
+}
+
+void Scene::sort_space(uint32_t space_id, soa::cuda_device_vector<Triangle>& d_temp_triangles)
+{
+    auto triangles_size = static_cast<uint32_t>(d_temp_triangles.size());
+    if (triangles_size == 0 || spaces[space_id].vertices_size == 0)
+        return;
+
+    auto triangles_range = d_temp_triangles.view();
+
+    thrust::device_vector<uint64_t> morton_codes(triangles_size, thrust::no_init);
+    calculate_morton_codes<<<(triangles_size - 1) / 128 + 1, 128>>>(geometry_context.vertices.view(), triangles_range, morton_codes.data().get(), triangles_size);
+    auto t = d_temp_triangles.get_tuple();
+    thrust::sort_by_key(thrust::device, morton_codes.begin(), morton_codes.end(), thrust::zip_iterator{t});
+
+    morton_codes.resize(0);
+    morton_codes.shrink_to_fit();
+
+    auto vertices_start = spaces[space_id].vertices_start;
+    auto vertices_size = spaces[space_id].vertices_size;
+
+    auto map = sort_by_first_appearance_in_triangles(triangles_range,
+        triangles_size, vertices_start, vertices_size,
+        thrust::make_zip_iterator(geometry_context.vertices.get_tuple(vertices_start)));
+
+    remap_triangle_vertices<<<(triangles_size - 1) / 256 + 1, 256>>>(triangles_range, map.data().get(), vertices_start, triangles_size);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+__global__ void scene_pack_triangles_kernel(
+    soa::soa_view<Triangle> src_triangles,
+    uint32_t triangles_count,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= triangles_count) return;
+
+    Triangle tri = src_triangles[i];
+    tri.type = PrimitiveType::Triangle;
+    store_primitive(dst_primitives, primitives_start + i, tri);
+}
+
+__global__ void scene_pack_full_triangles_kernel(
+    soa::soa_view<Triangle> src_triangles,
+    soa::soa_view<Vertex> vertices,
+    uint32_t triangles_count,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= triangles_count) return;
+
+    Triangle tri = src_triangles[i];
+    InlinedTriangle ftri{};
+    ftri.type = PrimitiveType::FullTriangle;
+    ftri.material_id = tri.material_id;
+
+    glm::vec2 uv0 = vertices[tri.v0].uv;
+    glm::vec2 uv1 = vertices[tri.v1].uv;
+    glm::vec2 uv2 = vertices[tri.v2].uv;
+    ftri.uv_0 = glm::packHalf2x16(glm::vec2(uv0.x, uv0.y));
+    ftri.uv_1 = glm::packHalf2x16(glm::vec2(uv1.x, uv1.y));
+    ftri.uv_2 = glm::packHalf2x16(glm::vec2(uv2.x, uv2.y));
+
+    ftri.v0 = glm::vec3(vertices[tri.v0].position);
+    ftri.n0_compressed.pack(glm::vec3(vertices[tri.v0].normal));
+
+    ftri.v1 = glm::vec3(vertices[tri.v1].position);
+    ftri.n1_compressed.pack(glm::vec3(vertices[tri.v1].normal));
+
+    ftri.v2 = glm::vec3(vertices[tri.v2].position);
+    ftri.n2_compressed.pack(glm::vec3(vertices[tri.v2].normal));
+
+    uint32_t dst_slot = primitives_start + i * InlinedTriangle::occupied_slots;
+    store_primitive(dst_primitives, dst_slot, ftri);
+}
+
+__global__ void scene_pack_nagata_patches_kernel(
+    soa::soa_view<Triangle> src_triangles,
+    soa::soa_view<Vertex> vertices,
+    uint32_t triangles_count,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= triangles_count) return;
+
+    Triangle tri = src_triangles[i];
+    glm::vec3 v0 = glm::vec3(vertices[tri.v0].position);
+    glm::vec3 v1 = glm::vec3(vertices[tri.v1].position);
+    glm::vec3 v2 = glm::vec3(vertices[tri.v2].position);
+    glm::vec3 n0 = glm::vec3(vertices[tri.v0].normal);
+    glm::vec3 n1 = glm::vec3(vertices[tri.v1].normal);
+    glm::vec3 n2 = glm::vec3(vertices[tri.v2].normal);
+
+    NagataPatch patch = NagataPatch::fromTriangle(v0, v1, v2, n0, n1, n2);
+
+    NagataPatchPrimitive prim{};
+    prim.type = PrimitiveType::NagataPatch;
+    prim.material_id = tri.material_id;
+
+    prim.v0 = tri.v0;
+    prim.v1 = tri.v1;
+    prim.v2 = tri.v2;
+
+    prim.C12 = patch.C12;
+    prim.C23 = patch.C23;
+    prim.C31 = patch.C31;
+
+    uint32_t dst_slot = primitives_start + i * NagataPatchPrimitive::occupied_slots;
+    store_primitive(dst_primitives, dst_slot, prim);
+}
+
+void Scene::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<Triangle>& d_temp_triangles, uint32_t triangles_count, PrimitiveType triangle_type)
+{
+    if (triangles_count == 0)
+        return;
+
+    if (triangle_type == PrimitiveType::FullTriangle)
+    {
+        uint32_t primitives_size = triangles_count * InlinedTriangle::occupied_slots;
+        auto primitives_start = static_cast<uint32_t>(geometry_context.primitives.alloc(primitives_size));
+        spaces[space_id].primitives_start = primitives_start;
+        spaces[space_id].primitives_size = primitives_size;
+
+        uint32_t blocks = (triangles_count - 1) / 256 + 1;
+        scene_pack_full_triangles_kernel<<<blocks, 256>>>(
+            const_cast<soa::cuda_device_vector<Triangle>&>(d_temp_triangles).view(),
+            geometry_context.vertices.view(),
+            triangles_count,
+            geometry_context.primitives.view(),
+            primitives_start);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        if (spaces[space_id].vertices_size > 0)
+        {
+            geometry_context.vertices.free(spaces[space_id].vertices_start);
+            spaces[space_id].vertices_start = 0;
+            spaces[space_id].vertices_size = 0;
+        }
+    }
+    else if (triangle_type == PrimitiveType::NagataPatch)
+    {
+        uint32_t primitives_size = triangles_count * NagataPatchPrimitive::occupied_slots;
+        auto primitives_start = static_cast<uint32_t>(geometry_context.primitives.alloc(primitives_size));
+        spaces[space_id].primitives_start = primitives_start;
+        spaces[space_id].primitives_size = primitives_size;
+
+        uint32_t blocks = (triangles_count - 1) / 256 + 1;
+        scene_pack_nagata_patches_kernel<<<blocks, 256>>>(
+            const_cast<soa::cuda_device_vector<Triangle>&>(d_temp_triangles).view(),
+            geometry_context.vertices.view(),
+            triangles_count,
+            geometry_context.primitives.view(),
+            primitives_start);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    else
+    {
+        uint32_t primitives_size = triangles_count * Triangle::occupied_slots;
+        auto primitives_start = static_cast<uint32_t>(geometry_context.primitives.alloc(primitives_size));
+        spaces[space_id].primitives_start = primitives_start;
+        spaces[space_id].primitives_size = primitives_size;
+
+        uint32_t blocks = (triangles_count - 1) / 256 + 1;
+        scene_pack_triangles_kernel<<<blocks, 256>>>(
+            const_cast<soa::cuda_device_vector<Triangle>&>(d_temp_triangles).view(),
+            triangles_count,
+            geometry_context.primitives.view(),
+            primitives_start);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 int Scene::get_root_box() const
@@ -376,6 +660,55 @@ namespace
             }
         }
         return out;
+    }
+
+    float get_material_ior(const tg3_material* tg3mat, float metallicFactor)
+    {
+        // Default IOR fallback: 1.5 for dielectric (metallicFactor < 1.0), 1.0 for conductor/metal (metallicFactor == 1.0)
+        const float fallback_ior = (metallicFactor < 1.0f) ? 1.5f : 1.0f;
+
+        if (!tg3mat)
+            return fallback_ior;
+
+        auto extract_ior_from_ext = [](const tg3_extras_ext& ext_container) -> std::optional<float>
+        {
+            for (uint32_t i = 0; i < ext_container.extensions_count; ++i)
+            {
+                const auto& ext = ext_container.extensions[i];
+                if (tg3_str_equals_cstr(ext.name, "KHR_materials_ior"))
+                {
+                    if (ext.value.type == TG3_VALUE_OBJECT)
+                    {
+                        for (uint32_t j = 0; j < ext.value.object_count; ++j)
+                        {
+                            const auto& kv = ext.value.object_data[j];
+                            if (tg3_str_equals_cstr(kv.key, "ior"))
+                            {
+                                if (kv.value.type == TG3_VALUE_REAL)
+                                    return static_cast<float>(kv.value.real_val);
+                                if (kv.value.type == TG3_VALUE_INT)
+                                    return static_cast<float>(kv.value.int_val);
+                            }
+                        }
+                    }
+                    // Extension is present but "ior" property omitted -> glTF spec default is 1.5
+                    return 1.5f;
+                }
+            }
+            return std::nullopt;
+        };
+
+        if (auto ior = extract_ior_from_ext(tg3mat->ext))
+        {
+            return (*ior > 0.0f) ? *ior : fallback_ior;
+        }
+
+        if (auto ior = extract_ior_from_ext(tg3mat->pbr_metallic_roughness.ext))
+        {
+            return (*ior > 0.0f) ? *ior : fallback_ior;
+        }
+
+        return fallback_ior;
     }
 } // namespace
 
@@ -739,6 +1072,7 @@ std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::ve
         m_materials[idx0].normalTextureIndex = 0;
         m_materials[idx0].baseColorTexture = 0;
         m_materials[idx0].normalTexture = 0;
+        m_materials[idx0].ior = 1;
     }
 
     for (uint32_t i = 0; i < model.materials_count; ++i)
@@ -787,6 +1121,7 @@ std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::ve
         mat.normalTextureIndex = normTexId;
         mat.baseColorTexture = baseTexObj;
         mat.normalTexture = normTexObj;
+        mat.ior = get_material_ior(tg3mat, mat.metallicFactor);
 
         materialIds[i] = static_cast<uint32_t>(matIdx);
     }

@@ -7,71 +7,8 @@
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
 
 
-struct RenderParameters
-{
-    uint32_t width;
-    uint32_t height;
 
-    glm::vec2 ax_c;
-    glm::vec2 az_c;
-
-    glm::vec2 mouse_pos;
-    glm::vec3 view_pos{0.5,0,0.3};
-    double t;
-    float az{0};
-    float ax{-0.5};
-    glm::mat3 rotation;
-    float near_ = 1;
-
-    float ambient_light=0.1;
-    float diffuse_light=0.9;
-
-    bool fixed_light_source=false;
-    glm::vec3 light_source{0.5, 0.5,1.5};
-
-    bool show_iterations=false;
-    bool measure_time=false;
-    bool show_triangles=true;
-    bool show_boxes=false;
-    bool use_fake_normals=true;
-    bool renderNagata=false;
-
-    bool enableShadows=false;
-    bool enableReflection=false;
-    bool enableRefraction=false;
-
-    glm::vec4 background_color=glm::vec4(0,0,0,1);
-    cudaTextureObject_t skybox;
-    bool use_skybox=true;
-
-    int time_max=50000;
-
-    //as
-    soa::soa_view<int> as;
-    soa::soa_view<BoxContent> containers;
-    soa::soa_view<PrimitiveChunk16> primitives;
-    soa::soa_view<Vertex> vertices;
-
-    //scene
-    soa::soa_view<Material> materials;
-
-    //temp
-    soa::soa_view<Ray> rays;
-    uint32_t number_of_rays=0;
-    uint32_t initial_rays_generated=0;
-    int root_box;
-};
-
-
-__host__ __device__ inline
-glm::vec3 screen_to_space(uint32_t x, uint32_t y, uint32_t width, uint32_t height, float near_plane)
-{
-    auto point=glm::vec2((float)x/(float)width,(float)y/(float)height);
-    point=point*2.f-1.f;
-    point.x*=float(width)/float(height);
-    auto point3d=glm::vec3(point.x,near_plane,-point.y);
-    return  point3d;
-}
+#include "RenderParameters.hpp"
 
 inline __device__
 void raygen(RenderParameters& p)
@@ -88,7 +25,7 @@ void raygen(RenderParameters& p)
         auto row=band*band_height + local_id%band_height;
         auto col=local_id/band_height;
 
-        auto point=screen_to_space(row,col,p.width,p.height,1);
+        // auto point=screen_to_space(row,col,p.width,p.height,1);
     }
 }
 
@@ -111,7 +48,7 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
 
 //returns whether to continue tracing the ray
  __host__ __device__ inline
-bool fragment_hit_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv,const RenderParameters& p)
+glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv,const RenderParameters& p,bool& continue_traversal)
 {
     using namespace glm;
 
@@ -228,37 +165,64 @@ bool fragment_hit_shader(glm::vec4& out_color, uint32_t primitive_id, glm::vec3&
     }
 
     float lighting = diffuse * p.diffuse_light + p.ambient_light;
-    out_color += glm::vec4(glm::vec3(base_color) * lighting + emissive, base_color.a);
+    glm::vec4 out_color = glm::vec4(glm::vec3(base_color) * lighting + emissive, base_color.a);
 
-    if (p.enableRefraction)
+    //decide whether to refract and continue
+    if (p.enableRefraction && base_color.a<1.0f)
     {
-        float eta = 0.75;
+        float eta = p.materials[mat_id].ior;
 
-        //out
-        if (glm::dot(ray_dir,normal) > 0.0f) {
+        //in
+        if (glm::dot(ray_dir,normal) < 0.0f) {
             eta = 1/eta;
+
+        }
+        else//out
+        {
             normal=-normal;
         }
+
+
         auto refracted=glm::refract(ray_dir,normal,eta);
         if (refracted!=glm::vec3(0))
         {
             ray_dir=refracted;
             ray_src=intersection;
-            return true;
+            continue_traversal = true;
         }
         else
-            return false;
+        {
+            continue_traversal = false;
+        }
+    }
+    else
+    {
+        continue_traversal=false;
     }
 
-    return false;
+    return out_color;
 }
 
 __host__ __device__ inline
 glm::vec4 miss_shader(glm::vec3 ray_src, glm::vec3 ray_dir,const RenderParameters& p)
 {
-
+    if (p.skybox==0)
+    {
+        return p.background_color;
+    }
+    else
+    {
+        return glm::vec4{1.f};
+    }
 }
 
+__host__ __device__ inline
+glm::vec4 blend_colors(glm::vec4 current_color, glm::vec4 new_color)
+{
+    auto base=glm::vec3(current_color)*current_color.a + (1.0f -current_color.a)*glm::vec3(new_color);
+    auto alpha = 1- (1-current_color.a)*(1-new_color.a);
+    return glm::vec4(base,alpha);
+}
 
 __host__ __device__ inline
 glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direction)
@@ -282,7 +246,7 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
     while (container_id!=0 && continue_traversal && it<max_iterations)
     {
         //AS TRAVERSAL STEP (returns after hitting non-empty leaf node)
-        TraversalResult result=traverse_stackless(&p.as[0], current_box, source, current_source, direction, it);
+        TraversalResult result=traverse_stackless(&p.as_octree.as[0], current_box, source, current_source, direction, it);
         container_id=result.content;
 
         if (container_id>0)
@@ -295,7 +259,7 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
             {
                 for (;;++container_id)
                 {
-                    auto primitive=p.containers[container_id];
+                    auto primitive=p.as_octree.box_content[container_id];
                     uint32_t prim_id=primitive.id();
                     PrimitiveChunk16 chunk0=p.primitives[prim_id];
                     if (chunk0.type() == PrimitiveType::Triangle)
@@ -364,8 +328,8 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
 
             if (closest_triangle!=UINT32_MAX)
             {
-
-                continue_traversal=fragment_hit_shader(hit_primitive_color,closest_triangle,source,direction,closest_tuv,p);
+                auto res=fragment_hit_shader(closest_triangle,source,direction,closest_tuv,p,continue_traversal);
+                hit_primitive_color=blend_colors(hit_primitive_color,res);
                 if (continue_traversal)
                 {
                     current_box.t_min=1e-4f;
@@ -375,7 +339,9 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
         }
 
         if (current_box.stack.depth()==0)//even though the content was return the stack depth 0 means that that was the last box
+        {
             break;
+        }
     }
 
     if (it==max_iterations)//return white to indicate that the loop was interrupted
@@ -383,36 +349,28 @@ glm::vec4 octree_first_hit(RenderParameters p, glm::vec3 source, glm::vec3 direc
 
     if (!p.show_iterations && !p.show_boxes)
     {
-        return glm::vec4(glm::vec3(hit_primitive_color), 1.0f);
+        if (current_box.stack.depth()==0)//call miss shader
+            hit_primitive_color=blend_colors(hit_primitive_color,miss_shader(source,direction,p));
+        return hit_primitive_color;
     }
 
-    //composes the final color result: number of boxes - red, number of leafs - green, geometry - blue (or additive when geometry has color)
+    //composes the final color result: number of boxes - red, number of leafs - green
     float iter_overlay = (float(it) / 25.0f) * p.show_iterations;
     float box_overlay = (box_hits / 10.0f) * p.show_boxes;
-    return glm::vec4(
-        hit_primitive_color.r + iter_overlay,
-        hit_primitive_color.g + box_overlay,
-        hit_primitive_color.b,
-        1.0f);
+
+    auto a=(hit_primitive_color.x+hit_primitive_color.y+hit_primitive_color.z)/3;
+    glm::vec3 base=glm::mix(glm::vec3(p.background_color),glm::vec3(0,0,1),a);
+    base = glm::mix(base,glm::vec3(1,0,0),iter_overlay);
+    base = glm::mix(base,glm::vec3(0,1,0),box_overlay);
+
+    return glm::vec4(base,1.0f);
 }
 
 __host__ __device__ inline
 glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, RenderParameters p)
 {
-    auto direction=screen_to_space(x,y,p.width,p.height,p.near_);
-
-    //apply rotation
-    //complex multiplication with  p.ax_c : rotates the camera up/down
-    direction={direction.x, direction.y*p.ax_c.x-direction.z*p.ax_c.y, direction.y*p.ax_c.y+direction.z*p.ax_c.x};
-    //complex multiplication with  p.az_c : rotates the camera left/right
-    direction={ direction.x*p.az_c.x-direction.y*p.az_c.y, direction.x*p.az_c.y+direction.y*p.az_c.x, direction.z};
-
-    //for some calculation it is better to keep normalized vector(e.g. nagata patch)
-    direction=glm::normalize(direction);
-
-    //keep source at one point
-    auto source=p.view_pos;
-
+    glm::vec3 source, direction;
+    p.calculate_camera_ray(x, y, source, direction);
     return octree_first_hit(p, source, direction);
 }
 

@@ -9,19 +9,32 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#ifndef GLM_FORCE_ALIGNED_GENTYPES
 #define GLM_FORCE_ALIGNED_GENTYPES
+#endif
+#ifndef GLM_FORCE_CUDA
 #define GLM_FORCE_CUDA
+#endif
+#ifndef GLM_FORCE_PURE
 #define GLM_FORCE_PURE
+#endif
 #include <glm/glm.hpp>
 #include <glm/gtc/type_aligned.hpp>
+
+#include "../external/soa_vector/src/soa_cuda.hpp"
+#include "pool/soa_pool_cuda.hpp"
 #undef min
 #undef max
 
 enum class ASType : uint32_t
 {
-    None = 0,
-    Octree = 1,
-    BVH = 2
+    None =0,
+    UniformGrid,
+    Octree,
+    KDTree,
+    BVH,
+    HUG,
+    Optix
 };
 
 struct ASRef
@@ -232,6 +245,7 @@ static_assert(sizeof(Sphere) == 32);
 struct Space
 {
     int& root_box;
+    ASType& as_type;
     uint32_t& vertices_start;
     uint32_t& vertices_size;
 
@@ -290,6 +304,7 @@ struct Material
     glm::vec4& baseColor;
     float& metallicFactor;
     float& roughnessFactor;
+    float& ior;
     glm::vec3& emissiveFactor;
     uint32_t& baseColorTextureIndex;
     uint32_t& normalTextureIndex;
@@ -309,4 +324,21 @@ struct Beam
     uint32_t& start;
     uint32_t& size;
     uint32_t& traced;
+};
+
+struct GeometryContext
+{
+    soa::cuda_device_vector<Space> d_spaces;
+    soa::soa_cuda_device_pool<PrimitiveChunk16> primitives{1024};
+    soa::soa_cuda_device_pool<Vertex> vertices{1024};
+    soa::cuda_device_vector<Material> materials;
+};
+
+struct Mesh
+{
+    std::string name;
+    soa::soa_vector<Vertex> vertices;
+    soa::soa_vector<Triangle> triangles;
+    glm::mat3 transform=1;
+    uint32_t space_id=UINT32_MAX;
 };

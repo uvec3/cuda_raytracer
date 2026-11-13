@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/raytracer/Scene.hpp"
+#include "../src/raytracer/RenderParameters.hpp"
 #include "../src/acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../vkbase/extensions/Assets/assets.h"
 
@@ -32,14 +33,14 @@ TEST(Scene, NodeHierarchyAndASRef)
     auto subscene_meshes = scene.get_mesh_transform(&subscene);
     ASSERT_FALSE(subscene_meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as.config.use_gpu = true;
-    scene.as.config.sort_space = true;
-    uint32_t space_id = scene.as.create_space_for_models(subscene_meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as_octree.config.use_gpu = true;
+    scene.as_octree.config.sort_space = true;
+    uint32_t space_id = scene.build_as(subscene_meshes, ASType::Octree);
     subscene.as_ref = {space_id, ASType::Octree};
 
     EXPECT_TRUE(subscene.as_ref.is_valid());
@@ -61,24 +62,27 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
 
-    std::cout << "primitives_size = " << scene.as.spaces[space_id].primitives_size << std::endl;
-    std::cout << "as_size = " << scene.as.spaces[space_id].as_size << std::endl;
-    std::cout << "box_content_size = " << scene.as.spaces[space_id].box_content_size << std::endl;
+    std::cout << "primitives_size = " << scene.spaces[space_id].primitives_size << std::endl;
+    std::cout << "as_size = " << scene.spaces[space_id].as_size << std::endl;
+    std::cout << "box_content_size = " << scene.spaces[space_id].box_content_size << std::endl;
 
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
 
     // Verify full ray traversal and triangle hit
-    int root_box = scene.as.spaces[space_id].root_box;
+    int root_box = scene.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
+
+    soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+    soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
 
     // Cast a bundle of rays towards the teapot center (0.5, 0.5, 0.5)
     int hit_count = 0;
@@ -97,20 +101,20 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                auto result = traverse_stackless(&scene.as_octree.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
                     for (; !hit_triangle; ++container_id)
                     {
-                        auto bc = scene.as.box_content[container_id];
-                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        auto bc = scene.as_octree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
-                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
-                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
+                            auto v1 = glm::vec3(host_vertices[tri.v0].position);
+                            auto v2 = glm::vec3(host_vertices[tri.v1].position);
+                            auto v3 = glm::vec3(host_vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
@@ -142,21 +146,23 @@ TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as.config.triangle_type = PrimitiveType::FullTriangle;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as_octree.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
 
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
-    EXPECT_EQ(scene.as.spaces[space_id].vertices_size, 0u); // vertices freed for FullTriangle
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
+    EXPECT_EQ(scene.spaces[space_id].vertices_size, 0u); // vertices freed for FullTriangle
 
-    int root_box = scene.as.spaces[space_id].root_box;
+    int root_box = scene.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
+
+    soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
 
     int hit_count = 0;
     for (float x = 0.3f; x <= 0.7f; x += 0.05f)
@@ -174,21 +180,21 @@ TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                auto result = traverse_stackless(&scene.as_octree.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
                     for (; !hit_triangle; ++container_id)
                     {
-                        auto bc = scene.as.box_content[container_id];
-                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        auto bc = scene.as_octree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
                         if (chunk0.type() == PrimitiveType::FullTriangle)
                         {
                             PrimitiveChunk16 chunks[4] = {
                                 chunk0,
-                                scene.as.primitives[bc.id() + 1],
-                                scene.as.primitives[bc.id() + 2],
-                                scene.as.primitives[bc.id() + 3]
+                                host_primitives[bc.id() + 1],
+                                host_primitives[bc.id() + 2],
+                                host_primitives[bc.id() + 3]
                             };
                             const InlinedTriangle& ftri = reinterpret_cast<const InlinedTriangle&>(chunks);
 
@@ -222,21 +228,24 @@ TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as.config.triangle_type = PrimitiveType::NagataPatch;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as_octree.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
 
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].vertices_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
+    EXPECT_GT(scene.spaces[space_id].vertices_size, 0u);
 
-    int root_box = scene.as.spaces[space_id].root_box;
+    int root_box = scene.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
+
+    soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+    soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
 
     int hit_count = 0;
     for (float x = 0.3f; x <= 0.7f; x += 0.05f)
@@ -254,23 +263,23 @@ TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                auto result = traverse_stackless(&scene.as_octree.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
                     for (; !hit_triangle; ++container_id)
                     {
-                        auto bc = scene.as.box_content[container_id];
-                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        auto bc = scene.as_octree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
                         if (chunk0.type() == PrimitiveType::NagataPatch)
                         {
-                            NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(scene.as.primitives, bc.id(), chunk0);
+                            NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(host_primitives, bc.id(), chunk0);
 
                             float t, u, v;
                             if (intersectNagataPrecomputed(origin, dir, current_box.t_min, current_box.t_max,
-                                                           glm::vec3(scene.as.vertices[patch.v0].position),
-                                                           glm::vec3(scene.as.vertices[patch.v1].position),
-                                                           glm::vec3(scene.as.vertices[patch.v2].position),
+                                                           glm::vec3(host_vertices[patch.v0].position),
+                                                           glm::vec3(host_vertices[patch.v1].position),
+                                                           glm::vec3(host_vertices[patch.v2].position),
                                                            patch.C12, patch.C23, patch.C31,
                                                            t, u, v))
                             {
@@ -301,20 +310,23 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as.config.use_gpu = false;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as_octree.config.use_gpu = false;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
 
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
 
-    int root_box = scene.as.spaces[space_id].root_box;
+    int root_box = scene.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
+
+    soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+    soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
 
     int hit_count = 0;
     for (float x = 0.3f; x <= 0.7f; x += 0.05f)
@@ -332,20 +344,20 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                auto result = traverse_stackless(&scene.as_octree.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
                     for (; !hit_triangle; ++container_id)
                     {
-                        auto bc = scene.as.box_content[container_id];
-                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        auto bc = scene.as_octree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
-                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
-                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
+                            auto v1 = glm::vec3(host_vertices[tri.v0].position);
+                            auto v2 = glm::vec3(host_vertices[tri.v1].position);
+                            auto v3 = glm::vec3(host_vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
@@ -378,21 +390,24 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
     ASSERT_FALSE(meshes.empty());
 
     // Build AS without sort_space (sort = false)
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 10;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as.config.use_gpu = true;
-    scene.as.config.sort_space = false;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 10;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    scene.as_octree.config.use_gpu = true;
+    scene.as_octree.config.sort_space = false;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
 
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
 
-    int root_box = scene.as.spaces[space_id].root_box;
+    int root_box = scene.spaces[space_id].root_box;
     EXPECT_GE(root_box, 0);
+
+    soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+    soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
 
     int hit_count = 0;
     for (float x = 0.3f; x <= 0.7f; x += 0.05f)
@@ -410,20 +425,20 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
 
             while (container_id != 0 && !hit_triangle && it < 500)
             {
-                auto result = traverse_stackless(&scene.as.as[0], current_box, origin, current_source, dir, it);
+                auto result = traverse_stackless(&scene.as_octree.as[0], current_box, origin, current_source, dir, it);
                 container_id = result.content;
                 if (container_id > 0)
                 {
                     for (; !hit_triangle; ++container_id)
                     {
-                        auto bc = scene.as.box_content[container_id];
-                        PrimitiveChunk16 chunk0 = scene.as.primitives[bc.id()];
+                        auto bc = scene.as_octree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
                         if (chunk0.type() == PrimitiveType::Triangle)
                         {
                             const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
-                            auto v1 = glm::vec3(scene.as.vertices[tri.v0].position);
-                            auto v2 = glm::vec3(scene.as.vertices[tri.v1].position);
-                            auto v3 = glm::vec3(scene.as.vertices[tri.v2].position);
+                            auto v1 = glm::vec3(host_vertices[tri.v0].position);
+                            auto v2 = glm::vec3(host_vertices[tri.v1].position);
+                            auto v3 = glm::vec3(host_vertices[tri.v2].position);
 
                             float t, u, v;
                             if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
@@ -458,19 +473,19 @@ TEST(OctreeAS, BuildAndTraverseHairballGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as.config.stretch = false;
-    scene.as.config.swapYZ = true;
-    scene.as.config.min_depth = 1;
-    scene.as.config.max_depth = 8;
-    scene.as.config.triangle_to_box_stop_ratio = 1.1f;
-    uint32_t space_id = scene.as.create_space_for_models(meshes);
-    EXPECT_GT(scene.as.spaces[space_id].as_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].box_content_size, 0);
-    EXPECT_GT(scene.as.spaces[space_id].primitives_size, 0);
+    scene.as_octree.config.stretch = false;
+    scene.as_octree.config.swapYZ = true;
+    scene.as_octree.config.min_depth = 1;
+    scene.as_octree.config.max_depth = 8;
+    scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
 
-    std::cout << "Hairball AS built on GPU: boxes=" << scene.as.spaces[space_id].as_size
-              << ", contents=" << scene.as.spaces[space_id].box_content_size
-              << ", primitives=" << scene.as.spaces[space_id].primitives_size << std::endl;
+    std::cout << "Hairball AS built on GPU: boxes=" << scene.spaces[space_id].as_size
+              << ", contents=" << scene.spaces[space_id].box_content_size
+              << ", primitives=" << scene.spaces[space_id].primitives_size << std::endl;
 }
 
 TEST(Assets, AssetsFrom)
@@ -548,4 +563,308 @@ TEST(Scene, LoadTexturesAndMaterials)
     EXPECT_TRUE(has_textured_mat);
 }
 
+TEST(OptixAS, BuildTeapot)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
 
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
+    EXPECT_TRUE(scene.as_optix.is_valid());
+    EXPECT_NE(scene.as_optix.get_handle(), 0);
+    EXPECT_EQ(scene.spaces[space_id].as_type, ASType::Optix);
+}
+
+TEST(OptixAS, RenderTeapot)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    ASSERT_TRUE(scene.as_optix.is_valid());
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    RenderParameters params{};
+    params.width = width;
+    params.height = height;
+    params.view_pos = glm::vec3(0.5f, 0.0f, 0.3f);
+    params.ax = 0.0f;
+    params.az = 0.0f;
+    params.ax_c = glm::vec2(1.0f, 0.0f);
+    params.az_c = glm::vec2(1.0f, 0.0f);
+    params.near_ = 1.0f;
+    params.ambient_light = 0.2f;
+    params.diffuse_light = 0.8f;
+    params.fixed_light_source = false;
+    params.light_source = glm::vec3(0.5f, 0.5f, 1.5f);
+    params.use_fake_normals = true;
+    params.background_color = glm::vec4(0.1f, 0.2f, 0.3f, 1.0f);
+    params.primitives = scene.geometry_context.primitives.view();
+    params.vertices = scene.geometry_context.vertices.view();
+    params.materials = scene.geometry_context.materials.view();
+
+    EXPECT_NO_THROW(scene.as_optix.render(surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    // Verify pixels were written (alpha should be 255 and colors non-zero)
+    bool has_non_zero = false;
+    for (const auto& px : host_pixels)
+    {
+        if (px.w > 0 && (px.x > 0 || px.y > 0 || px.z > 0))
+        {
+            has_non_zero = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_non_zero);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(OptixAS, RenderWithTimeMeasurement)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    ASSERT_TRUE(scene.as_optix.is_valid());
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    RenderParameters params{};
+    params.width = width;
+    params.height = height;
+    params.view_pos = glm::vec3(0.5f, 0.0f, 0.3f);
+    params.ax = 0.0f;
+    params.az = 0.0f;
+    params.ax_c = glm::vec2(1.0f, 0.0f);
+    params.az_c = glm::vec2(1.0f, 0.0f);
+    params.near_ = 1.0f;
+    params.ambient_light = 0.2f;
+    params.diffuse_light = 0.8f;
+    params.fixed_light_source = false;
+    params.light_source = glm::vec3(0.5f, 0.5f, 1.5f);
+    params.use_fake_normals = true;
+    params.background_color = glm::vec4(0.1f, 0.2f, 0.3f, 1.0f);
+    params.primitives = scene.geometry_context.primitives.view();
+    params.vertices = scene.geometry_context.vertices.view();
+    params.materials = scene.geometry_context.materials.view();
+    params.measure_time = true;
+    params.time_max = 5000;
+
+    EXPECT_NO_THROW(scene.as_optix.render(surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    bool has_timing_values = false;
+    for (const auto& px : host_pixels)
+    {
+        if (px.w == 255 && px.x > 0)
+        {
+            has_timing_values = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_timing_values);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(OptixAS, RenderWithRefraction)
+{
+    Scene scene("Refraction");
+    auto refraction_view = vkbase::assets::get("Scenes/Refraction.glb");
+    if (refraction_view.empty())
+    {
+        refraction_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    }
+    ASSERT_FALSE(refraction_view.empty());
+    scene.load(refraction_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    ASSERT_TRUE(scene.as_optix.is_valid());
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    RenderParameters params{};
+    params.width = width;
+    params.height = height;
+    params.view_pos = glm::vec3(0.0f, 0.0f, 2.0f);
+    params.ax = 0.0f;
+    params.az = 0.0f;
+    params.ax_c = glm::vec2(1.0f, 0.0f);
+    params.az_c = glm::vec2(1.0f, 0.0f);
+    params.near_ = 1.0f;
+    params.ambient_light = 0.2f;
+    params.diffuse_light = 0.8f;
+    params.fixed_light_source = false;
+    params.light_source = glm::vec3(0.5f, 0.5f, 1.5f);
+    params.use_fake_normals = true;
+    params.background_color = glm::vec4(0.1f, 0.2f, 0.3f, 1.0f);
+    params.primitives = scene.geometry_context.primitives.view();
+    params.vertices = scene.geometry_context.vertices.view();
+    params.materials = scene.geometry_context.materials.view();
+    params.enableRefraction = true;
+
+    EXPECT_NO_THROW(scene.as_optix.render(surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    bool has_rendered_pixels = false;
+    for (const auto& px : host_pixels)
+    {
+        if (px.w == 255 && (px.x > 0 || px.y > 0 || px.z > 0))
+        {
+            has_rendered_pixels = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_rendered_pixels);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(OptixAS, BuildMultipleSpacesAndFree)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes1 = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes1.empty());
+
+    uint32_t space1 = scene.build_as(meshes1, ASType::Optix);
+    EXPECT_TRUE(scene.as_optix.is_valid(space1));
+    OptixTraversableHandle handle1 = scene.as_optix.get_handle(space1);
+    EXPECT_NE(handle1, 0);
+
+    auto meshes2 = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes2.empty());
+
+    uint32_t space2 = scene.build_as(meshes2, ASType::Optix);
+    EXPECT_NE(space1, space2);
+    EXPECT_TRUE(scene.as_optix.is_valid(space2));
+    OptixTraversableHandle handle2 = scene.as_optix.get_handle(space2);
+    EXPECT_NE(handle2, 0);
+
+    // Both spaces must be valid simultaneously
+    EXPECT_TRUE(scene.as_optix.is_valid(space1));
+    EXPECT_TRUE(scene.as_optix.is_valid(space2));
+
+    const uint32_t width = 32;
+    const uint32_t height = 32;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    RenderParameters params{};
+    params.width = width;
+    params.height = height;
+    params.view_pos = glm::vec3(0.5f, 0.0f, 0.3f);
+    params.ax = 0.0f;
+    params.az = 0.0f;
+    params.ax_c = glm::vec2(1.0f, 0.0f);
+    params.az_c = glm::vec2(1.0f, 0.0f);
+    params.near_ = 1.0f;
+    params.ambient_light = 0.2f;
+    params.diffuse_light = 0.8f;
+    params.background_color = glm::vec4(0.1f, 0.2f, 0.3f, 1.0f);
+    params.primitives = scene.geometry_context.primitives.view();
+    params.vertices = scene.geometry_context.vertices.view();
+    params.materials = scene.geometry_context.materials.view();
+
+    // Render space 1 and space 2 independently
+    EXPECT_NO_THROW(scene.as_optix.render(space1, surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    EXPECT_NO_THROW(scene.as_optix.render(space2, surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    // Free space 1 only
+    scene.free_space(space1);
+    EXPECT_FALSE(scene.as_optix.is_valid(space1));
+    EXPECT_TRUE(scene.as_optix.is_valid(space2));
+
+    // Space 2 must still render cleanly
+    EXPECT_NO_THROW(scene.as_optix.render(space2, surface, params, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    // Free space 2
+    scene.free_space(space2);
+    EXPECT_FALSE(scene.as_optix.is_valid(space2));
+    EXPECT_FALSE(scene.as_optix.is_valid());
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
