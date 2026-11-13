@@ -302,6 +302,38 @@ public:
         return images[currently_presented].get();
     }
 
+    bool copyPresentedImageToHost(std::vector<uint8_t>& out_rgba, uint32_t& out_width, uint32_t& out_height)
+    {
+        std::lock_guard lock(image_mutex);
+        if (currently_presented < 0 || currently_presented >= static_cast<int>(images.size()) || !images[currently_presented])
+            return false;
+
+        auto& img = images[currently_presented]->image;
+        if (img.width == 0 || img.height == 0 || !img.mipmapArray)
+            return false;
+
+        out_width = img.width;
+        out_height = img.height;
+
+        cudaArray_t cuda_array = nullptr;
+        cudaError_t err = cudaGetMipmappedArrayLevel(&cuda_array, img.mipmapArray, 0);
+        if (err != cudaSuccess || !cuda_array)
+            return false;
+
+        out_rgba.resize(static_cast<size_t>(out_width) * out_height * 4);
+        err = cudaMemcpy2DFromArray(
+            out_rgba.data(),
+            out_width * 4,
+            cuda_array,
+            0,
+            0,
+            out_width * 4,
+            out_height,
+            cudaMemcpyDeviceToHost
+        );
+        return (err == cudaSuccess);
+    }
+
     uint32_t get_width() const
     {
         return m_width;

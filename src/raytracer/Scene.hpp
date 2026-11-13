@@ -5,7 +5,6 @@
 #include <vector>
 
 #include "../types.hpp"
-#include "../types.cuh"
 #include "../pool/soa_pool_cuda.hpp"
 #include "../acceleration_structures/octree/OctreeAS.cuh"
 #include "../acceleration_structures/uniform_grid/UniformGridAS.cuh"

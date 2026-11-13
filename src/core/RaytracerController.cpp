@@ -12,6 +12,7 @@
 #include "../cuda_common.hpp"
 #include "../../vkbase/extensions/Assets/assets.h"
 #include <ranges>
+#include <clip.h>
 
 SceneData::SceneData() : explorer(std::make_unique<ContainerExplorer>()) {}
 SceneData::~SceneData() = default;
@@ -338,7 +339,46 @@ void RaytracerController::ui_image()
 
         ImGui::Image(image_to_present->image_imgui, display_size);
         ui_surface_input();
+
+        if (ImGui::BeginPopupContextItem("##ImageContextMenu"))
+        {
+            if (ImGui::MenuItem("Copy Image"))
+            {
+                copy_image_to_clipboard();
+            }
+            ImGui::EndPopup();
+        }
     }
+}
+
+void RaytracerController::copy_image_to_clipboard()
+{
+    if (!swap_chain)
+        return;
+
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    if (!swap_chain->copyPresentedImageToHost(pixels, width, height) || pixels.empty())
+        return;
+
+    clip::image_spec spec;
+    spec.width = width;
+    spec.height = height;
+    spec.bits_per_pixel = 32;
+    spec.bytes_per_row = width * 4;
+    spec.red_mask = 0x000000ff;
+    spec.green_mask = 0x0000ff00;
+    spec.blue_mask = 0x00ff0000;
+    spec.alpha_mask = 0xff000000;
+    spec.red_shift = 0;
+    spec.green_shift = 8;
+    spec.blue_shift = 16;
+    spec.alpha_shift = 24;
+
+    clip::image img(reinterpret_cast<const char*>(pixels.data()), spec);
+    clip::set_image(img);
 }
 
 void RaytracerController::ui_toolbar()

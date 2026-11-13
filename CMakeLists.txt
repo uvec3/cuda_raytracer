@@ -32,6 +32,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(optix_headers)
 
+# CLIP
+set(CLIP_EXAMPLES OFF CACHE BOOL "Compile clip examples" FORCE)
+set(CLIP_TESTS OFF CACHE BOOL "Compile clip tests" FORCE)
+FetchContent_Declare(
+        clip
+        GIT_REPOSITORY https://github.com/dacap/clip.git
+        GIT_TAG        main
+        GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(clip)
+
 
 add_executable(Raytracer main.cpp
         src/core/RaytracerController.cpp src/core/RaytracerController_cuda.cu src/core/RaytracerController.hpp
@@ -121,6 +132,7 @@ target_link_libraries(Raytracer
         imgui_container_explorer::imgui_container_explorer
 
         CUDA::cudart CUDA::cuda_driver
+        clip
 )
 
 add_subdirectory(tests)

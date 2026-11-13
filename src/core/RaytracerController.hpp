@@ -115,6 +115,8 @@ public:
 
     void ui_image();
 
+    void copy_image_to_clipboard();
+
     void ui_toolbar();
 
     bool ui_rendering_parameters();
