@@ -1,4 +1,5 @@
 #include "OctreeAS.cuh"
+#include <chrono>
 #include <thrust/device_vector.h>
 #include <thrust/fill.h>
 #include <thrust/sort.h>
@@ -86,6 +87,31 @@ void OctreeAS::config_ui()
     }
 }
 
+void OctreeAS::info_ui(uint32_t space_id, Space space)
+{
+    auto it = m_build_times_ms.find(space_id);
+    if (it != m_build_times_ms.end())
+    {
+        ImGui::Text("  Build Time: %.2f ms", it->second);
+    }
+
+    const size_t nodes_bytes = static_cast<size_t>(space.as_size) * sizeof(int);
+    const size_t content_bytes = static_cast<size_t>(space.box_content_size) * sizeof(BoxContent);
+    const size_t as_bytes = nodes_bytes + content_bytes;
+    const size_t geom_bytes = space_geometry_bytes(space);
+    const size_t total_bytes = as_bytes + geom_bytes;
+
+    ImGui::Text("  Boxes:      %u (%u node blocks)", (uint32_t)space.as_size, (uint32_t)(space.as_size / 9));
+    ImGui::Text("  Contents:   %u", (uint32_t)space.box_content_size);
+    ImGui::Text("  Primitives: %u slots", (uint32_t)space.primitives_size);
+    ImGui::Text("  Vertices:   %u", (uint32_t)space.vertices_size);
+    ImGui::Text("  AS Memory:  %s", format_bytes(as_bytes).c_str());
+    ImGui::Text("    Nodes:    %s", format_bytes(nodes_bytes).c_str());
+    ImGui::Text("    Contents: %s", format_bytes(content_bytes).c_str());
+    ImGui::Text("  Geo Memory: %s", format_bytes(geom_bytes).c_str());
+    ImGui::Text("  Total Size: %s", format_bytes(total_bytes).c_str());
+}
+
 OctreeAS::OctreeAS(GeometryContext* geometry_context)
     : m_geometry_context(geometry_context)
 {
@@ -98,6 +124,7 @@ OctreeAS::OctreeAS(GeometryContext* geometry_context)
 
 void OctreeAS::free_space(uint32_t space_id, Space space)
 {
+    m_build_times_ms.erase(space_id);
     if (space.as_size > 0)
     {
         free_box(space.as_start);
@@ -903,6 +930,8 @@ void OctreeAS::insert_triangles(uint32_t space_id, Space space, uint32_t primiti
 void OctreeAS::build(uint32_t space_id, Space space)
 {
     assert(m_geometry_context != nullptr);
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     uint32_t occupied_slots = Triangle::occupied_slots;
     if (config.triangle_type == PrimitiveType::FullTriangle)
         occupied_slots = InlinedTriangle::occupied_slots;
@@ -914,6 +943,9 @@ void OctreeAS::build(uint32_t space_id, Space space)
     insert_triangles(space_id, space, space.primitives_start, number_of_triangles, occupied_slots,
                      config.min_depth, config.max_depth, config.triangle_to_box_stop_ratio, config.use_gpu);
     sync_to_device();
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 

@@ -38,6 +38,8 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::Checkbox("Show triangles",&p.show_triangles);
         ImGui::Checkbox("Show boxes",&p.show_boxes);
         ImGui::InputInt("Time max",&p.time_max);
+        ImGui::DragFloat("Iterations max",&p.iterations_max,1.0f,1.0f,10000.0f);
+        ImGui::DragFloat("Boxes max",&p.boxes_max,1.0f,1.0f,10000.0f);
         ImGui::Checkbox("Fake normals",&p.use_fake_normals);
         ImGui::Checkbox("Nagata patch",&p.renderNagata);
         ImGui::Checkbox("Fixed light source",&p.fixed_light_source);

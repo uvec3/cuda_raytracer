@@ -20,7 +20,10 @@ void Raytracer::update_parameters(Scene& scene, uint32_t width, uint32_t height)
     parameters.width=width;
     parameters.height=height;
 
+    uint32_t active_space = scene.get_active_space();
+    parameters.active_as_type = scene.spaces.is_allocated(active_space) ? scene.spaces[active_space].as_type : ASType::Octree;
     parameters.as_octree = scene.as_octree.device_view();
+    parameters.as_uniform_grid = scene.as_uniform_grid.device_view();
     parameters.vertices = scene.geometry_context.vertices.view();
     parameters.materials = scene.geometry_context.materials.view();
     parameters.primitives = scene.geometry_context.primitives.view();
@@ -35,7 +38,9 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
     {
         scene.as_optix.render(active_space, surface, parameters, stream);
     }
-    else if (scene.spaces.is_allocated(active_space) && scene.spaces[active_space].as_type == ASType::Octree)
+    else if (scene.spaces.is_allocated(active_space) &&
+             (scene.spaces[active_space].as_type == ASType::Octree ||
+              scene.spaces[active_space].as_type == ASType::UniformGrid))
     {
         uint32_t block_dim_x=16;//must be multiple of 8
         uint32_t block_dim_y=16;//must be multiple of 8

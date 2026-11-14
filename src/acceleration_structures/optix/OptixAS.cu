@@ -5,7 +5,9 @@
 #include <optix_stubs.h>
 #include <optix_stack_size.h>
 #include <cuda_runtime.h>
+#include <chrono>
 #include <iostream>
+#include "imgui.h"
 
 #include "params.hpp"
 #include "../../cuda_common.hpp"
@@ -309,6 +311,8 @@ void OptixAS::init_pipeline()
 
 void OptixAS::build(uint32_t space_id, Space space)
 {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     if (!m_pipeline_initialized)
     {
         init_pipeline();
@@ -388,11 +392,14 @@ void OptixAS::build(uint32_t space_id, Space space)
     CUDA_CHECK(cudaStreamSynchronize(0));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp_buffer)));
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     OptixSpaceData data{};
     data.gas_handle = gas_handle;
     data.gas_output_buffer = d_gas_output_buffer;
     data.gas_output_size = gas_buffer_sizes.outputSizeInBytes;
     data.primitives_start = space.primitives_start;
+    data.build_time_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_spaces[space_id] = data;
 }
 
@@ -407,6 +414,26 @@ void OptixAS::free_space(uint32_t space_id, Space space)
         }
         m_spaces.erase(it);
     }
+}
+
+void OptixAS::info_ui(uint32_t space_id, Space space)
+{
+    size_t gas_bytes = 0;
+    auto it = m_spaces.find(space_id);
+    if (it != m_spaces.end())
+    {
+        ImGui::Text("  Build Time: %.2f ms", it->second.build_time_ms);
+        gas_bytes = it->second.gas_output_size;
+    }
+
+    const size_t geom_bytes = space_geometry_bytes(space);
+    const size_t total_bytes = gas_bytes + geom_bytes;
+
+    ImGui::Text("  Primitives: %u slots", (uint32_t)space.primitives_size);
+    ImGui::Text("  Vertices:   %u", (uint32_t)space.vertices_size);
+    ImGui::Text("  AS Memory:  %s (OptiX GAS)", format_bytes(gas_bytes).c_str());
+    ImGui::Text("  Geo Memory: %s", format_bytes(geom_bytes).c_str());
+    ImGui::Text("  Total Size: %s", format_bytes(total_bytes).c_str());
 }
 
 void OptixAS::render(uint32_t space_id, cudaSurfaceObject_t surface, const RenderParameters& p, cudaStream_t stream)

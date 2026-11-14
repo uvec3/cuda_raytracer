@@ -1,9 +1,14 @@
 #pragma once
 
+#include "../../raytracer/rt_shaders.cuh"
+
 struct OctreeASDeviceView
 {
     soa::soa_view<int> as;
     soa::soa_view<BoxContent> box_content;
+
+    template <typename RenderParams>
+    __host__ __device__ inline glm::vec4 first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const;
 };
 
 struct TriangleNumberId
@@ -253,4 +258,81 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
 {
     glm::vec3 current_pos = pos + dir * current_box.t_max;
     return traverse_stackless(as, current_box, pos, current_pos, dir, iterations);
+}
+
+template <typename RenderParams>
+__host__ __device__ inline
+glm::vec4 OctreeASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const
+{
+    //current source can propagate through the acceleration structure
+    auto current_source=source;
+    static constexpr int max_iterations=500;
+    //counts how many boxes were hit on the way
+    int box_hits=0;
+    //records triangles
+    glm::vec4 hit_primitive_color{0};
+
+    //current container and box
+    int32_t container_id=INT32_MAX;
+    CurrentBox current_box{.id = p.root_box};
+
+    //count the number of iterations to prevent infinite or too long propagations
+    //one iteration is a one horizontal step through octree
+    int it=0;
+    bool continue_traversal=true;
+    while (container_id!=0 && continue_traversal && it<max_iterations)
+    {
+        //AS TRAVERSAL STEP (returns after hitting non-empty leaf node)
+        TraversalResult result=traverse_stackless(&as[0], current_box, source, current_source, direction, it);
+        container_id=result.content;
+
+        if (container_id>0)
+        {
+            uint32_t closest_triangle=UINT32_MAX;
+            glm::vec3 closest_tuv{INFINITY,0,0};
+            ++box_hits;
+
+            if (p.show_triangles)
+            {
+                intersect_box_primitives(
+                    box_content,
+                    static_cast<uint32_t>(container_id),
+                    p,
+                    source,
+                    direction,
+                    current_box.t_min,
+                    current_box.t_max,
+                    closest_triangle,
+                    closest_tuv);
+            }
+
+            if (closest_triangle!=UINT32_MAX)
+            {
+                auto res=fragment_hit_shader(closest_triangle,source,direction,closest_tuv,p,continue_traversal);
+                hit_primitive_color=blend_colors(hit_primitive_color,res);
+                if (continue_traversal)
+                {
+                    current_box.t_min=1e-4f;
+                    current_box.t_max=1e-4f;
+                }
+            }
+        }
+
+        if (current_box.stack.depth()==0)//even though the content was return the stack depth 0 means that that was the last box
+        {
+            break;
+        }
+    }
+
+    if (it==max_iterations)//return white to indicate that the loop was interrupted
+        return glm::vec4{1.f};
+
+    if (!p.show_iterations && !p.show_boxes)
+    {
+        if (current_box.stack.depth()==0)//call miss shader
+            hit_primitive_color=blend_colors(hit_primitive_color,miss_shader(source,direction,p));
+        return hit_primitive_color;
+    }
+
+    return compose_debug_overlay(p, hit_primitive_color, it, box_hits);
 }

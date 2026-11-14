@@ -5,6 +5,7 @@
 #include "../types.hpp"
 #include "../geometry_common.cuh"
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
+#include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 
 
 enum class ProjectionType
@@ -29,6 +30,8 @@ struct RenderParameters
     bool show_triangles = true;
     bool show_boxes = false;
     int time_max = 50000;
+    float iterations_max = 25.0f;
+    float boxes_max = 10.0f;
 
     //lighting
     float ambient_light = 0.1f;
@@ -59,7 +62,9 @@ struct RenderParameters
     glm::vec2 az_c = {1.0f, 0.0f};
 
     //AS
+    ASType active_as_type = ASType::Octree;
     OctreeASDeviceView as_octree{};
+    UniformGridASDeviceView as_uniform_grid{};
 
     //geometry context
     soa::soa_view<PrimitiveChunk16> primitives{};

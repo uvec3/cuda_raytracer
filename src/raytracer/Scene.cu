@@ -118,6 +118,7 @@ Scene::Scene(Scene&& other) noexcept
     , m_root_box(other.m_root_box)
 {
     as_octree.bind_geometry_context(&geometry_context);
+    as_uniform_grid.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
     other.m_textures.clear();
     other.m_is_loaded = false;
@@ -146,6 +147,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         m_root_box = other.m_root_box;
 
         as_octree.bind_geometry_context(&geometry_context);
+    as_uniform_grid.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
         other.m_textures.clear();
         other.m_is_loaded = false;
@@ -260,8 +262,18 @@ void Scene::free_space(uint32_t space_id)
     if (!spaces.is_allocated(space_id))
         return;
     auto space = spaces[space_id];
-    as_octree.free_space(space_id, space);
-    as_optix.free_space(space_id, space);
+    if (space.as_type == ASType::Octree)
+    {
+        as_octree.free_space(space_id, space);
+    }
+    else if (space.as_type == ASType::UniformGrid)
+    {
+        as_uniform_grid.free_space(space_id, space);
+    }
+    else if (space.as_type == ASType::Optix)
+    {
+        as_optix.free_space(space_id, space);
+    }
     if (space.vertices_size > 0)
     {
         geometry_context.vertices.free(space.vertices_start);
@@ -292,30 +304,37 @@ struct MaxVec3 {
     }
 };
 
-void Scene::normalize_space(uint32_t space_id, bool stretch)
+void Scene::normalize_space(uint32_t space_id, bool stretch, bool margin)
 {
-    auto vertices_start = &geometry_context.vertices[spaces[space_id].vertices_start].position;
     auto vertices_size = spaces[space_id].vertices_size;
+    if (vertices_size == 0)
+        return;
+    auto vertices_start = &geometry_context.vertices[spaces[space_id].vertices_start].position;
 
     constexpr float inf = std::numeric_limits<float>::infinity();
     auto aabb_min = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(inf), MinVec3{});
     auto aabb_max = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(-inf), MaxVec3{});
     auto aabb_size = aabb_max - aabb_min;
 
+    const float scale_factor = margin ? 0.98f : 1.0f;
+    const float offset = margin ? 0.01f : 0.0f;
+
     glm::vec3 normalization_translate = -aabb_min;
     glm::vec3 normalization_scale;
     if (stretch)
     {
-        normalization_scale = glm::vec3(1) / (aabb_size) * 0.98f;
+        glm::vec3 safe_size = glm::max(aabb_size, glm::vec3(1e-7f));
+        normalization_scale = glm::vec3(scale_factor) / safe_size;
     }
     else
     {
-        normalization_scale = glm::vec3(1) / glm::vec3(glm::max(glm::max(aabb_size.x, aabb_size.y), aabb_size.z)) * 0.98f;
+        float max_axis = glm::max(glm::max(aabb_size.x, aabb_size.y), aabb_size.z);
+        normalization_scale = (max_axis > 0.0f) ? glm::vec3(scale_factor / max_axis) : glm::vec3(1.0f);
     }
 
     thrust::transform(thrust::device, vertices_start, vertices_start + vertices_size, vertices_start, [=] __device__(const glm::vec3& v)
     {
-        return (v + normalization_translate) * normalization_scale + 0.01f;
+        return (v + normalization_translate) * normalization_scale + offset;
     });
 
     spaces[space_id].normalization_translate = normalization_translate;

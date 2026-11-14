@@ -25,6 +25,13 @@ void OctreeAS::register_containers(ContainerExplorer& explorer)
     explorer.register_container("octree.box_content", box_content);
 }
 
+void UniformGridAS::register_containers(ContainerExplorer& explorer)
+{
+    explorer.register_container("uniform_grid.grids", grids);
+    explorer.register_container("uniform_grid.as", as);
+    explorer.register_container("uniform_grid.box_content", box_content);
+}
+
 
 RaytracerController::RaytracerController()
 {
@@ -105,6 +112,7 @@ void RaytracerController::initScenes()
         s.scene->load(scene_data);
 
         s.scene->as_octree.register_containers(*s.explorer);
+        s.scene->as_uniform_grid.register_containers(*s.explorer);
         s.explorer->register_container("scene.materials", s.scene->m_materials, [this, sc = s.scene.get()](std::size_t)
         {
             std::lock_guard lock(device_data_mutex);
@@ -458,6 +466,7 @@ static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_s
         std::string type_name = "AS";
         if (node.as_ref.type == ASType::Optix) type_name = "OptiX";
         else if (node.as_ref.type == ASType::Octree) type_name = "Octree";
+        else if (node.as_ref.type == ASType::UniformGrid) type_name = "UniformGrid";
         else if (node.as_ref.type == ASType::BVH) type_name = "BVH";
         label += " [" + type_name + " #" + std::to_string(node.as_ref.space_id) + "]";
     }
@@ -590,14 +599,21 @@ bool RaytracerController::ui_scenes_manager()
 
             if (node.as_ref.is_valid())
             {
-                const char* type_str = (node.as_ref.type == ASType::Optix) ? "OptiX" : (node.as_ref.type == ASType::Octree) ? "Octree" : "BVH";
+                const char* type_str = "Unknown";
+                if (node.as_ref.type == ASType::Optix) type_str = "OptiX";
+                else if (node.as_ref.type == ASType::Octree) type_str = "Octree";
+                else if (node.as_ref.type == ASType::UniformGrid) type_str = "UniformGrid";
+                else if (node.as_ref.type == ASType::BVH) type_str = "BVH";
                 ImGui::Text("Status: Built (%s, Space #%u)", type_str, node.as_ref.space_id);
                 if (active_scene.spaces.is_allocated(node.as_ref.space_id))
                 {
                     auto sp = active_scene.spaces[node.as_ref.space_id];
-                    ImGui::Text("  Boxes:      %u", (uint32_t)sp.as_size);
-                    ImGui::Text("  Contents:   %u", (uint32_t)sp.box_content_size);
-                    ImGui::Text("  Primitives: %u", (uint32_t)sp.primitives_size);
+                    if (node.as_ref.type == ASType::Octree)
+                        active_scene.as_octree.info_ui(node.as_ref.space_id, sp);
+                    else if (node.as_ref.type == ASType::UniformGrid)
+                        active_scene.as_uniform_grid.info_ui(node.as_ref.space_id, sp);
+                    else if (node.as_ref.type == ASType::Optix)
+                        active_scene.as_optix.info_ui(node.as_ref.space_id, sp);
                 }
                 if (active_scene.get_active_space() == node.as_ref.space_id)
                 {
@@ -609,10 +625,11 @@ bool RaytracerController::ui_scenes_manager()
                 ImGui::Text("Status: Not built");
             }
 
-            static int selected_as_type = 0; // 0: Octree, 1: BVH, 2: OptiX
-            const char* as_type_names[] = {"Octree", "BVH (Coming soon)", "OptiX (Hardware RT)"};
-            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 3);
+            static int selected_as_type = 0; // 0: Octree, 1: Uniform Grid, 2: BVH, 3: OptiX
+            const char* as_type_names[] = {"Octree", "Uniform Grid", "BVH (Coming soon)", "OptiX (Hardware RT)"};
+            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 4);
 
+            ImGui::BeginDisabled(sub_triangles == 0 || selected_as_type == 2);
             if (ImGui::Button("Build AS"))
             {
                 pause();
@@ -626,7 +643,9 @@ bool RaytracerController::ui_scenes_manager()
                 auto relative_meshes = active_scene.get_mesh_transform(&node);
                 if (!relative_meshes.empty())
                 {
-                    ASType as_type = (selected_as_type == 2) ? ASType::Optix : ASType::Octree;
+                    ASType as_type = ASType::Octree;
+                    if (selected_as_type == 1) as_type = ASType::UniformGrid;
+                    else if (selected_as_type == 3) as_type = ASType::Optix;
                     uint32_t new_space_id = active_scene.build_as(
                         relative_meshes, as_type);
                     node.as_ref = {new_space_id, as_type};
@@ -640,19 +659,21 @@ bool RaytracerController::ui_scenes_manager()
                 if (auto_play)
                     play();
             }
+            ImGui::EndDisabled();
 
             if (selected_as_type == 0)
             {
                 active_scene.as_octree.config_ui();
+            }
+            else if (selected_as_type == 1)
+            {
+                active_scene.as_uniform_grid.config_ui();
             }
 
             ImGui::Separator();
 
             ImGui::Checkbox("Auto select for render after build", &auto_select);
             ImGui::Checkbox("Auto play after build", &auto_play);
-            ImGui::BeginDisabled(sub_triangles == 0 || (selected_as_type != 0 && selected_as_type != 2));
-
-            ImGui::EndDisabled();
 
             ImGui::SameLine();
 

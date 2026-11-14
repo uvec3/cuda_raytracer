@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <unordered_map>
 #include "../../types.hpp"
 #include "../../pool/soa_pool_cuda.hpp"
 #include "../../geometry_common.cuh"
@@ -46,6 +47,7 @@ public:
     }
 
     void config_ui();
+    void info_ui(uint32_t space_id, Space space);
     void register_containers(ContainerExplorer& explorer);
 
     void build(uint32_t space_id, Space space);
@@ -79,6 +81,9 @@ public:
     };
 
     Config config;
+
+private:
+    std::unordered_map<uint32_t, double> m_build_times_ms;
 };
 
 // static_assert(AS<OctreeAS>); // OctreeAS implements AS concept

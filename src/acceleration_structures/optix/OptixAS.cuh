@@ -23,6 +23,7 @@ struct OptixSpaceData
     CUdeviceptr gas_output_buffer = 0;
     size_t gas_output_size = 0;
     uint32_t primitives_start = 0;
+    double build_time_ms = 0.0;
 };
 
 class OptixAS
@@ -91,4 +92,5 @@ public:
     }
 
     void register_containers(ContainerExplorer& explorer) {}
+    void info_ui(uint32_t space_id, Space space);
 };

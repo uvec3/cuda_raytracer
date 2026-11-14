@@ -18,8 +18,10 @@ target_link_libraries(traversal_test PRIVATE gtest_main glm::glm)
 
 
 add_executable(scene_test scene_test.cpp
+        ../src/raytracer/Raytracer.cu ../src/raytracer/Raytracer.cuh
         ../src/raytracer/Scene.cu ../src/raytracer/Scene.hpp
         ../src/acceleration_structures/octree/OctreeAS.cu
+        ../src/acceleration_structures/uniform_grid/UniformGridAS.cu
         ../src/acceleration_structures/optix/OptixAS.cu
         ../external/tinygltf.cpp ../external/tiny_gltf_v3.h
         ../external/stb_image.cpp ../external/stb_image.h

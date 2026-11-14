@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include "../src/raytracer/Scene.hpp"
+#include "../src/raytracer/Raytracer.cuh"
 #include "../src/raytracer/RenderParameters.hpp"
 #include "../src/acceleration_structures/octree/OctreeGeometry.cuh"
+#include "../src/acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../vkbase/extensions/Assets/assets.h"
 
 TEST(Scene, Load)
@@ -864,6 +869,307 @@ TEST(OptixAS, BuildMultipleSpacesAndFree)
     scene.free_space(space2);
     EXPECT_FALSE(scene.as_optix.is_valid(space2));
     EXPECT_FALSE(scene.as_optix.is_valid());
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+namespace
+{
+    int count_uniform_grid_teapot_hits(Scene& scene, uint32_t space_id, PrimitiveType expected_type)
+    {
+        const int grid_id = scene.spaces[space_id].root_box;
+        EXPECT_GE(grid_id, 0);
+        const auto grid = scene.as_uniform_grid.grids[static_cast<size_t>(grid_id)];
+        const glm::vec3 grid_max = glm::vec3(grid.dims) * grid.cell_size;
+
+        soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+        soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
+
+        int hit_count = 0;
+        for (int ix = 0; ix < 9; ++ix)
+        {
+            for (int iz = 0; iz < 9; ++iz)
+            {
+                const float x = grid_max.x * (0.1f + 0.8f * (static_cast<float>(ix) / 8.0f));
+                const float z = grid_max.z * (0.1f + 0.8f * (static_cast<float>(iz) / 8.0f));
+                const glm::vec3 origin(x, -0.5f, z);
+                const glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+                CurrentGridCell state{};
+                state.grid_id = grid_id;
+                int it = 0;
+                bool hit_triangle = false;
+
+                while (!hit_triangle && it < 500)
+                {
+                    uint32_t container_id = traverse_uniform_grid(
+                        &scene.as_uniform_grid.as[0],
+                        grid.dims,
+                        grid.cell_size,
+                        grid.as_start,
+                        state,
+                        origin,
+                        dir,
+                        it);
+                    if (container_id == 0)
+                        break;
+
+                    for (; !hit_triangle; ++container_id)
+                    {
+                        auto bc = scene.as_uniform_grid.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
+                        EXPECT_EQ(chunk0.type(), expected_type);
+
+                        float t = 0.0f, u = 0.0f, v = 0.0f;
+                        bool hit = false;
+                        if (chunk0.type() == PrimitiveType::Triangle)
+                        {
+                            const Triangle tri = chunk0.as<Triangle>();
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[tri.v0].position),
+                                glm::vec3(host_vertices[tri.v1].position),
+                                glm::vec3(host_vertices[tri.v2].position),
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::FullTriangle)
+                        {
+                            const InlinedTriangle ftri = load_primitive<InlinedTriangle>(host_primitives, bc.id(), chunk0);
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                ftri.v0, ftri.v1, ftri.v2,
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::NagataPatch)
+                        {
+                            const NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(host_primitives, bc.id(), chunk0);
+                            hit = intersectNagataPrecomputed(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[patch.v0].position),
+                                glm::vec3(host_vertices[patch.v1].position),
+                                glm::vec3(host_vertices[patch.v2].position),
+                                patch.C12, patch.C23, patch.C31,
+                                t, u, v);
+                        }
+
+                        if (hit)
+                        {
+                            hit_triangle = true;
+                            break;
+                        }
+                        if (bc.is_last())
+                            break;
+                    }
+                    if (state.exited)
+                        break;
+                }
+
+                if (hit_triangle)
+                    ++hit_count;
+            }
+        }
+        return hit_count;
+    }
+} // namespace
+
+TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = true;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+
+    EXPECT_EQ(scene.spaces[space_id].as_type, ASType::UniformGrid);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+
+    const int grid_id = scene.spaces[space_id].root_box;
+    ASSERT_GE(grid_id, 0);
+    const auto grid = scene.as_uniform_grid.grids[static_cast<size_t>(grid_id)];
+    EXPECT_EQ(std::max({grid.dims.x, grid.dims.y, grid.dims.z}), 20u);
+    EXPECT_EQ(grid.dims.x * grid.dims.y * grid.dims.z, scene.spaces[space_id].as_size);
+
+    // Verify tight normalization: vertices start at (0,0,0), max extent is 1.0, and dims match resolution along longest axis
+    soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
+    const uint32_t v_start = scene.spaces[space_id].vertices_start;
+    const uint32_t v_size = scene.spaces[space_id].vertices_size;
+    glm::vec3 v_min(std::numeric_limits<float>::infinity());
+    glm::vec3 v_max(-std::numeric_limits<float>::infinity());
+    for (uint32_t i = 0; i < v_size; ++i)
+    {
+        const glm::vec3 p = host_vertices[v_start + i].position;
+        v_min = glm::min(v_min, p);
+        v_max = glm::max(v_max, p);
+    }
+    EXPECT_NEAR(v_min.x, 0.0f, 1e-5f);
+    EXPECT_NEAR(v_min.y, 0.0f, 1e-5f);
+    EXPECT_NEAR(v_min.z, 0.0f, 1e-5f);
+    const float max_extent = glm::max(glm::max(v_max.x, v_max.y), v_max.z);
+    EXPECT_NEAR(max_extent, 1.0f, 1e-5f);
+    EXPECT_NEAR(grid.cell_size, max_extent / 20.0f, 1e-5f);
+    EXPECT_EQ(grid.dims.x, std::clamp(static_cast<uint32_t>(std::ceil((v_max.x / grid.cell_size) - 1e-5f)), 1u, 20u));
+    EXPECT_EQ(grid.dims.y, std::clamp(static_cast<uint32_t>(std::ceil((v_max.y / grid.cell_size) - 1e-5f)), 1u, 20u));
+    EXPECT_EQ(grid.dims.z, std::clamp(static_cast<uint32_t>(std::ceil((v_max.z / grid.cell_size) - 1e-5f)), 1u, 20u));
+
+    const int hit_count = count_uniform_grid_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "UniformGrid rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(UniformGridAS, BuildAndTraverseTeapotFullTriangleGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = true;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_EQ(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_uniform_grid_teapot_hits(scene, space_id, PrimitiveType::FullTriangle);
+    std::cout << "UniformGrid rays hitting FullTriangle teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(UniformGridAS, BuildAndTraverseTeapotNagataPatchGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = true;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_uniform_grid_teapot_hits(scene, space_id, PrimitiveType::NagataPatch);
+    std::cout << "UniformGrid rays hitting NagataPatch teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(UniformGridAS, BuildAndTraverseWithoutSortAndFree)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = false;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+
+    const int hit_count = count_uniform_grid_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "UniformGrid rays hitting unsorted teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+
+    const uint32_t grid_id = static_cast<uint32_t>(scene.spaces[space_id].root_box);
+    const uint32_t as_start = scene.spaces[space_id].as_start;
+    const uint32_t bc_start = scene.spaces[space_id].box_content_start;
+
+    scene.free_space(space_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(space_id));
+    EXPECT_FALSE(scene.as_uniform_grid.grids.is_allocated(grid_id));
+    EXPECT_FALSE(scene.as_uniform_grid.as.is_allocated(as_start));
+    EXPECT_FALSE(scene.as_uniform_grid.box_content.is_allocated(bc_start));
+}
+
+TEST(UniformGridAS, RenderTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = true;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.set_active_space(space_id);
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.3f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    EXPECT_EQ(raytracer.parameters.active_as_type, ASType::UniformGrid);
+    EXPECT_NO_THROW(raytracer.draw_first_hit(scene, surface, width, height, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t non_black_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        EXPECT_EQ(px.w, 255);
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+        {
+            ++non_black_pixels;
+        }
+    }
+    std::cout << "UniformGrid rendered non-black pixels: " << non_black_pixels << " / " << (width * height) << std::endl;
+    EXPECT_GT(non_black_pixels, 0u);
+    EXPECT_LT(non_black_pixels, width * height);
 
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
