@@ -7,7 +7,7 @@
 
 //expose for the host-side debugging purposes
 __host__ __device__
-glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, RenderParameters p);
+glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& p);
 
 
 class Scene;

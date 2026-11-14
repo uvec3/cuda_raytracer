@@ -17,8 +17,8 @@ struct UniformGridASDeviceView
     soa::soa_view<uint32_t> as;
     soa::soa_view<BoxContent> box_content;
 
-    template <typename RenderParams>
-    __host__ __device__ inline glm::vec4 first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const;
+    template <bool HasNagata = true, typename RenderParams>
+    __host__ __device__ inline glm::vec4 first_hit(const RenderParams& p, glm::vec3 source, glm::vec3 direction) const;
 };
 
 struct CellPrimPair
@@ -35,16 +35,15 @@ uint32_t uniform_grid_cell_index(glm::uvec3 cell, glm::uvec3 dims)
 
 struct CurrentGridCell
 {
-    int grid_id = -1;
-    glm::ivec3 cell = glm::ivec3(0);
-    glm::ivec3 step = glm::ivec3(0);
-    glm::vec3 t_next = glm::vec3(0.0f);
-    glm::vec3 t_delta = glm::vec3(0.0f);
+    uint32_t cell_x : 10 = 0;
+    uint32_t cell_y : 10 = 0;
+    uint32_t cell_z : 10 = 0;
+    uint32_t initialized : 1 = 0;
+    uint32_t exited : 1 = 0;
     float t_min = 0.0f;
     float t_max = 0.0f;
-    bool initialized = false;
-    bool exited = false;
 };
+static_assert(sizeof(CurrentGridCell) == 12);
 
 __host__ __device__ inline uint32_t traverse_uniform_grid(
     const uint32_t* as,
@@ -58,15 +57,16 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
 {
     if (state.exited || dims.x == 0 || dims.y == 0 || dims.z == 0 || cell_size <= 0.0f)
     {
-        state.exited = true;
+        state.exited = 1;
         return 0;
     }
 
+    glm::ivec3 cell;
     if (!state.initialized)
     {
         const glm::vec3 grid_max = glm::vec3(dims) * cell_size;
 
-        float t_enter = state.t_max;
+        float t_enter = glm::max(0.0f, state.t_max);
         float t_leave = 1e30f;
 
         for (int a = 0; a < 3; ++a)
@@ -75,7 +75,7 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
             {
                 if (orig[a] < 0.0f || orig[a] > grid_max[a])
                 {
-                    state.exited = true;
+                    state.exited = 1;
                     return 0;
                 }
             }
@@ -97,48 +97,61 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
 
         if (t_enter > t_leave || t_leave < 0.0f)
         {
-            state.exited = true;
+            state.exited = 1;
             return 0;
         }
 
         const glm::vec3 p = orig + dir * t_enter;
-        state.cell = glm::clamp(
+        cell = glm::clamp(
             glm::ivec3(glm::floor(p / cell_size)),
             glm::ivec3(0),
             glm::ivec3(dims) - 1);
 
-        for (int a = 0; a < 3; ++a)
-        {
-            if (dir[a] >= 1e-20f)
-            {
-                state.step[a] = 1;
-                const float next_boundary = static_cast<float>(state.cell[a] + 1) * cell_size;
-                state.t_next[a] = (next_boundary - orig[a]) / dir[a];
-                state.t_delta[a] = cell_size / dir[a];
-            }
-            else if (dir[a] <= -1e-20f)
-            {
-                state.step[a] = -1;
-                const float next_boundary = static_cast<float>(state.cell[a]) * cell_size;
-                state.t_next[a] = (next_boundary - orig[a]) / dir[a];
-                state.t_delta[a] = -cell_size / dir[a];
-            }
-            else
-            {
-                state.step[a] = 0;
-                state.t_next[a] = 1e30f;
-                state.t_delta[a] = 1e30f;
-            }
-        }
-
-        if (state.step.x == 0 && state.step.y == 0 && state.step.z == 0)
-        {
-            state.exited = true;
-            return 0;
-        }
-
+        state.cell_x = static_cast<uint32_t>(cell.x);
+        state.cell_y = static_cast<uint32_t>(cell.y);
+        state.cell_z = static_cast<uint32_t>(cell.z);
         state.t_max = t_enter;
-        state.initialized = true;
+        state.initialized = 1;
+    }
+    else
+    {
+        cell = glm::ivec3(
+            static_cast<int>(state.cell_x),
+            static_cast<int>(state.cell_y),
+            static_cast<int>(state.cell_z));
+    }
+
+    glm::ivec3 step;
+    glm::vec3 t_next;
+    glm::vec3 t_delta;
+    for (int a = 0; a < 3; ++a)
+    {
+        if (dir[a] >= 1e-20f)
+        {
+            const float inv_d = 1.0f / dir[a];
+            step[a] = 1;
+            t_next[a] = (static_cast<float>(cell[a] + 1) * cell_size - orig[a]) * inv_d;
+            t_delta[a] = cell_size * inv_d;
+        }
+        else if (dir[a] <= -1e-20f)
+        {
+            const float inv_d = 1.0f / dir[a];
+            step[a] = -1;
+            t_next[a] = (static_cast<float>(cell[a]) * cell_size - orig[a]) * inv_d;
+            t_delta[a] = -cell_size * inv_d;
+        }
+        else
+        {
+            step[a] = 0;
+            t_next[a] = 1e30f;
+            t_delta[a] = 1e30f;
+        }
+    }
+
+    if (step.x == 0 && step.y == 0 && step.z == 0)
+    {
+        state.exited = 1;
+        return 0;
     }
 
     const int max_iterations = static_cast<int>(dims.x + dims.y + dims.z);
@@ -146,38 +159,38 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
     {
         ++iterations;
 
-        const uint32_t linear_idx = uniform_grid_cell_index(glm::uvec3(state.cell), dims);
+        const uint32_t linear_idx = uniform_grid_cell_index(glm::uvec3(cell), dims);
         const uint32_t content = as[as_start + linear_idx];
 
         float exit_t;
-        if (state.t_next.x <= state.t_next.y && state.t_next.x <= state.t_next.z)
+        if (t_next.x <= t_next.y && t_next.x <= t_next.z)
         {
-            exit_t = state.t_next.x;
-            state.cell.x += state.step.x;
-            state.t_next.x += state.t_delta.x;
-            if (state.cell.x < 0 || state.cell.x >= static_cast<int>(dims.x))
+            exit_t = t_next.x;
+            cell.x += step.x;
+            t_next.x += t_delta.x;
+            if (cell.x < 0 || cell.x >= static_cast<int>(dims.x))
             {
-                state.exited = true;
+                state.exited = 1;
             }
         }
-        else if (state.t_next.y <= state.t_next.z)
+        else if (t_next.y <= t_next.z)
         {
-            exit_t = state.t_next.y;
-            state.cell.y += state.step.y;
-            state.t_next.y += state.t_delta.y;
-            if (state.cell.y < 0 || state.cell.y >= static_cast<int>(dims.y))
+            exit_t = t_next.y;
+            cell.y += step.y;
+            t_next.y += t_delta.y;
+            if (cell.y < 0 || cell.y >= static_cast<int>(dims.y))
             {
-                state.exited = true;
+                state.exited = 1;
             }
         }
         else
         {
-            exit_t = state.t_next.z;
-            state.cell.z += state.step.z;
-            state.t_next.z += state.t_delta.z;
-            if (state.cell.z < 0 || state.cell.z >= static_cast<int>(dims.z))
+            exit_t = t_next.z;
+            cell.z += step.z;
+            t_next.z += t_delta.z;
+            if (cell.z < 0 || cell.z >= static_cast<int>(dims.z))
             {
-                state.exited = true;
+                state.exited = 1;
             }
         }
 
@@ -186,32 +199,39 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
 
         if (content > 0)
         {
+            state.cell_x = static_cast<uint32_t>(cell.x);
+            state.cell_y = static_cast<uint32_t>(cell.y);
+            state.cell_z = static_cast<uint32_t>(cell.z);
             return content;
         }
     }
 
+    state.cell_x = static_cast<uint32_t>(cell.x);
+    state.cell_y = static_cast<uint32_t>(cell.y);
+    state.cell_z = static_cast<uint32_t>(cell.z);
     if (iterations >= max_iterations)
     {
-        state.exited = true;
+        state.exited = 1;
     }
 
     return 0;
 }
 
 __host__ __device__ inline uint32_t traverse_uniform_grid(
-    UniformGridASDeviceView view,
+    const UniformGridASDeviceView& view,
+    int grid_id,
     CurrentGridCell& state,
     glm::vec3 orig,
     glm::vec3 dir,
     int& iterations)
 {
-    if (state.exited || state.grid_id < 0)
+    if (state.exited || grid_id < 0)
     {
-        state.exited = true;
+        state.exited = 1;
         return 0;
     }
 
-    const auto grid = view.grids[static_cast<uint32_t>(state.grid_id)];
+    const auto grid = view.grids[static_cast<uint32_t>(grid_id)];
     return traverse_uniform_grid(
         &view.as[0],
         grid.dims,
@@ -223,33 +243,28 @@ __host__ __device__ inline uint32_t traverse_uniform_grid(
         iterations);
 }
 
-template <typename RenderParams>
+template <bool HasNagata, typename RenderParams>
 __host__ __device__ inline
-glm::vec4 UniformGridASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const
+glm::vec4 UniformGridASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, glm::vec3 direction) const
 {
     if (p.root_box < 0)
         return miss_shader(source, direction, p);
 
-    const auto grid = grids[static_cast<uint32_t>(p.root_box)];
-    const glm::uvec3 dims = grid.dims;
-    const float cell_size = grid.cell_size;
-    const uint32_t as_start = grid.as_start;
-    const int max_iterations = static_cast<int>(dims.x + dims.y + dims.z);
+    constexpr int max_iterations = 2000;
 
     int box_hits = 0;
     glm::vec4 hit_primitive_color{0};
 
     uint32_t container_id = UINT32_MAX;
-    CurrentGridCell current_cell{.grid_id = p.root_box};
+    CurrentGridCell current_cell{};
 
     int it = 0;
-    int total_it = 0;
     int bounce = 0;
     bool continue_traversal = true;
 
     while (container_id != 0 && continue_traversal && it < max_iterations)
     {
-        container_id = traverse_uniform_grid(&as[0], dims, cell_size, as_start, current_cell, source, direction, it);
+        container_id = traverse_uniform_grid(*this, p.root_box, current_cell, source, direction, it);
 
         if (container_id > 0)
         {
@@ -259,7 +274,7 @@ glm::vec4 UniformGridASDeviceView::first_hit(RenderParams p, glm::vec3 source, g
 
             if (p.show_triangles)
             {
-                intersect_box_primitives(
+                intersect_box_primitives<HasNagata>(
                     box_content,
                     container_id,
                     p,
@@ -273,15 +288,13 @@ glm::vec4 UniformGridASDeviceView::first_hit(RenderParams p, glm::vec3 source, g
 
             if (closest_triangle != UINT32_MAX)
             {
-                auto res = fragment_hit_shader(closest_triangle, source, direction, closest_tuv, p, continue_traversal);
+                auto res = fragment_hit_shader<HasNagata>(closest_triangle, source, direction, closest_tuv, p, continue_traversal);
                 hit_primitive_color = blend_colors(hit_primitive_color, res);
                 if (continue_traversal)
                 {
                     if (++bounce < 8)
                     {
-                        total_it += it;
-                        it = 0;
-                        current_cell = CurrentGridCell{.grid_id = p.root_box, .t_min = 1e-4f, .t_max = 1e-4f};
+                        current_cell = CurrentGridCell{.t_min = 1e-4f, .t_max = 1e-4f};
                     }
                     else
                     {
@@ -297,8 +310,6 @@ glm::vec4 UniformGridASDeviceView::first_hit(RenderParams p, glm::vec3 source, g
         }
     }
 
-    total_it += it;
-
     if (it >= max_iterations)
         return glm::vec4{1.f};
 
@@ -309,5 +320,5 @@ glm::vec4 UniformGridASDeviceView::first_hit(RenderParams p, glm::vec3 source, g
         return hit_primitive_color;
     }
 
-    return compose_debug_overlay(p, hit_primitive_color, total_it, box_hits);
+    return compose_debug_overlay(p, hit_primitive_color, it, box_hits);
 }

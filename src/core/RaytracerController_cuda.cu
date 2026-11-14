@@ -41,7 +41,6 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::DragFloat("Iterations max",&p.iterations_max,1.0f,1.0f,10000.0f);
         ImGui::DragFloat("Boxes max",&p.boxes_max,1.0f,1.0f,10000.0f);
         ImGui::Checkbox("Fake normals",&p.use_fake_normals);
-        ImGui::Checkbox("Nagata patch",&p.renderNagata);
         ImGui::Checkbox("Fixed light source",&p.fixed_light_source);
         ImGui::DragFloat3("Light source",&p.light_source[0],0.01);
         ImGui::DragFloat("Diffuse lightning",&p.diffuse_light,0.01);
@@ -240,7 +239,7 @@ void RaytracerController::ui_surface_input()
 }
 
 
-__global__ void evaluate_single_pixel_kernel(uint32_t x, uint32_t y, RenderParameters p, glm::vec4* result)
+__global__ void evaluate_single_pixel_kernel(uint32_t x, uint32_t y, const __grid_constant__ RenderParameters p, glm::vec4* result)
 {
     *result = trace_pixel_first_hit(x, y, p);
 }

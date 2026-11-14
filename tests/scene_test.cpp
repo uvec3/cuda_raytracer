@@ -7,6 +7,7 @@
 #include "../src/raytracer/RenderParameters.hpp"
 #include "../src/acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../src/acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
+#include "../src/acceleration_structures/kdtree/KDTreeGeometry.cuh"
 #include "../vkbase/extensions/Assets/assets.h"
 
 TEST(Scene, Load)
@@ -897,7 +898,6 @@ namespace
                 const glm::vec3 dir(0.0f, 1.0f, 0.0f);
 
                 CurrentGridCell state{};
-                state.grid_id = grid_id;
                 int it = 0;
                 bool hit_triangle = false;
 
@@ -1173,4 +1173,310 @@ TEST(UniformGridAS, RenderTeapotGPU)
 
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
+}
+
+namespace
+{
+    int count_kdtree_teapot_hits(Scene& scene, uint32_t space_id, PrimitiveType expected_type)
+    {
+        const int tree_id = scene.spaces[space_id].root_box;
+        EXPECT_GE(tree_id, 0);
+        const auto tree = scene.as_kdtree.trees[static_cast<size_t>(tree_id)];
+        const glm::vec3 bounds_min = tree.bounds_min;
+        const glm::vec3 bounds_max = tree.bounds_max;
+
+        soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+        soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
+
+        int hit_count = 0;
+        for (int ix = 0; ix < 9; ++ix)
+        {
+            for (int iz = 0; iz < 9; ++iz)
+            {
+                const float x = bounds_min.x + (bounds_max.x - bounds_min.x) * (0.1f + 0.8f * (static_cast<float>(ix) / 8.0f));
+                const float z = bounds_min.z + (bounds_max.z - bounds_min.z) * (0.1f + 0.8f * (static_cast<float>(iz) / 8.0f));
+                const glm::vec3 origin(x, -0.5f, z);
+                const glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+                CurrentKDNode state{};
+                KDStackEntry stack[CurrentKDNode::SHORT_STACK_SIZE];
+                int it = 0;
+                bool hit_triangle = false;
+
+                while (!hit_triangle && it < 500)
+                {
+                    uint32_t container_id = traverse_kdtree(
+                        &scene.as_kdtree.as[0],
+                        bounds_min,
+                        bounds_max,
+                        tree.as_start,
+                        state,
+                        stack,
+                        origin,
+                        dir,
+                        it);
+                    if (container_id == 0)
+                        break;
+
+                    for (; !hit_triangle; ++container_id)
+                    {
+                        auto bc = scene.as_kdtree.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
+                        EXPECT_EQ(chunk0.type(), expected_type);
+
+                        float t = 0.0f, u = 0.0f, v = 0.0f;
+                        bool hit = false;
+                        if (chunk0.type() == PrimitiveType::Triangle)
+                        {
+                            const Triangle tri = chunk0.as<Triangle>();
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[tri.v0].position),
+                                glm::vec3(host_vertices[tri.v1].position),
+                                glm::vec3(host_vertices[tri.v2].position),
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::FullTriangle)
+                        {
+                            const InlinedTriangle ftri = load_primitive<InlinedTriangle>(host_primitives, bc.id(), chunk0);
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                ftri.v0, ftri.v1, ftri.v2,
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::NagataPatch)
+                        {
+                            const NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(host_primitives, bc.id(), chunk0);
+                            hit = intersectNagataPrecomputed(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[patch.v0].position),
+                                glm::vec3(host_vertices[patch.v1].position),
+                                glm::vec3(host_vertices[patch.v2].position),
+                                patch.C12, patch.C23, patch.C31,
+                                t, u, v);
+                        }
+
+                        if (hit)
+                        {
+                            hit_triangle = true;
+                            break;
+                        }
+                        if (bc.is_last())
+                            break;
+                    }
+                    if (state.exited)
+                        break;
+                }
+
+                if (hit_triangle)
+                    ++hit_count;
+            }
+        }
+        return hit_count;
+    }
+} // namespace
+
+TEST(KDTreeAS, BuildAndTraverseTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
+    scene.as_kdtree.config.use_gpu = true;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = true;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+
+    EXPECT_EQ(scene.spaces[space_id].as_type, ASType::KDTree);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_GE(scene.spaces[space_id].root_box, 0);
+
+    const int hit_count = count_kdtree_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "KDTree (SAH GPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(KDTreeAS, BuildAndTraverseTeapotFullTriangleGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
+    scene.as_kdtree.config.use_gpu = true;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = true;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_EQ(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_kdtree_teapot_hits(scene, space_id, PrimitiveType::FullTriangle);
+    std::cout << "KDTree (FullTriangle GPU) rays hitting teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(KDTreeAS, BuildAndTraverseTeapotNagataPatchGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
+    scene.as_kdtree.config.use_gpu = true;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = true;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_kdtree_teapot_hits(scene, space_id, PrimitiveType::NagataPatch);
+    std::cout << "KDTree (NagataPatch GPU) rays hitting teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(KDTreeAS, BuildAndTraverseTeapotCPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
+    scene.as_kdtree.config.use_gpu = false;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = false;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+
+    const int hit_count = count_kdtree_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "KDTree (SAH CPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(KDTreeAS, BuildAndTraverseSpatialMedianGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SpatialMedian;
+    scene.as_kdtree.config.use_gpu = true;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = true;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+
+    const int hit_count = count_kdtree_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "KDTree (SpatialMedian GPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(KDTreeAS, RenderTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
+    scene.as_kdtree.config.use_gpu = true;
+    scene.as_kdtree.config.swapYZ = true;
+    scene.as_kdtree.config.sort_space = true;
+    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.set_active_space(space_id);
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.3f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    EXPECT_EQ(raytracer.parameters.active_as_type, ASType::KDTree);
+    EXPECT_NO_THROW(raytracer.draw_first_hit(scene, surface, width, height, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t non_black_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        EXPECT_EQ(px.w, 255);
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+        {
+            ++non_black_pixels;
+        }
+    }
+    std::cout << "KDTree rendered non-black pixels: " << non_black_pixels << " / " << (width * height) << std::endl;
+    EXPECT_GT(non_black_pixels, 0u);
+    EXPECT_LT(non_black_pixels, width * height);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    const uint32_t tree_id = static_cast<uint32_t>(scene.spaces[space_id].root_box);
+    const uint32_t as_start = scene.spaces[space_id].as_start;
+    const uint32_t bc_start = scene.spaces[space_id].box_content_start;
+
+    scene.free_space(space_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(space_id));
+    EXPECT_FALSE(scene.as_kdtree.trees.is_allocated(tree_id));
+    EXPECT_FALSE(scene.as_kdtree.as.is_allocated(as_start));
+    EXPECT_FALSE(scene.as_kdtree.box_content.is_allocated(bc_start));
 }

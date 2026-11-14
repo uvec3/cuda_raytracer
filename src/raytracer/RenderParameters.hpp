@@ -6,6 +6,7 @@
 #include "../geometry_common.cuh"
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
+#include "../acceleration_structures/kdtree/KDTreeGeometry.cuh"
 
 
 enum class ProjectionType
@@ -39,7 +40,6 @@ struct RenderParameters
     bool fixed_light_source = false;
     glm::vec3 light_source = {0.5f, 0.5f, 1.5f};
     bool use_fake_normals = true;
-    bool renderNagata = false;
     bool enableShadows = false;
     bool enableReflection = false;
     bool enableRefraction = false;
@@ -65,6 +65,7 @@ struct RenderParameters
     ASType active_as_type = ASType::Octree;
     OctreeASDeviceView as_octree{};
     UniformGridASDeviceView as_uniform_grid{};
+    KDTreeASDeviceView as_kdtree{};
 
     //geometry context
     soa::soa_view<PrimitiveChunk16> primitives{};

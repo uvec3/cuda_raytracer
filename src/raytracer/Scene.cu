@@ -89,6 +89,7 @@ Scene::Scene(std::string_view name)
     : m_name(name)
     , as_octree(&geometry_context)
     , as_uniform_grid(&geometry_context)
+    , as_kdtree(&geometry_context)
     , as_optix(&geometry_context)
 {
     m_active_space = root_space;
@@ -111,6 +112,7 @@ Scene::Scene(Scene&& other) noexcept
     , geometry_context(std::move(other.geometry_context))
     , as_octree(std::move(other.as_octree))
     , as_uniform_grid(std::move(other.as_uniform_grid))
+    , as_kdtree(std::move(other.as_kdtree))
     , as_optix(std::move(other.as_optix))
     , m_is_loaded(other.m_is_loaded)
     , m_name(std::move(other.m_name))
@@ -119,6 +121,7 @@ Scene::Scene(Scene&& other) noexcept
 {
     as_octree.bind_geometry_context(&geometry_context);
     as_uniform_grid.bind_geometry_context(&geometry_context);
+    as_kdtree.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
     other.m_textures.clear();
     other.m_is_loaded = false;
@@ -140,6 +143,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         geometry_context = std::move(other.geometry_context);
         as_octree = std::move(other.as_octree);
         as_uniform_grid = std::move(other.as_uniform_grid);
+        as_kdtree = std::move(other.as_kdtree);
         as_optix = std::move(other.as_optix);
         m_is_loaded = other.m_is_loaded;
         m_name = std::move(other.m_name);
@@ -148,6 +152,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
 
         as_octree.bind_geometry_context(&geometry_context);
     as_uniform_grid.bind_geometry_context(&geometry_context);
+    as_kdtree.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
         other.m_textures.clear();
         other.m_is_loaded = false;
@@ -253,6 +258,7 @@ uint32_t Scene::create_space()
     spaces[space_id].primitives_size = 0;
     spaces[space_id].normalization_translate = glm::vec3(0.0f);
     spaces[space_id].normalization_scale = glm::vec3(1.0f);
+    spaces[space_id].has_nagata = false;
     geometry_context.d_spaces = spaces;
     return space_id;
 }
@@ -269,6 +275,10 @@ void Scene::free_space(uint32_t space_id)
     else if (space.as_type == ASType::UniformGrid)
     {
         as_uniform_grid.free_space(space_id, space);
+    }
+    else if (space.as_type == ASType::KDTree)
+    {
+        as_kdtree.free_space(space_id, space);
     }
     else if (space.as_type == ASType::Optix)
     {
@@ -456,7 +466,12 @@ __global__ void scene_pack_nagata_patches_kernel(
 void Scene::pack_primitives(uint32_t space_id, const soa::cuda_device_vector<Triangle>& d_temp_triangles, uint32_t triangles_count, PrimitiveType triangle_type)
 {
     if (triangles_count == 0)
+    {
+        spaces[space_id].has_nagata = false;
         return;
+    }
+
+    spaces[space_id].has_nagata = (triangle_type == PrimitiveType::NagataPatch);
 
     if (triangle_type == PrimitiveType::FullTriangle)
     {

@@ -11,7 +11,7 @@
 #include "../geometry_common.cuh"
 
 //returns whether to continue tracing the ray
-template <typename RenderParams>
+template <bool HasNagata = true, typename RenderParams>
 __host__ __device__ inline
 glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv, const RenderParams& p, bool& continue_traversal)
 {
@@ -71,29 +71,32 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
         glm::vec2 uv2 = glm::unpackHalf2x16(ftri.uv_2);
         uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
     }
-    else if (chunk0.type() == PrimitiveType::NagataPatch)
+    else if constexpr (HasNagata)
     {
-        NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, primitive_id, chunk0);
-
-        if (p.use_fake_normals)
+        if (chunk0.type() == PrimitiveType::NagataPatch)
         {
-            glm::vec3 n0 = glm::vec3(p.vertices[patch.v0].normal);
-            glm::vec3 n1 = glm::vec3(p.vertices[patch.v1].normal);
-            glm::vec3 n2 = glm::vec3(p.vertices[patch.v2].normal);
-            normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
-        }
-        else
-        {
-            glm::vec3 v0 = glm::vec3(p.vertices[patch.v0].position);
-            glm::vec3 v1 = glm::vec3(p.vertices[patch.v1].position);
-            glm::vec3 v2 = glm::vec3(p.vertices[patch.v2].position);
-            normal = evaluateNagataNormal2(v0,v1,v2, patch.C12,patch.C23,patch.C31,w0,w1);
-        }
+            NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, primitive_id, chunk0);
 
-        glm::vec2 uv0 = p.vertices[patch.v0].uv;
-        glm::vec2 uv1 = p.vertices[patch.v1].uv;
-        glm::vec2 uv2 = p.vertices[patch.v2].uv;
-        uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
+            if (p.use_fake_normals)
+            {
+                glm::vec3 n0 = glm::vec3(p.vertices[patch.v0].normal);
+                glm::vec3 n1 = glm::vec3(p.vertices[patch.v1].normal);
+                glm::vec3 n2 = glm::vec3(p.vertices[patch.v2].normal);
+                normal = normalize(n0 * w0 + n1 * w1 + n2 * w2);
+            }
+            else
+            {
+                glm::vec3 v0 = glm::vec3(p.vertices[patch.v0].position);
+                glm::vec3 v1 = glm::vec3(p.vertices[patch.v1].position);
+                glm::vec3 v2 = glm::vec3(p.vertices[patch.v2].position);
+                normal = evaluateNagataNormal2(v0,v1,v2, patch.C12,patch.C23,patch.C31,w0,w1);
+            }
+
+            glm::vec2 uv0 = p.vertices[patch.v0].uv;
+            glm::vec2 uv1 = p.vertices[patch.v1].uv;
+            glm::vec2 uv2 = p.vertices[patch.v2].uv;
+            uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
+        }
     }
 
     vec3 intersection=ray_src+ray_dir*tuv[0];
@@ -190,7 +193,7 @@ glm::vec4 blend_colors(glm::vec4 current_color, glm::vec4 new_color)
     return glm::vec4(base,alpha);
 }
 
-template <typename RenderParams>
+template <bool HasNagata = true, typename RenderParams>
 __host__ __device__ inline
 void intersect_box_primitives(
     soa::soa_view<BoxContent> box_content,
@@ -240,21 +243,24 @@ void intersect_box_primitives(
                 closest_triangle = prim_id;
             }
         }
-        else if (chunk0.type() == PrimitiveType::NagataPatch)
+        else if constexpr (HasNagata)
         {
-            NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, prim_id, chunk0);
-
-            glm::vec3 tuv;
-            bool hit = intersectNagataPrecomputed(
-                source, direction, t_min, t_max,
-                glm::vec3(p.vertices[patch.v0].position), glm::vec3(p.vertices[patch.v1].position), glm::vec3(p.vertices[patch.v2].position),
-                patch.C12, patch.C23, patch.C31,
-                tuv.x, tuv.y, tuv.z);
-
-            if (hit && tuv[0] < closest_tuv[0])
+            if (chunk0.type() == PrimitiveType::NagataPatch)
             {
-                closest_tuv = tuv;
-                closest_triangle = prim_id;
+                NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(p.primitives, prim_id, chunk0);
+
+                glm::vec3 tuv;
+                bool hit = intersectNagataPrecomputed(
+                    source, direction, t_min, t_max,
+                    glm::vec3(p.vertices[patch.v0].position), glm::vec3(p.vertices[patch.v1].position), glm::vec3(p.vertices[patch.v2].position),
+                    patch.C12, patch.C23, patch.C31,
+                    tuv.x, tuv.y, tuv.z);
+
+                if (hit && tuv[0] < closest_tuv[0])
+                {
+                    closest_tuv = tuv;
+                    closest_triangle = prim_id;
+                }
             }
         }
 

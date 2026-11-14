@@ -7,8 +7,8 @@ struct OctreeASDeviceView
     soa::soa_view<int> as;
     soa::soa_view<BoxContent> box_content;
 
-    template <typename RenderParams>
-    __host__ __device__ inline glm::vec4 first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const;
+    template <bool HasNagata = true, typename RenderParams>
+    __host__ __device__ inline glm::vec4 first_hit(const RenderParams& p, glm::vec3 source, glm::vec3 direction) const;
 };
 
 struct TriangleNumberId
@@ -139,7 +139,6 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
     }
 
 
-    BoxStack content_stack=current_box.stack;
     while (true)//traversal loop: one iteration is one step through next box on ray's way
     {
         ++iterations;
@@ -162,7 +161,6 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
             box_content=as[current_box.id];
 
             current_box.stack.descend(child_box_offset);
-            content_stack=current_box.stack;
         }
 
 
@@ -211,7 +209,7 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
             if (current_box.stack.depth()==0)
             {
                 if (box_content<0)
-                    return TraversalResult{.content =(uint32_t) -box_content,.stack = content_stack};
+                    return TraversalResult{.content =(uint32_t) -box_content,.stack = current_box.stack};
                 return {0,0};
             }
 
@@ -242,10 +240,9 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
         current_pos = glm::mix(clamped, snapped, glm::notEqual(move_dir, glm::ivec3(0)));
 
         if (box_content<0)
-            return TraversalResult{.content =(uint32_t) -box_content,.stack = content_stack};
+            return TraversalResult{.content =(uint32_t) -box_content,.stack = current_box.stack};
 
         box_content=as[current_box.id];
-        content_stack=current_box.stack;
 
         //move center
         center=center+glm::vec3(move_dir)*current_box.stack.box_size();
@@ -256,16 +253,21 @@ inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box
 __device__ __host__
 inline TraversalResult traverse_stackless(const int* as, CurrentBox& current_box, glm::vec3 pos, glm::vec3 dir, int& iterations)
 {
-    glm::vec3 current_pos = pos + dir * current_box.t_max;
+    glm::vec3 current_pos = pos;
+    if (current_box.stack.depth() > 0)
+    {
+        constexpr float eps = 0x1p-21f;
+        const glm::vec3 c = current_box.stack.get_center();
+        const float shrink = current_box.stack.half_box_size() - eps;
+        current_pos = glm::clamp(pos + dir * current_box.t_max, c - shrink, c + shrink);
+    }
     return traverse_stackless(as, current_box, pos, current_pos, dir, iterations);
 }
 
-template <typename RenderParams>
+template <bool HasNagata, typename RenderParams>
 __host__ __device__ inline
-glm::vec4 OctreeASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::vec3 direction) const
+glm::vec4 OctreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, glm::vec3 direction) const
 {
-    //current source can propagate through the acceleration structure
-    auto current_source=source;
     static constexpr int max_iterations=500;
     //counts how many boxes were hit on the way
     int box_hits=0;
@@ -283,7 +285,7 @@ glm::vec4 OctreeASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::v
     while (container_id!=0 && continue_traversal && it<max_iterations)
     {
         //AS TRAVERSAL STEP (returns after hitting non-empty leaf node)
-        TraversalResult result=traverse_stackless(&as[0], current_box, source, current_source, direction, it);
+        TraversalResult result=traverse_stackless(&as[0], current_box, source, direction, it);
         container_id=result.content;
 
         if (container_id>0)
@@ -294,7 +296,7 @@ glm::vec4 OctreeASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::v
 
             if (p.show_triangles)
             {
-                intersect_box_primitives(
+                intersect_box_primitives<HasNagata>(
                     box_content,
                     static_cast<uint32_t>(container_id),
                     p,
@@ -308,7 +310,7 @@ glm::vec4 OctreeASDeviceView::first_hit(RenderParams p, glm::vec3 source, glm::v
 
             if (closest_triangle!=UINT32_MAX)
             {
-                auto res=fragment_hit_shader(closest_triangle,source,direction,closest_tuv,p,continue_traversal);
+                auto res=fragment_hit_shader<HasNagata>(closest_triangle,source,direction,closest_tuv,p,continue_traversal);
                 hit_primitive_color=blend_colors(hit_primitive_color,res);
                 if (continue_traversal)
                 {

@@ -260,6 +260,8 @@ struct Space
 
     glm::vec3& normalization_translate;
     glm::vec3& normalization_scale;
+
+    bool& has_nagata;
 };
 
 struct alignas(4) BoxContent
