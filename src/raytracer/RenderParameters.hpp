@@ -7,6 +7,7 @@
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../acceleration_structures/kdtree/KDTreeGeometry.cuh"
+#include "../acceleration_structures/bvh/BVHGeometry.cuh"
 
 
 enum class ProjectionType
@@ -66,6 +67,7 @@ struct RenderParameters
     OctreeASDeviceView as_octree{};
     UniformGridASDeviceView as_uniform_grid{};
     KDTreeASDeviceView as_kdtree{};
+    BVHASDeviceView as_bvh{};
 
     //geometry context
     soa::soa_view<PrimitiveChunk16> primitives{};

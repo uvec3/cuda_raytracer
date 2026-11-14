@@ -25,6 +25,7 @@ void Raytracer::update_parameters(Scene& scene, uint32_t width, uint32_t height)
     parameters.as_octree = scene.as_octree.device_view();
     parameters.as_uniform_grid = scene.as_uniform_grid.device_view();
     parameters.as_kdtree = scene.as_kdtree.device_view();
+    parameters.as_bvh = scene.as_bvh.device_view();
     parameters.vertices = scene.geometry_context.vertices.view();
     parameters.materials = scene.geometry_context.materials.view();
     parameters.primitives = scene.geometry_context.primitives.view();
@@ -47,12 +48,12 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
         dim3 block_dim{64,block_dim_x/8,block_dim_y/8};
 
         const bool has_nagata = scene.spaces[active_space].has_nagata;
-        auto launch = [&]<ASType Type>()
+        auto launch = [&]<ASType Type, bool UseBVH16 = false>()
         {
             if (has_nagata)
-                draw_first_hit_kernel<Type, true><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
+                draw_first_hit_kernel<Type, true, UseBVH16><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
             else
-                draw_first_hit_kernel<Type, false><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
+                draw_first_hit_kernel<Type, false, UseBVH16><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
         };
 
         switch (scene.spaces[active_space].as_type)
@@ -66,6 +67,16 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
         case ASType::KDTree:
             launch.template operator()<ASType::KDTree>();
             break;
+        case ASType::BVH:
+        {
+            const int root_box = scene.spaces[active_space].root_box;
+            const bool use_bvh16 = (root_box >= 0) && (scene.as_bvh.trees[static_cast<size_t>(root_box)].use_bvh16 != 0u);
+            if (use_bvh16)
+                launch.template operator()<ASType::BVH, true>();
+            else
+                launch.template operator()<ASType::BVH, false>();
+            break;
+        }
         default:
             break;
         }

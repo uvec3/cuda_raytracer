@@ -51,6 +51,7 @@ add_executable(Raytracer main.cpp
         src/acceleration_structures/octree/OctreeAS.cu src/acceleration_structures/octree/OctreeAS.cuh src/acceleration_structures/octree/OctreeGeometry.cuh
         src/acceleration_structures/uniform_grid/UniformGridAS.cu
         src/acceleration_structures/kdtree/KDTreeAS.cu
+        src/acceleration_structures/bvh/BVHAS.cu
         src/acceleration_structures/optix/OptixAS.cu
 
 
@@ -108,6 +109,10 @@ add_custom_command(
             "${CMAKE_CURRENT_SOURCE_DIR}/src/raytracer/rt_kernels.cuh"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/geometry_common.cuh"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/types.hpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/acceleration_structures/octree/OctreeGeometry.cuh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/acceleration_structures/kdtree/KDTreeGeometry.cuh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/acceleration_structures/bvh/BVHGeometry.cuh"
     COMMENT "Compiling OptiX shaders to OptiX IR and generating C header"
 )
 

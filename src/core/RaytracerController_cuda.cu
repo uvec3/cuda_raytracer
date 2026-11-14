@@ -239,9 +239,10 @@ void RaytracerController::ui_surface_input()
 }
 
 
+template <ASType AsType>
 __global__ void evaluate_single_pixel_kernel(uint32_t x, uint32_t y, const __grid_constant__ RenderParameters p, glm::vec4* result)
 {
-    *result = trace_pixel_first_hit(x, y, p);
+    *result = trace_pixel_first_hit<AsType>(x, y, p);
 }
 
 bool RaytracerController::ui_debug_pixel()
@@ -260,7 +261,22 @@ bool RaytracerController::ui_debug_pixel()
                 raytracer->update_parameters(*scene,current_image_size.x, current_image_size.y);
                 glm::vec4* d_result = nullptr;
                 CUDA_CHECK(cudaMalloc(&d_result, sizeof(glm::vec4)));
-                evaluate_single_pixel_kernel<<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                switch (raytracer->parameters.active_as_type)
+                {
+                case ASType::UniformGrid:
+                    evaluate_single_pixel_kernel<ASType::UniformGrid><<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                    break;
+                case ASType::KDTree:
+                    evaluate_single_pixel_kernel<ASType::KDTree><<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                    break;
+                case ASType::BVH:
+                    evaluate_single_pixel_kernel<ASType::BVH><<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                    break;
+                case ASType::Octree:
+                default:
+                    evaluate_single_pixel_kernel<ASType::Octree><<<1, 1>>>(debug_pixel.x, debug_pixel.y, raytracer->parameters, d_result);
+                    break;
+                }
                 CUDA_CHECK(cudaDeviceSynchronize());
                 CUDA_CHECK(cudaMemcpy(&debug_pixel_result, d_result, sizeof(glm::vec4), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaFree(d_result));

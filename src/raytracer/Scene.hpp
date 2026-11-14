@@ -9,6 +9,7 @@
 #include "../acceleration_structures/octree/OctreeAS.cuh"
 #include "../acceleration_structures/uniform_grid/UniformGridAS.cuh"
 #include "../acceleration_structures/kdtree/KDTreeAS.cuh"
+#include "../acceleration_structures/bvh/BVHAS.cuh"
 #include "../acceleration_structures/optix/OptixAS.cuh"
 #include "glm/detail/type_quat.hpp"
 #include "glm/gtc/quaternion.hpp"
@@ -109,6 +110,7 @@ public:
 	OctreeAS as_octree;
 	UniformGridAS as_uniform_grid;
 	KDTreeAS as_kdtree;
+	BVHAS as_bvh;
 	OptixAS as_optix;
 
 	bool m_is_loaded = false;
@@ -262,6 +264,24 @@ inline uint32_t Scene::build_as(Range&& meshes, ASType type)
 		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_kdtree.config.triangle_type);
 
 		as_kdtree.build(space_id, spaces[space_id]);
+		geometry_context.d_spaces = spaces;
+		return space_id;
+	}
+	else if (type == ASType::BVH)
+	{
+		size_t triangles_size = 0;
+		soa::cuda_device_vector<Triangle> d_temp_triangles;
+		auto space_id = prepare_space_geometry(meshes, type, as_bvh.config.swapYZ, d_temp_triangles, triangles_size);
+
+		normalize_space(space_id, false, false);
+		if (as_bvh.config.sort_space)
+		{
+			sort_space(space_id, d_temp_triangles);
+		}
+
+		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_bvh.config.triangle_type);
+
+		as_bvh.build(space_id, spaces[space_id]);
 		geometry_context.d_spaces = spaces;
 		return space_id;
 	}

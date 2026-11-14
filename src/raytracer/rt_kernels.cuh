@@ -8,6 +8,7 @@
 #include "../acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../acceleration_structures/kdtree/KDTreeGeometry.cuh"
+#include "../acceleration_structures/bvh/BVHGeometry.cuh"
 
 
 
@@ -51,7 +52,7 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
 #endif
 
 
-template <ASType AsType, bool HasNagata = true>
+template <ASType AsType, bool HasNagata = true, bool UseBVH16 = false>
 __host__ __device__ inline
 glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& p)
 {
@@ -61,6 +62,8 @@ glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& 
         return p.as_uniform_grid.template first_hit<HasNagata>(p, source, direction);
     else if constexpr (AsType == ASType::KDTree)
         return p.as_kdtree.template first_hit<HasNagata>(p, source, direction);
+    else if constexpr (AsType == ASType::BVH)
+        return p.as_bvh.template first_hit<HasNagata, UseBVH16>(p, source, direction);
     else
         return p.as_octree.template first_hit<HasNagata>(p, source, direction);
 }
@@ -72,6 +75,8 @@ glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& 
         return trace_pixel_first_hit<ASType::UniformGrid>(x, y, p);
     if (p.active_as_type == ASType::KDTree)
         return trace_pixel_first_hit<ASType::KDTree>(x, y, p);
+    if (p.active_as_type == ASType::BVH)
+        return trace_pixel_first_hit<ASType::BVH>(x, y, p);
     return trace_pixel_first_hit<ASType::Octree>(x, y, p);
 }
 
@@ -88,7 +93,7 @@ glm::uvec2 threadPixelPos()
     return {x,y};
 }
 
-template <ASType AsType, bool HasNagata = true>
+template <ASType AsType, bool HasNagata = true, bool UseBVH16 = false>
 __global__
 void draw_first_hit_kernel(cudaSurfaceObject_t surface, const __grid_constant__ RenderParameters p)
 {
@@ -102,7 +107,7 @@ void draw_first_hit_kernel(cudaSurfaceObject_t surface, const __grid_constant__ 
             __syncwarp();
             long long start = clock64();
             asm volatile("": : :"memory");
-            output=trace_pixel_first_hit<AsType, HasNagata>(threadPixel.x,threadPixel.y,p);
+            output=trace_pixel_first_hit<AsType, HasNagata, UseBVH16>(threadPixel.x,threadPixel.y,p);
             __threadfence();
             asm volatile("": : :"memory");
             __syncwarp();
@@ -113,7 +118,7 @@ void draw_first_hit_kernel(cudaSurfaceObject_t surface, const __grid_constant__ 
         }
         else
         {
-            output=trace_pixel_first_hit<AsType, HasNagata>(threadPixel.x,threadPixel.y,p);
+            output=trace_pixel_first_hit<AsType, HasNagata, UseBVH16>(threadPixel.x,threadPixel.y,p);
             write_texture(surface,threadPixel.x,threadPixel.y,output);
         }
     }

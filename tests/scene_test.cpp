@@ -8,6 +8,7 @@
 #include "../src/acceleration_structures/octree/OctreeGeometry.cuh"
 #include "../src/acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../src/acceleration_structures/kdtree/KDTreeGeometry.cuh"
+#include "../src/acceleration_structures/bvh/BVHGeometry.cuh"
 #include "../vkbase/extensions/Assets/assets.h"
 
 TEST(Scene, Load)
@@ -1479,4 +1480,559 @@ TEST(KDTreeAS, RenderTeapotGPU)
     EXPECT_FALSE(scene.as_kdtree.trees.is_allocated(tree_id));
     EXPECT_FALSE(scene.as_kdtree.as.is_allocated(as_start));
     EXPECT_FALSE(scene.as_kdtree.box_content.is_allocated(bc_start));
+}
+
+
+namespace
+{
+    int count_bvh_teapot_hits(Scene& scene, uint32_t space_id, PrimitiveType expected_type)
+    {
+        const int tree_id = scene.spaces[space_id].root_box;
+        EXPECT_GE(tree_id, 0);
+        const auto tree = scene.as_bvh.trees[static_cast<size_t>(tree_id)];
+        const glm::vec3 bounds_min = tree.bounds_min;
+        const glm::vec3 bounds_max = tree.bounds_max;
+
+        soa::soa_vector<PrimitiveChunk16> host_primitives = scene.geometry_context.primitives;
+        soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
+
+        int hit_count = 0;
+        for (int ix = 0; ix < 9; ++ix)
+        {
+            for (int iz = 0; iz < 9; ++iz)
+            {
+                const float x = bounds_min.x + (bounds_max.x - bounds_min.x) * (0.1f + 0.8f * (static_cast<float>(ix) / 8.0f));
+                const float z = bounds_min.z + (bounds_max.z - bounds_min.z) * (0.1f + 0.8f * (static_cast<float>(iz) / 8.0f));
+                const glm::vec3 origin(x, -0.5f, z);
+                const glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+                CurrentBVHNode state{};
+                BVHStackEntry stack[CurrentBVHNode::SHORT_STACK_SIZE];
+                int it = 0;
+                bool hit_triangle = false;
+
+                while (!hit_triangle && it < 500)
+                {
+                    uint32_t container_id = (tree.use_bvh16 != 0u)
+                        ? traverse_bvh16_impl(
+                            &scene.as_bvh.as16[0],
+                            tree.as_start,
+                            bounds_min,
+                            bounds_max,
+                            state,
+                            stack,
+                            origin,
+                            dir,
+                            it)
+                        : traverse_bvh_impl(
+                            &scene.as_bvh.as[0],
+                            tree.as_start,
+                            state,
+                            stack,
+                            origin,
+                            dir,
+                            it);
+                    if (container_id == 0)
+                        break;
+
+                    for (; !hit_triangle; ++container_id)
+                    {
+                        auto bc = scene.as_bvh.box_content[container_id];
+                        PrimitiveChunk16 chunk0 = host_primitives[bc.id()];
+                        EXPECT_EQ(chunk0.type(), expected_type);
+
+                        float t = 0.0f, u = 0.0f, v = 0.0f;
+                        bool hit = false;
+                        if (chunk0.type() == PrimitiveType::Triangle)
+                        {
+                            const Triangle tri = chunk0.as<Triangle>();
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[tri.v0].position),
+                                glm::vec3(host_vertices[tri.v1].position),
+                                glm::vec3(host_vertices[tri.v2].position),
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::FullTriangle)
+                        {
+                            const InlinedTriangle ftri = load_primitive<InlinedTriangle>(host_primitives, bc.id(), chunk0);
+                            hit = intersectRayTriangle(
+                                origin, dir, state.t_min, state.t_max,
+                                ftri.v0, ftri.v1, ftri.v2,
+                                t, u, v);
+                        }
+                        else if (chunk0.type() == PrimitiveType::NagataPatch)
+                        {
+                            const NagataPatchPrimitive patch = load_primitive<NagataPatchPrimitive>(host_primitives, bc.id(), chunk0);
+                            hit = intersectNagataPrecomputed(
+                                origin, dir, state.t_min, state.t_max,
+                                glm::vec3(host_vertices[patch.v0].position),
+                                glm::vec3(host_vertices[patch.v1].position),
+                                glm::vec3(host_vertices[patch.v2].position),
+                                patch.C12, patch.C23, patch.C31,
+                                t, u, v);
+                        }
+
+                        if (hit)
+                        {
+                            hit_triangle = true;
+                            break;
+                        }
+                        if (bc.is_last())
+                            break;
+                    }
+                    if (state.exited)
+                        break;
+                }
+
+                if (hit_triangle)
+                    ++hit_count;
+            }
+        }
+        return hit_count;
+    }
+} // namespace
+
+TEST(BVHAS, BuildAndTraverseTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene.as_bvh.config.use_gpu = true;
+    scene.as_bvh.config.swapYZ = true;
+    scene.as_bvh.config.sort_space = true;
+    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+    EXPECT_EQ(scene.spaces[space_id].as_type, ASType::BVH);
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_GE(scene.spaces[space_id].root_box, 0);
+
+    const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "BVH (SAH GPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(BVHAS, BuildAndTraverseTeapotFullTriangleGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene.as_bvh.config.use_gpu = true;
+    scene.as_bvh.config.swapYZ = true;
+    scene.as_bvh.config.sort_space = true;
+    scene.as_bvh.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_EQ(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::FullTriangle);
+    std::cout << "BVH (FullTriangle GPU) rays hitting teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(BVHAS, BuildAndTraverseTeapotNagataPatchGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene.as_bvh.config.use_gpu = true;
+    scene.as_bvh.config.swapYZ = true;
+    scene.as_bvh.config.sort_space = true;
+    scene.as_bvh.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].vertices_size, 0u);
+
+    const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::NagataPatch);
+    std::cout << "BVH (NagataPatch GPU) rays hitting teapot: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(BVHAS, BuildAndTraverseTeapotCPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene.as_bvh.config.use_gpu = false;
+    scene.as_bvh.config.swapYZ = true;
+    scene.as_bvh.config.sort_space = false;
+    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+    EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+    EXPECT_GT(scene.spaces[space_id].primitives_size, 0u);
+
+    const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+    std::cout << "BVH (SAH CPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+    EXPECT_GT(hit_count, 15);
+}
+
+TEST(BVHAS, BuildAndTraverseSpatialAndObjectMedianGPU)
+{
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+
+    {
+        Scene scene("TeapotSpatial");
+        scene.load(teapot_view);
+        auto meshes = scene.get_mesh_transform();
+        ASSERT_FALSE(meshes.empty());
+
+        scene.as_bvh.config.split_mode = BVHSplitMode::SpatialMedian;
+        scene.as_bvh.config.use_gpu = true;
+        scene.as_bvh.config.swapYZ = true;
+        scene.as_bvh.config.sort_space = true;
+        scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+        uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+        EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+        EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+
+        const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+        std::cout << "BVH (SpatialMedian GPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+        EXPECT_GT(hit_count, 15);
+    }
+
+    {
+        Scene scene("TeapotObject");
+        scene.load(teapot_view);
+        auto meshes = scene.get_mesh_transform();
+        ASSERT_FALSE(meshes.empty());
+
+        scene.as_bvh.config.split_mode = BVHSplitMode::ObjectMedian;
+        scene.as_bvh.config.use_gpu = true;
+        scene.as_bvh.config.swapYZ = true;
+        scene.as_bvh.config.sort_space = true;
+        scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+        uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+
+        EXPECT_GT(scene.spaces[space_id].as_size, 0u);
+        EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
+
+        const int hit_count = count_bvh_teapot_hits(scene, space_id, PrimitiveType::Triangle);
+        std::cout << "BVH (ObjectMedian GPU) rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
+        EXPECT_GT(hit_count, 15);
+    }
+}
+
+TEST(BVHAS, RenderTeapotGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene.as_bvh.config.use_gpu = true;
+    scene.as_bvh.config.swapYZ = true;
+    scene.as_bvh.config.sort_space = true;
+    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.set_active_space(space_id);
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.3f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    EXPECT_EQ(raytracer.parameters.active_as_type, ASType::BVH);
+    EXPECT_NO_THROW(raytracer.draw_first_hit(scene, surface, width, height, 0));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    EXPECT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t non_black_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        EXPECT_EQ(px.w, 255);
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+        {
+            ++non_black_pixels;
+        }
+    }
+    std::cout << "BVH rendered non-black pixels: " << non_black_pixels << " / " << (width * height) << std::endl;
+    EXPECT_GT(non_black_pixels, 0u);
+    EXPECT_LT(non_black_pixels, width * height);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    const uint32_t tree_id = static_cast<uint32_t>(scene.spaces[space_id].root_box);
+    const uint32_t as_start = scene.spaces[space_id].as_start;
+    const uint32_t bc_start = scene.spaces[space_id].box_content_start;
+    const bool was_bvh16 = (scene.as_bvh.trees[tree_id].use_bvh16 != 0u);
+
+    scene.free_space(space_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(space_id));
+    EXPECT_FALSE(scene.as_bvh.trees.is_allocated(tree_id));
+    if (was_bvh16)
+    {
+        EXPECT_FALSE(scene.as_bvh.as16.is_allocated(as_start));
+    }
+    else
+    {
+        EXPECT_FALSE(scene.as_bvh.as.is_allocated(as_start));
+    }
+    EXPECT_FALSE(scene.as_bvh.box_content.is_allocated(bc_start));
+}
+
+TEST(BVHAS, CompareBVH16AndBVH32TeapotGPU)
+{
+    static_assert(sizeof(BVHNode16) == 16);
+    static_assert(sizeof(BVHNode) == 32);
+    EXPECT_EQ(sizeof(BVHNode16), 16u);
+    EXPECT_EQ(sizeof(BVHNode), 32u);
+
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+
+    Scene scene16("TeapotBVH16");
+    scene16.load(teapot_view);
+    auto meshes16 = scene16.get_mesh_transform();
+    ASSERT_FALSE(meshes16.empty());
+    scene16.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene16.as_bvh.config.use_gpu = true;
+    scene16.as_bvh.config.swapYZ = true;
+    scene16.as_bvh.config.sort_space = true;
+    scene16.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    scene16.as_bvh.config.use_bvh16 = true;
+    const uint32_t space16 = scene16.build_as(meshes16, ASType::BVH);
+    scene16.set_active_space(space16);
+
+    Scene scene32("TeapotBVH32");
+    scene32.load(teapot_view);
+    auto meshes32 = scene32.get_mesh_transform();
+    ASSERT_FALSE(meshes32.empty());
+    scene32.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    scene32.as_bvh.config.use_gpu = true;
+    scene32.as_bvh.config.swapYZ = true;
+    scene32.as_bvh.config.sort_space = true;
+    scene32.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    scene32.as_bvh.config.use_bvh16 = false;
+    const uint32_t space32 = scene32.build_as(meshes32, ASType::BVH);
+    scene32.set_active_space(space32);
+
+    const uint32_t nodes16 = static_cast<uint32_t>(scene16.spaces[space16].as_size);
+    const uint32_t nodes32 = static_cast<uint32_t>(scene32.spaces[space32].as_size);
+    EXPECT_GT(nodes16, 0u);
+    EXPECT_EQ(nodes16, nodes32);
+
+    const size_t bytes16 = static_cast<size_t>(nodes16) * sizeof(BVHNode16);
+    const size_t bytes32 = static_cast<size_t>(nodes32) * sizeof(BVHNode);
+    EXPECT_EQ(bytes32, 2u * bytes16);
+
+    const int tree16_id = scene16.spaces[space16].root_box;
+    const int tree32_id = scene32.spaces[space32].root_box;
+    ASSERT_GE(tree16_id, 0);
+    ASSERT_GE(tree32_id, 0);
+    EXPECT_EQ(scene16.as_bvh.trees[static_cast<size_t>(tree16_id)].use_bvh16, 1u);
+    EXPECT_EQ(scene32.as_bvh.trees[static_cast<size_t>(tree32_id)].use_bvh16, 0u);
+
+    const int hits16 = count_bvh_teapot_hits(scene16, space16, PrimitiveType::Triangle);
+    const int hits32 = count_bvh_teapot_hits(scene32, space32, PrimitiveType::Triangle);
+    EXPECT_GT(hits16, 15);
+    EXPECT_EQ(hits16, hits32);
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    auto render_scene = [&](Scene& s) {
+        Raytracer raytracer;
+        raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.3f);
+        raytracer.parameters.ax = 0.0f;
+        raytracer.parameters.az = 0.0f;
+        raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        raytracer.update_parameters(s, width, height);
+        EXPECT_NO_THROW(raytracer.draw_first_hit(s, surface, width, height, 0));
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<uchar4> pixels(width * height);
+        EXPECT_EQ(cudaMemcpy2DFromArray(pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+        return pixels;
+    };
+
+    const auto pixels16 = render_scene(scene16);
+    const auto pixels32 = render_scene(scene32);
+
+    uint32_t diff_pixels = 0;
+    uint32_t non_black_16 = 0;
+    uint32_t non_black_32 = 0;
+    for (size_t i = 0; i < pixels16.size(); ++i)
+    {
+        if (pixels16[i].x > 0 || pixels16[i].y > 0 || pixels16[i].z > 0) ++non_black_16;
+        if (pixels32[i].x > 0 || pixels32[i].y > 0 || pixels32[i].z > 0) ++non_black_32;
+        if (pixels16[i].x != pixels32[i].x || pixels16[i].y != pixels32[i].y || pixels16[i].z != pixels32[i].z || pixels16[i].w != pixels32[i].w)
+        {
+            ++diff_pixels;
+        }
+    }
+    EXPECT_GT(non_black_16, 0u);
+    EXPECT_EQ(non_black_16, non_black_32);
+    EXPECT_EQ(diff_pixels, 0u);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(BVHAS, DISABLED_BenchmarkBVH16VsBVH32)
+{
+    const char* scenes[] = {"Scenes/utah_teapot.glb", "Scenes/hairball.glb", "Scenes/ABeautifulGame.glb"};
+    const uint32_t width = 1920;
+    const uint32_t height = 1080;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
+    for (const char* asset_name : scenes)
+    {
+        auto view = vkbase::assets::get(asset_name);
+        if (view.empty())
+            continue;
+
+        for (bool use16 : {false, true})
+        {
+            Scene scene(asset_name);
+            scene.load(view);
+            auto meshes = scene.get_mesh_transform();
+            if (meshes.empty())
+                continue;
+
+            scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
+            scene.as_bvh.config.use_gpu = true;
+            scene.as_bvh.config.swapYZ = true;
+            scene.as_bvh.config.sort_space = true;
+            scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+            scene.as_bvh.config.use_bvh16 = use16;
+            const uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+            scene.set_active_space(space_id);
+
+            const auto tree = scene.as_bvh.trees[static_cast<size_t>(scene.spaces[space_id].root_box)];
+            const glm::vec3 center = (tree.bounds_min + tree.bounds_max) * 0.5f;
+            const float radius = glm::length(tree.bounds_max - tree.bounds_min) * 0.5f;
+
+            Raytracer raytracer;
+            raytracer.parameters.view_pos = center + glm::vec3(0.0f, -1.6f * radius, 0.25f * radius);
+            raytracer.parameters.ax = 0.0f;
+            raytracer.parameters.az = 0.0f;
+            raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            raytracer.update_parameters(scene, width, height);
+
+            for (int i = 0; i < 5; ++i)
+                raytracer.draw_first_hit(scene, surface, width, height, 0);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+            const int iters = 30;
+            cudaEventRecord(ev_start, 0);
+            for (int i = 0; i < iters; ++i)
+                raytracer.draw_first_hit(scene, surface, width, height, 0);
+            cudaEventRecord(ev_stop, 0);
+            ASSERT_EQ(cudaEventSynchronize(ev_stop), cudaSuccess);
+            float total_ms = 0.0f;
+            cudaEventElapsedTime(&total_ms, ev_start, ev_stop);
+
+            // Also measure debug stats (show_iterations + show_boxes)
+            raytracer.parameters.show_iterations = true;
+            raytracer.parameters.show_boxes = true;
+            raytracer.parameters.iterations_max = 255.0f;
+            raytracer.parameters.boxes_max = 255.0f;
+            raytracer.draw_first_hit(scene, surface, width, height, 0);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            std::vector<uchar4> dbg_px(width * height);
+            ASSERT_EQ(cudaMemcpy2DFromArray(dbg_px.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+            uint64_t sum_it = 0, sum_box = 0, hit_px = 0;
+            for (const auto& px : dbg_px)
+            {
+                sum_it += px.x;
+                sum_box += px.y;
+                if (px.z > 0) ++hit_px;
+            }
+
+            const size_t node_bytes = static_cast<size_t>(scene.spaces[space_id].as_size) * (use16 ? sizeof(BVHNode16) : sizeof(BVHNode));
+            std::cout << "[BENCH] " << asset_name
+                      << " mode=" << (use16 ? "BVH16" : "BVH32")
+                      << " nodes=" << scene.spaces[space_id].as_size
+                      << " nodeMB=" << (static_cast<double>(node_bytes) / (1024.0 * 1024.0))
+                      << " avgMs=" << (total_ms / iters)
+                      << " avgIt=" << (static_cast<double>(sum_it) / (width * height))
+                      << " avgBoxHits=" << (static_cast<double>(sum_box) / (width * height))
+                      << " hitPx=" << hit_px
+                      << std::endl;
+        }
+    }
+
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
 }

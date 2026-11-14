@@ -90,6 +90,7 @@ Scene::Scene(std::string_view name)
     , as_octree(&geometry_context)
     , as_uniform_grid(&geometry_context)
     , as_kdtree(&geometry_context)
+    , as_bvh(&geometry_context)
     , as_optix(&geometry_context)
 {
     m_active_space = root_space;
@@ -113,6 +114,7 @@ Scene::Scene(Scene&& other) noexcept
     , as_octree(std::move(other.as_octree))
     , as_uniform_grid(std::move(other.as_uniform_grid))
     , as_kdtree(std::move(other.as_kdtree))
+    , as_bvh(std::move(other.as_bvh))
     , as_optix(std::move(other.as_optix))
     , m_is_loaded(other.m_is_loaded)
     , m_name(std::move(other.m_name))
@@ -122,6 +124,7 @@ Scene::Scene(Scene&& other) noexcept
     as_octree.bind_geometry_context(&geometry_context);
     as_uniform_grid.bind_geometry_context(&geometry_context);
     as_kdtree.bind_geometry_context(&geometry_context);
+    as_bvh.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
     other.m_textures.clear();
     other.m_is_loaded = false;
@@ -144,6 +147,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         as_octree = std::move(other.as_octree);
         as_uniform_grid = std::move(other.as_uniform_grid);
         as_kdtree = std::move(other.as_kdtree);
+        as_bvh = std::move(other.as_bvh);
         as_optix = std::move(other.as_optix);
         m_is_loaded = other.m_is_loaded;
         m_name = std::move(other.m_name);
@@ -153,6 +157,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         as_octree.bind_geometry_context(&geometry_context);
     as_uniform_grid.bind_geometry_context(&geometry_context);
     as_kdtree.bind_geometry_context(&geometry_context);
+    as_bvh.bind_geometry_context(&geometry_context);
     as_optix.bind_geometry_context(&geometry_context);
         other.m_textures.clear();
         other.m_is_loaded = false;
@@ -279,6 +284,10 @@ void Scene::free_space(uint32_t space_id)
     else if (space.as_type == ASType::KDTree)
     {
         as_kdtree.free_space(space_id, space);
+    }
+    else if (space.as_type == ASType::BVH)
+    {
+        as_bvh.free_space(space_id, space);
     }
     else if (space.as_type == ASType::Optix)
     {
