@@ -45,7 +45,7 @@ struct SceneData
 {
     std::unique_ptr<Scene> scene;
     std::unique_ptr<ContainerExplorer> explorer;
-    Node* selected_node = nullptr;
+    uint32_t selected_node_id = 0;
 
     SceneData();
     ~SceneData();

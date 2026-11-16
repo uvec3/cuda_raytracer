@@ -60,6 +60,13 @@ __host__ __device__ inline void get_primitive_triangle_vertices(
         n1 = glm::vec3(vertices[patch.v1].normal);
         n2 = glm::vec3(vertices[patch.v2].normal);
     }
+    else if (chunk0.type() == PrimitiveType::Subspace)
+    {
+        SubspacePrimitive sub = load_primitive<SubspacePrimitive>(primitives, prim_slot_id, chunk0);
+        v0 = sub.bounds_min;
+        v1 = sub.bounds_max;
+        v2 = 0.5f * (sub.bounds_min + sub.bounds_max);
+    }
 }
 
 void OctreeAS::config_ui()
@@ -125,7 +132,15 @@ OctreeAS::OctreeAS(GeometryContext* geometry_context)
 void OctreeAS::free_space(uint32_t space_id, Space space)
 {
     m_build_times_ms.erase(space_id);
-    if (space.as_size > 0)
+    if (space.box_content_size > 0)
+    {
+        if (space.as_size > 0)
+        {
+            as.free(space.as_start);
+        }
+        box_content.free(space.box_content_start);
+    }
+    else if (space.as_size > 0)
     {
         free_box(space.as_start);
     }
@@ -689,7 +704,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, Space space, uint32_t pri
     static constexpr uint32_t block_size=128;
     uint32_t number_of_blocks= (number_of_triangles-1) / block_size + 1;
 
-    soa::cuda_device_vector<TriangleNumberId> d_number_id(number_of_triangles*100);
+    soa::cuda_device_vector<TriangleNumberId> d_number_id(std::max<uint32_t>(number_of_triangles * 100u, 16384u));
 
     uint32_t* d_result_size = nullptr;
     CUDA_CHECK(cudaMalloc(&d_result_size, sizeof(uint32_t)));
@@ -921,6 +936,10 @@ void OctreeAS::insert_triangles(uint32_t space_id, Space space, uint32_t primiti
     {
         dispatch(FindCubeIntersection<PrimitiveApproximation::Nagata>{});
     }
+    else if (config.triangle_type == PrimitiveType::Subspace)
+    {
+        dispatch(FindCubeIntersection<PrimitiveApproximation::Approximate>{});
+    }
     else
     {
         dispatch(FindCubeIntersection<PrimitiveApproximation::Precise>{});
@@ -937,6 +956,8 @@ void OctreeAS::build(uint32_t space_id, Space space)
         occupied_slots = InlinedTriangle::occupied_slots;
     else if (config.triangle_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
+    else if (config.triangle_type == PrimitiveType::Subspace)
+        occupied_slots = SubspacePrimitive::occupied_slots;
 
     uint32_t number_of_triangles = space.primitives_size / occupied_slots;
 

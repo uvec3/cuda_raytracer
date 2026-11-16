@@ -34,7 +34,8 @@ enum class ASType : uint32_t
     KDTree,
     BVH,
     HUG,
-    Optix
+    Optix,
+    Heterogeneous
 };
 
 struct ASRef
@@ -230,7 +231,6 @@ struct alignas(16) NagataPatchPrimitive
 
 };
 
-
 struct alignas(16) Sphere
 {
     static constexpr int occupied_slots=2;//how many 16 byte slots it occupies (header 4B + center 12B + radius 4B = 20B -> 32B)
@@ -241,6 +241,22 @@ struct alignas(16) Sphere
     float radius;
 };
 static_assert(sizeof(Sphere) == 32);
+
+struct alignas(16) SubspacePrimitive
+{
+    static constexpr int occupied_slots = 3; // header(4B) + ids(12B) + bounds_min(12B) + bounds_max(12B) + padding(8B) = 48B
+    PrimitiveType type = PrimitiveType::Subspace;
+    uint16_t material_id = 0;
+
+    int32_t space_id = -1;
+    uint32_t blas_info_id = 0;
+    uint32_t blas_as_type = 0;
+
+    glm::vec3 bounds_min{0.0f};
+    glm::vec3 bounds_max{0.0f};
+    uint32_t padding[2]{0, 0};
+};
+static_assert(sizeof(SubspacePrimitive) == 48);
 
 struct Space
 {

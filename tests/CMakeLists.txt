@@ -24,6 +24,7 @@ add_executable(scene_test scene_test.cpp
         ../src/acceleration_structures/uniform_grid/UniformGridAS.cu
         ../src/acceleration_structures/kdtree/KDTreeAS.cu
         ../src/acceleration_structures/bvh/BVHAS.cu
+        ../src/acceleration_structures/heterogeneous/HeterogeneousAS.cu
         ../src/acceleration_structures/optix/OptixAS.cu
         ../external/tinygltf.cpp ../external/tiny_gltf_v3.h
         ../external/stb_image.cpp ../external/stb_image.h

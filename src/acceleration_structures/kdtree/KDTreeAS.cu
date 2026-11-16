@@ -59,6 +59,13 @@ namespace kdtree_detail
             n1 = glm::vec3(vertices[patch.v1].normal);
             n2 = glm::vec3(vertices[patch.v2].normal);
         }
+        else if (ptype == PrimitiveType::Subspace)
+        {
+            SubspacePrimitive sub = load_primitive<SubspacePrimitive>(primitives, prim_slot_id, chunk0);
+            v0 = sub.bounds_min;
+            v1 = sub.bounds_max;
+            v2 = 0.5f * (sub.bounds_min + sub.bounds_max);
+        }
         return ptype;
     }
 
@@ -174,6 +181,13 @@ namespace kdtree_detail
         const glm::vec3 pad = glm::max((box_max - box_min) * 1e-4f, glm::vec3(1e-6f));
         const glm::vec3 clamped_prim_min = glm::min(glm::max(prim_min, box_min), box_max);
         const glm::vec3 clamped_prim_max = glm::max(clamped_prim_min, glm::min(glm::max(prim_max, box_min), box_max));
+
+        if (ptype == PrimitiveType::Subspace)
+        {
+            out_cmin = clamped_prim_min;
+            out_cmax = clamped_prim_max;
+            return;
+        }
 
         if (ptype == PrimitiveType::NagataPatch)
         {
@@ -305,6 +319,11 @@ namespace kdtree_detail
             tri_max.z < pad_min.z || tri_min.z > pad_max.z)
         {
             return false;
+        }
+
+        if (ptype == PrimitiveType::Subspace)
+        {
+            return true;
         }
 
         if (ptype == PrimitiveType::NagataPatch)
@@ -1570,6 +1589,8 @@ void KDTreeAS::build(uint32_t space_id, Space space)
         occupied_slots = InlinedTriangle::occupied_slots;
     else if (config.triangle_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
+    else if (config.triangle_type == PrimitiveType::Subspace)
+        occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;
     if (number_of_triangles == 0)

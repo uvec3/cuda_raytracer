@@ -26,13 +26,13 @@ TEST(Scene, NodeHierarchyAndASRef)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    EXPECT_FALSE(scene.root_node.name.empty());
-    EXPECT_FALSE(scene.root_node.children.empty());
+    EXPECT_FALSE(scene.get_root_node().name.empty());
+    EXPECT_FALSE(scene.get_root_node().children.empty());
 
-    Node& subscene = scene.root_node.children[0];
+    const uint32_t subscene_id = scene.get_root_node().children[0]; ASSERT_LT(subscene_id, scene.m_nodes.size()); Node& subscene = scene.m_nodes[subscene_id];
     EXPECT_FALSE(subscene.name.empty());
-    EXPECT_GT(subscene.count_subtree_meshes(), 0);
-    EXPECT_GT(subscene.count_subtree_triangles(scene.m_meshes), 0);
+    EXPECT_GT(subscene.count_subtree_meshes(scene.m_nodes), 0u);
+    EXPECT_GT(subscene.count_subtree_triangles(scene.m_nodes, scene.m_meshes), 0u); EXPECT_GT(subscene.count_subtree_vertices(scene.m_nodes, scene.m_meshes), 0u);
 
     EXPECT_FALSE(subscene.as_ref.is_valid());
     EXPECT_EQ(subscene.as_ref.type, ASType::None);
@@ -47,8 +47,8 @@ TEST(Scene, NodeHierarchyAndASRef)
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
     scene.as_octree.config.use_gpu = true;
     scene.as_octree.config.sort_space = true;
-    uint32_t space_id = scene.build_as(subscene_meshes, ASType::Octree);
-    subscene.as_ref = {space_id, ASType::Octree};
+    uint32_t space_id = scene.build_node_as(subscene_id, ASType::Octree);
+    ASSERT_NE(space_id, UINT32_MAX);
 
     EXPECT_TRUE(subscene.as_ref.is_valid());
     EXPECT_EQ(subscene.as_ref.type, ASType::Octree);
@@ -974,6 +974,161 @@ namespace
     }
 } // namespace
 
+TEST(UniformGridAS, ComputeAdaptiveGridDimensions)
+{
+    EXPECT_FLOAT_EQ(UniformGridAS::Config{}.voxels_per_triangle, 1.0f);
+
+    // Cubic AABB: 1000 triangles at 1.0 vox/tri -> 10x10x10
+    {
+        const auto layout = UniformGridAS::compute_grid_dimensions(glm::vec3(1.0f, 1.0f, 1.0f), 1000u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(10u, 10u, 10u));
+        EXPECT_NEAR(layout.cell_size, 0.1f, 1e-6f);
+    }
+
+    // Anisotropic AABB: (1.0, 0.5, 0.5), 250 tris -> N_x*N_y*N_z = 250 with t = 10 -> 10x5x5
+    {
+        const auto layout = UniformGridAS::compute_grid_dimensions(glm::vec3(1.0f, 0.5f, 0.5f), 250u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(10u, 5u, 5u));
+        EXPECT_NEAR(layout.cell_size, 0.1f, 1e-6f);
+    }
+
+    // Planar AABB (one zero extent): 100 tris -> fixed to 1 on flat axis, 10x1x10
+    {
+        const auto layout = UniformGridAS::compute_grid_dimensions(glm::vec3(1.0f, 0.0f, 1.0f), 100u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(10u, 1u, 10u));
+        EXPECT_NEAR(layout.cell_size, 0.1f, 1e-6f);
+    }
+
+    // Thin 1D-like AABB: (1.0, 0.01, 0.01), 50 tris -> Y,Z clamp to 1, X solves to 50
+    {
+        const auto layout = UniformGridAS::compute_grid_dimensions(glm::vec3(1.0f, 0.01f, 0.01f), 50u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(50u, 1u, 1u));
+        EXPECT_GE(static_cast<float>(layout.dims.x) * layout.cell_size, 1.0f);
+        EXPECT_GE(static_cast<float>(layout.dims.y) * layout.cell_size, 0.01f);
+        EXPECT_GE(static_cast<float>(layout.dims.z) * layout.cell_size, 0.01f);
+    }
+
+    // Floor rounding + cell_size adjustment guarantees full AABB enclosure
+    {
+        const glm::vec3 aabb(1.0f, 1.0f, 1.0f);
+        const auto layout = UniformGridAS::compute_grid_dimensions(aabb, 2000u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(12u, 12u, 12u));
+        EXPECT_GE(static_cast<float>(layout.dims.x) * layout.cell_size, aabb.x);
+        EXPECT_GE(static_cast<float>(layout.dims.y) * layout.cell_size, aabb.y);
+        EXPECT_GE(static_cast<float>(layout.dims.z) * layout.cell_size, aabb.z);
+    }
+
+    // Per-axis cap at 1024 (10-bit CurrentGridCell coordinates) still encloses elongated AABB
+    {
+        const glm::vec3 aabb(1.0f, 0.1f, 0.1f);
+        const auto layout = UniformGridAS::compute_grid_dimensions(aabb, 100000000u, 10.0f);
+        EXPECT_LE(layout.dims.x, UniformGridAS::kMaxAxisResolution);
+        EXPECT_LE(layout.dims.y, UniformGridAS::kMaxAxisResolution);
+        EXPECT_LE(layout.dims.z, UniformGridAS::kMaxAxisResolution);
+        EXPECT_EQ(layout.dims.x, UniformGridAS::kMaxAxisResolution);
+        EXPECT_GE(static_cast<float>(layout.dims.x) * layout.cell_size, aabb.x);
+        EXPECT_GE(static_cast<float>(layout.dims.y) * layout.cell_size, aabb.y);
+        EXPECT_GE(static_cast<float>(layout.dims.z) * layout.cell_size, aabb.z);
+    }
+
+    // Degenerate zero-size AABB falls back to 1x1x1
+    {
+        const auto layout = UniformGridAS::compute_grid_dimensions(glm::vec3(0.0f), 10u, 1.0f);
+        EXPECT_EQ(layout.dims, glm::uvec3(1u, 1u, 1u));
+        EXPECT_GT(layout.cell_size, 0.0f);
+    }
+}
+
+TEST(UniformGridAS, DensityScalingAndPlanarGeometryGPU)
+{
+    Scene scene("Teapot");
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+    scene.load(teapot_view);
+
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    scene.as_uniform_grid.config.swapYZ = true;
+    scene.as_uniform_grid.config.sort_space = true;
+    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+
+    scene.as_uniform_grid.config.voxels_per_triangle = 0.5f;
+    const uint32_t coarse_space = scene.build_as(meshes, ASType::UniformGrid);
+    const auto coarse_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[coarse_space].root_box)];
+
+    scene.as_uniform_grid.config.voxels_per_triangle = 4.0f;
+    const uint32_t fine_space = scene.build_as(meshes, ASType::UniformGrid);
+    const auto fine_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[fine_space].root_box)];
+
+    EXPECT_GT(scene.spaces[fine_space].as_size, scene.spaces[coarse_space].as_size);
+    EXPECT_LT(fine_grid.cell_size, coarse_grid.cell_size);
+    EXPECT_GT(count_uniform_grid_teapot_hits(scene, coarse_space, PrimitiveType::Triangle), 15);
+    EXPECT_GT(count_uniform_grid_teapot_hits(scene, fine_space, PrimitiveType::Triangle), 15);
+
+    // Flatten Y strongly (thin geometry) -> grid stays valid with dims.y == 1 and adapts X/Z
+    for (auto& entry : meshes)
+    {
+        entry.first = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, 1.0f, 0.001f)) * entry.first;
+    }
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
+    const uint32_t planar_space = scene.build_as(meshes, ASType::UniformGrid);
+    const auto planar_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[planar_space].root_box)];
+    EXPECT_EQ(planar_grid.dims.y, 1u);
+    EXPECT_GT(planar_grid.dims.x, 1u);
+    EXPECT_GT(planar_grid.dims.z, 1u);
+    EXPECT_GT(count_uniform_grid_teapot_hits(scene, planar_space, PrimitiveType::Triangle), 15);
+
+    // Exact zero-thickness planar mesh (y = 0) -> dims.y == 1 and 2D X/Z solve hits all rays
+    Scene planar_scene("PlanarQuad");
+    Mesh quad_grid_mesh;
+    quad_grid_mesh.name = "PlanarGrid";
+    constexpr int grid_n = 10;
+    quad_grid_mesh.vertices.allocate((grid_n + 1) * (grid_n + 1));
+    for (int iz = 0; iz <= grid_n; ++iz)
+    {
+        for (int ix = 0; ix <= grid_n; ++ix)
+        {
+            const uint32_t v_idx = static_cast<uint32_t>(iz * (grid_n + 1) + ix);
+            quad_grid_mesh.vertices[v_idx].position = glm::vec3(static_cast<float>(ix), 0.0f, static_cast<float>(iz));
+            quad_grid_mesh.vertices[v_idx].normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            quad_grid_mesh.vertices[v_idx].color = glm::vec4(1.0f);
+            quad_grid_mesh.vertices[v_idx].uv = glm::vec2(0.0f);
+        }
+    }
+    quad_grid_mesh.triangles.allocate(grid_n * grid_n * 2);
+    uint32_t tri_idx = 0;
+    for (int iz = 0; iz < grid_n; ++iz)
+    {
+        for (int ix = 0; ix < grid_n; ++ix)
+        {
+            const uint32_t v00 = static_cast<uint32_t>(iz * (grid_n + 1) + ix);
+            const uint32_t v10 = v00 + 1;
+            const uint32_t v01 = v00 + static_cast<uint32_t>(grid_n + 1);
+            const uint32_t v11 = v01 + 1;
+            quad_grid_mesh.triangles[tri_idx].v0 = v00;
+            quad_grid_mesh.triangles[tri_idx].v1 = v10;
+            quad_grid_mesh.triangles[tri_idx].v2 = v11;
+            quad_grid_mesh.triangles[tri_idx].material_id = 0;
+            ++tri_idx;
+            quad_grid_mesh.triangles[tri_idx].v0 = v00;
+            quad_grid_mesh.triangles[tri_idx].v1 = v11;
+            quad_grid_mesh.triangles[tri_idx].v2 = v01;
+            quad_grid_mesh.triangles[tri_idx].material_id = 0;
+            ++tri_idx;
+        }
+    }
+    std::vector<std::pair<glm::mat4, Mesh&>> planar_meshes{{glm::mat4(1.0f), quad_grid_mesh}};
+    planar_scene.as_uniform_grid.config.swapYZ = false;
+    planar_scene.as_uniform_grid.config.sort_space = true;
+    planar_scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+    planar_scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
+    const uint32_t exact_planar_space = planar_scene.build_as(planar_meshes, ASType::UniformGrid);
+    const auto exact_planar_grid = planar_scene.as_uniform_grid.grids[static_cast<size_t>(planar_scene.spaces[exact_planar_space].root_box)];
+    EXPECT_EQ(exact_planar_grid.dims, glm::uvec3(14u, 1u, 14u));
+    EXPECT_EQ(count_uniform_grid_teapot_hits(planar_scene, exact_planar_space, PrimitiveType::Triangle), 81);
+}
+
 TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
 {
     Scene scene("Teapot");
@@ -984,7 +1139,7 @@ TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
     scene.as_uniform_grid.config.swapYZ = true;
     scene.as_uniform_grid.config.sort_space = true;
     scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
@@ -998,10 +1153,11 @@ TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
     const int grid_id = scene.spaces[space_id].root_box;
     ASSERT_GE(grid_id, 0);
     const auto grid = scene.as_uniform_grid.grids[static_cast<size_t>(grid_id)];
-    EXPECT_EQ(std::max({grid.dims.x, grid.dims.y, grid.dims.z}), 20u);
+    EXPECT_GE(std::min({grid.dims.x, grid.dims.y, grid.dims.z}), 1u);
+    EXPECT_LE(std::max({grid.dims.x, grid.dims.y, grid.dims.z}), UniformGridAS::kMaxAxisResolution);
     EXPECT_EQ(grid.dims.x * grid.dims.y * grid.dims.z, scene.spaces[space_id].as_size);
 
-    // Verify tight normalization: vertices start at (0,0,0), max extent is 1.0, and dims match resolution along longest axis
+    // Verify tight normalization: vertices start at (0,0,0), max extent is 1.0, and adaptive dims match solver
     soa::soa_vector<Vertex> host_vertices = scene.geometry_context.vertices;
     const uint32_t v_start = scene.spaces[space_id].vertices_start;
     const uint32_t v_size = scene.spaces[space_id].vertices_size;
@@ -1018,10 +1174,13 @@ TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
     EXPECT_NEAR(v_min.z, 0.0f, 1e-5f);
     const float max_extent = glm::max(glm::max(v_max.x, v_max.y), v_max.z);
     EXPECT_NEAR(max_extent, 1.0f, 1e-5f);
-    EXPECT_NEAR(grid.cell_size, max_extent / 20.0f, 1e-5f);
-    EXPECT_EQ(grid.dims.x, std::clamp(static_cast<uint32_t>(std::ceil((v_max.x / grid.cell_size) - 1e-5f)), 1u, 20u));
-    EXPECT_EQ(grid.dims.y, std::clamp(static_cast<uint32_t>(std::ceil((v_max.y / grid.cell_size) - 1e-5f)), 1u, 20u));
-    EXPECT_EQ(grid.dims.z, std::clamp(static_cast<uint32_t>(std::ceil((v_max.z / grid.cell_size) - 1e-5f)), 1u, 20u));
+    const uint32_t num_triangles = scene.spaces[space_id].primitives_size / Triangle::occupied_slots;
+    const auto expected_layout = UniformGridAS::compute_grid_dimensions(v_max, num_triangles, 1.0f);
+    EXPECT_EQ(grid.dims, expected_layout.dims);
+    EXPECT_NEAR(grid.cell_size, expected_layout.cell_size, 1e-6f);
+    EXPECT_GE(static_cast<float>(grid.dims.x) * grid.cell_size, v_max.x - 1e-5f);
+    EXPECT_GE(static_cast<float>(grid.dims.y) * grid.cell_size, v_max.y - 1e-5f);
+    EXPECT_GE(static_cast<float>(grid.dims.z) * grid.cell_size, v_max.z - 1e-5f);
 
     const int hit_count = count_uniform_grid_teapot_hits(scene, space_id, PrimitiveType::Triangle);
     std::cout << "UniformGrid rays hitting teapot triangles: " << hit_count << " / 81" << std::endl;
@@ -1038,7 +1197,7 @@ TEST(UniformGridAS, BuildAndTraverseTeapotFullTriangleGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
     scene.as_uniform_grid.config.swapYZ = true;
     scene.as_uniform_grid.config.sort_space = true;
     scene.as_uniform_grid.config.triangle_type = PrimitiveType::FullTriangle;
@@ -1064,7 +1223,7 @@ TEST(UniformGridAS, BuildAndTraverseTeapotNagataPatchGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
     scene.as_uniform_grid.config.swapYZ = true;
     scene.as_uniform_grid.config.sort_space = true;
     scene.as_uniform_grid.config.triangle_type = PrimitiveType::NagataPatch;
@@ -1090,7 +1249,7 @@ TEST(UniformGridAS, BuildAndTraverseWithoutSortAndFree)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
     scene.as_uniform_grid.config.swapYZ = true;
     scene.as_uniform_grid.config.sort_space = false;
     scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
@@ -1125,7 +1284,7 @@ TEST(UniformGridAS, RenderTeapotGPU)
     auto meshes = scene.get_mesh_transform();
     ASSERT_FALSE(meshes.empty());
 
-    scene.as_uniform_grid.config.resolution = 20;
+    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
     scene.as_uniform_grid.config.swapYZ = true;
     scene.as_uniform_grid.config.sort_space = true;
     scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
@@ -2033,6 +2192,702 @@ TEST(BVHAS, DISABLED_BenchmarkBVH16VsBVH32)
 
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(HeterogeneousAS, BuildAndRenderTeapotGPU)
+{
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+
+    Scene scene("HeterogeneousTeapot");
+    scene.load(teapot_view);
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_FALSE(meshes.empty());
+
+    for (const auto& variant : scene.as_heterogeneous.variants)
+    {
+        if (variant.as_type == ASType::BVH)
+        {
+            EXPECT_TRUE(variant.bvh_config.use_bvh16);
+        }
+    }
+
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 64.0f;
+    scene.as_heterogeneous.config.num_probe_rays = 8192;
+
+    const uint32_t space_id = scene.build_as(meshes, ASType::Heterogeneous);
+    ASSERT_TRUE(scene.spaces.is_allocated(space_id));
+    EXPECT_EQ(scene.spaces[space_id].as_type, ASType::Heterogeneous);
+    EXPECT_GE(scene.spaces[space_id].root_box, 0);
+
+    const auto* records = scene.as_heterogeneous.get_mesh_records(space_id);
+    ASSERT_NE(records, nullptr);
+    ASSERT_EQ(records->size(), 1u);
+    EXPECT_EQ((*records)[0].candidates.size(), scene.as_heterogeneous.variants.size());
+    EXPECT_FALSE((*records)[0].selected_variant_name.empty());
+
+    const uint32_t owned_blas_id = (*records)[0].space_id;
+    EXPECT_TRUE(scene.spaces.is_allocated(owned_blas_id));
+
+    scene.set_active_space(space_id);
+
+    const uint32_t width = 64;
+    const uint32_t height = 64;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.45f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    raytracer.draw_first_hit(scene, surface, width, height, 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    ASSERT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t hit_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+            ++hit_pixels;
+    }
+    EXPECT_GT(hit_pixels, 0u);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    scene.free_space(space_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(space_id));
+    EXPECT_FALSE(scene.spaces.is_allocated(owned_blas_id));
+    EXPECT_EQ(scene.as_heterogeneous.get_mesh_records(space_id), nullptr);
+}
+
+TEST(HeterogeneousAS, MultiMeshSelectionAndThresholdGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("HeterogeneousMultiMesh");
+    scene.load(view);
+    auto meshes = scene.get_mesh_transform();
+    ASSERT_GT(meshes.size(), 1u);
+
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 4096;
+
+    // Pass 1: Generous memory budget (128 B/tri)
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+    const uint32_t space_generous = scene.build_as(meshes, ASType::Heterogeneous);
+    ASSERT_TRUE(scene.spaces.is_allocated(space_generous));
+
+    const auto* records_gen = scene.as_heterogeneous.get_mesh_records(space_generous);
+    ASSERT_NE(records_gen, nullptr);
+    ASSERT_GT(records_gen->size(), 1u);
+
+    auto verify_selection_rule = [](const std::vector<MeshBuildRecord>& recs) -> double
+    {
+        double total_bytes = 0.0;
+        double total_tris = 0.0;
+        for (const auto& rec : recs)
+        {
+            EXPECT_FALSE(rec.candidates.empty());
+            if (rec.candidates.empty())
+                continue;
+            bool any_feasible = false;
+            float min_feasible_time = FLT_MAX;
+            double min_bpt = DBL_MAX;
+            const MeshCandidateResult* chosen = nullptr;
+
+            for (const auto& cand : rec.candidates)
+            {
+                if (cand.within_memory_limit)
+                {
+                    any_feasible = true;
+                    min_feasible_time = std::min(min_feasible_time, cand.probe_trace_ms);
+                }
+                min_bpt = std::min(min_bpt, cand.bytes_per_triangle);
+                if (cand.variant_name == rec.selected_variant_name)
+                    chosen = &cand;
+            }
+            EXPECT_NE(chosen, nullptr);
+            if (chosen == nullptr)
+                continue;
+            if (any_feasible)
+            {
+                EXPECT_TRUE(chosen->within_memory_limit);
+                EXPECT_LE(chosen->probe_trace_ms, min_feasible_time + 1e-5f);
+            }
+            else
+            {
+                EXPECT_LE(chosen->bytes_per_triangle, min_bpt + 1e-6);
+            }
+
+            total_bytes += static_cast<double>(chosen->as_nodes_bytes + chosen->box_content_bytes);
+            total_tris += static_cast<double>(rec.num_triangles);
+        }
+        return (total_tris > 0.0) ? (total_bytes / total_tris) : 0.0;
+    };
+
+    const double avg_bpt_generous = verify_selection_rule(*records_gen);
+
+    // Render Pass 1 (128x128)
+    const uint32_t width = 128;
+    const uint32_t height = 128;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    scene.set_active_space(space_generous);
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.5f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    raytracer.draw_first_hit(scene, surface, width, height, 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    ASSERT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t hit_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+            ++hit_pixels;
+    }
+    EXPECT_GT(hit_pixels, 0u);
+
+    // Pass 2: Tight memory budget (4 B/tri — strictly tighter than BVH16 so minimum-memory selection runs deterministically)
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 4.0f;
+    const uint32_t space_tight = scene.build_as(meshes, ASType::Heterogeneous);
+    ASSERT_TRUE(scene.spaces.is_allocated(space_tight));
+
+    const auto* records_tight = scene.as_heterogeneous.get_mesh_records(space_tight);
+    ASSERT_NE(records_tight, nullptr);
+    EXPECT_EQ(records_tight->size(), records_gen->size());
+
+    const double avg_bpt_tight = verify_selection_rule(*records_tight);
+    EXPECT_LE(avg_bpt_tight, avg_bpt_generous + 1e-6);
+
+    scene.set_active_space(space_tight);
+    raytracer.update_parameters(scene, width, height);
+    raytracer.draw_first_hit(scene, surface, width, height, 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> tight_pixels(width * height);
+    ASSERT_EQ(cudaMemcpy2DFromArray(tight_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t tight_hits = 0;
+    for (const auto& px : tight_pixels)
+    {
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+            ++tight_hits;
+    }
+    EXPECT_GT(tight_hits, 0u);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    scene.free_space(space_generous);
+    scene.free_space(space_tight);
+    EXPECT_FALSE(scene.spaces.is_allocated(space_generous));
+    EXPECT_FALSE(scene.spaces.is_allocated(space_tight));
+}
+
+TEST(HeterogeneousAS, InstancingAndLiveNodeOverrideGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("HeterogeneousInstancing");
+    scene.load(view);
+
+    ASSERT_EQ(scene.m_mesh_node_ids.size(), scene.m_meshes.size());
+    bool any_shared_mesh_node = false;
+    for (uint32_t mesh_nid : scene.m_mesh_node_ids)
+    {
+        ASSERT_LT(mesh_nid, scene.m_nodes.size());
+        if (scene.is_mesh_node_shared(mesh_nid))
+        {
+            any_shared_mesh_node = true;
+        }
+    }
+    EXPECT_TRUE(any_shared_mesh_node);
+
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 2048;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    const uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    ASSERT_TRUE(scene.spaces.is_allocated(tlas_space));
+    scene.set_active_space(tlas_space);
+
+    const auto* mesh_records = scene.as_heterogeneous.get_mesh_records(tlas_space);
+    const auto* inst_records = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(mesh_records, nullptr);
+    ASSERT_NE(inst_records, nullptr);
+    EXPECT_EQ(mesh_records->size(), scene.m_meshes.size());
+    EXPECT_GT(inst_records->size(), mesh_records->size());
+
+    uint32_t shared_mesh_node_id = UINT32_MAX;
+    uint32_t old_blas_space_id = UINT32_MAX;
+    for (const auto& rec : *mesh_records)
+    {
+        ASSERT_LT(rec.mesh_node_id, scene.m_nodes.size());
+        const Node& mesh_node = scene.m_nodes[rec.mesh_node_id];
+        EXPECT_TRUE(mesh_node.as_ref.is_valid());
+        EXPECT_EQ(mesh_node.as_ref.space_id, rec.space_id);
+        EXPECT_EQ(mesh_node.as_ref.type, rec.selected_as_type);
+        if (rec.instance_count > 1 && shared_mesh_node_id == UINT32_MAX)
+        {
+            shared_mesh_node_id = rec.mesh_node_id;
+            old_blas_space_id = rec.space_id;
+        }
+    }
+    ASSERT_NE(shared_mesh_node_id, UINT32_MAX);
+
+    // Rebuild shared leaf mesh node in-place -> Heterogeneous TLAS automatically sees the rebuilt child BLAS
+    const uint32_t rebuilt_space = scene.build_node_as(shared_mesh_node_id, ASType::UniformGrid);
+    EXPECT_EQ(rebuilt_space, old_blas_space_id);
+    EXPECT_EQ(scene.spaces[rebuilt_space].as_type, ASType::UniformGrid);
+    const MeshBuildRecord* updated_mesh_rec = scene.as_heterogeneous.find_mesh_record_by_space(rebuilt_space);
+    ASSERT_NE(updated_mesh_rec, nullptr);
+    EXPECT_EQ(updated_mesh_rec->selected_as_type, ASType::UniformGrid);
+    EXPECT_EQ(scene.m_nodes[shared_mesh_node_id].as_ref.type, ASType::UniformGrid);
+
+    // Find an intermediate single-mesh instance node sharing that BLAS (or any instanced node) and override it
+    uint32_t inst_node_id = UINT32_MAX;
+    uint32_t default_blas_space = UINT32_MAX;
+    for (const auto& irec : *inst_records)
+    {
+        if (irec.instance_node_id < scene.m_nodes.size() &&
+            scene.m_nodes[irec.instance_node_id].meshId == 0 &&
+            scene.m_nodes[irec.instance_node_id].count_subtree_meshes(scene.m_nodes) == 1)
+        {
+            inst_node_id = irec.instance_node_id;
+            default_blas_space = irec.default_space_id;
+            break;
+        }
+    }
+    ASSERT_NE(inst_node_id, UINT32_MAX);
+
+    const uint32_t override_space = scene.build_node_as(inst_node_id, ASType::KDTree);
+    ASSERT_NE(override_space, UINT32_MAX);
+    EXPECT_NE(override_space, default_blas_space);
+
+    inst_records = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(inst_records, nullptr);
+    bool found_override = false;
+    for (const auto& irec : *inst_records)
+    {
+        if (irec.instance_node_id == inst_node_id)
+        {
+            EXPECT_EQ(irec.active_space_id, override_space);
+            EXPECT_EQ(irec.active_as_type, ASType::KDTree);
+            found_override = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_override);
+
+    // Render with active Heterogeneous TLAS (containing both in-place rebuilt BLAS and instance override)
+    const uint32_t width = 128;
+    const uint32_t height = 128;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.5f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    raytracer.update_parameters(scene, width, height);
+
+    raytracer.draw_first_hit(scene, surface, width, height, 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<uchar4> host_pixels(width * height);
+    ASSERT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+    uint32_t hit_pixels = 0;
+    for (const auto& px : host_pixels)
+    {
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+            ++hit_pixels;
+    }
+    EXPECT_GT(hit_pixels, 0u);
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    // Free instance override -> binds back to shared default BLAS space
+    scene.free_node_as(inst_node_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(override_space));
+
+    inst_records = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(inst_records, nullptr);
+    bool found_reverted = false;
+    for (const auto& irec : *inst_records)
+    {
+        if (irec.instance_node_id == inst_node_id)
+        {
+            EXPECT_EQ(irec.active_space_id, default_blas_space);
+            found_reverted = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_reverted);
+
+    scene.free_node_as(scene.root_node_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(tlas_space));
+    EXPECT_FALSE(scene.spaces.is_allocated(rebuilt_space));
+}
+
+TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("HeterogeneousRebuildTlasOnly");
+    scene.load(view);
+
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 2048;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    const uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    ASSERT_TRUE(scene.spaces.is_allocated(tlas_space));
+    scene.set_active_space(tlas_space);
+
+    const int tree_id = scene.spaces[tlas_space].root_box;
+    ASSERT_GE(tree_id, 0);
+    EXPECT_EQ(scene.as_heterogeneous.trees[static_cast<size_t>(tree_id)].tlas_as_type, static_cast<uint32_t>(ASType::BVH));
+
+    const double init_tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
+    const double init_blas_ms = scene.as_heterogeneous.get_blas_build_time_ms(tlas_space);
+    const double init_eval_ms = scene.as_heterogeneous.get_blas_eval_prep_time_ms(tlas_space);
+    const double init_total_ms = scene.as_heterogeneous.get_build_time_ms(tlas_space);
+    EXPECT_GT(init_tlas_ms, 0.0);
+    EXPECT_GT(init_blas_ms, 0.0);
+    EXPECT_GE(init_eval_ms, 0.0);
+    EXPECT_NEAR(init_total_ms, init_tlas_ms + init_blas_ms + init_eval_ms, 1e-6);
+
+    const auto* mesh_records = scene.as_heterogeneous.get_mesh_records(tlas_space);
+    const auto* inst_records = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(mesh_records, nullptr);
+    ASSERT_NE(inst_records, nullptr);
+    ASSERT_FALSE(mesh_records->empty());
+
+    std::vector<uint32_t> original_blas_spaces;
+    for (const auto& rec : *mesh_records)
+    {
+        EXPECT_GT(rec.selected_build_ms, 0.0);
+        original_blas_spaces.push_back(rec.space_id);
+    }
+
+    uint32_t inst_node_id = UINT32_MAX;
+    for (const auto& irec : *inst_records)
+    {
+        if (irec.instance_node_id < scene.m_nodes.size() &&
+            scene.m_nodes[irec.instance_node_id].meshId == 0 &&
+            scene.m_nodes[irec.instance_node_id].count_subtree_meshes(scene.m_nodes) == 1)
+        {
+            inst_node_id = irec.instance_node_id;
+            break;
+        }
+    }
+    ASSERT_NE(inst_node_id, UINT32_MAX);
+    const uint32_t override_space = scene.build_node_as(inst_node_id, ASType::KDTree);
+    ASSERT_NE(override_space, UINT32_MAX);
+
+    const uint32_t width = 128;
+    const uint32_t height = 128;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    Raytracer raytracer;
+    raytracer.parameters.view_pos = glm::vec3(0.5f, -1.2f, 0.5f);
+    raytracer.parameters.ax = 0.0f;
+    raytracer.parameters.az = 0.0f;
+    raytracer.parameters.background_color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    std::vector<uchar4> host_pixels(width * height);
+    const ASType target_tlas_types[] = {ASType::KDTree, ASType::UniformGrid, ASType::Octree, ASType::BVH};
+
+    for (ASType target_tlas : target_tlas_types)
+    {
+        scene.as_heterogeneous.config.tlas_type = target_tlas;
+        scene.rebuild_heterogeneous_tlas(tlas_space);
+
+        EXPECT_TRUE(scene.spaces.is_allocated(tlas_space));
+        EXPECT_EQ(scene.spaces[tlas_space].as_type, ASType::Heterogeneous);
+        EXPECT_EQ(scene.spaces[tlas_space].root_box, tree_id);
+        EXPECT_EQ(scene.as_heterogeneous.trees[static_cast<size_t>(tree_id)].tlas_as_type, static_cast<uint32_t>(target_tlas));
+
+        const double tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
+        EXPECT_GT(tlas_ms, 0.0);
+        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_build_time_ms(tlas_space), init_blas_ms);
+        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_eval_prep_time_ms(tlas_space), init_eval_ms);
+        EXPECT_NEAR(scene.as_heterogeneous.get_build_time_ms(tlas_space), tlas_ms + init_blas_ms + init_eval_ms, 1e-6);
+
+        const auto* post_meshes = scene.as_heterogeneous.get_mesh_records(tlas_space);
+        ASSERT_NE(post_meshes, nullptr);
+        ASSERT_EQ(post_meshes->size(), original_blas_spaces.size());
+        for (size_t i = 0; i < original_blas_spaces.size(); ++i)
+        {
+            EXPECT_EQ((*post_meshes)[i].space_id, original_blas_spaces[i]);
+            EXPECT_TRUE(scene.spaces.is_allocated(original_blas_spaces[i]));
+        }
+
+        raytracer.update_parameters(scene, width, height);
+        raytracer.draw_first_hit(scene, surface, width, height, 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+        uint32_t hit_pixels = 0;
+        for (const auto& px : host_pixels)
+        {
+            if (px.x > 0 || px.y > 0 || px.z > 0)
+                ++hit_pixels;
+        }
+        EXPECT_GT(hit_pixels, 0u);
+    }
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+
+    scene.free_node_as(inst_node_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(override_space));
+    scene.free_node_as(scene.root_node_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(tlas_space));
+    for (uint32_t blas_id : original_blas_spaces)
+    {
+        EXPECT_FALSE(scene.spaces.is_allocated(blas_id));
+    }
+}
+
+TEST(BVHAS, RefractionBoxEdgePlanesMatchOctreeGPU)
+{
+    auto view = vkbase::assets::get("Scenes/Refraction.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene_oct("RefractionOct");
+    scene_oct.load(view);
+    auto m_oct = scene_oct.get_mesh_transform();
+    scene_oct.as_octree.config.max_depth = 10;
+    const uint32_t sp_oct = scene_oct.build_as(m_oct, ASType::Octree);
+    scene_oct.set_active_space(sp_oct);
+
+    Scene scene_bvh32("RefractionBVH32");
+    scene_bvh32.load(view);
+    auto m_32 = scene_bvh32.get_mesh_transform();
+    scene_bvh32.as_bvh.config.use_bvh16 = false;
+    scene_bvh32.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    const uint32_t sp_32 = scene_bvh32.build_as(m_32, ASType::BVH);
+    scene_bvh32.set_active_space(sp_32);
+
+    Scene scene_bvh16("RefractionBVH16");
+    scene_bvh16.load(view);
+    auto m_16 = scene_bvh16.get_mesh_transform();
+    scene_bvh16.as_bvh.config.use_bvh16 = true;
+    scene_bvh16.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    const uint32_t sp_16 = scene_bvh16.build_as(m_16, ASType::BVH);
+    scene_bvh16.set_active_space(sp_16);
+
+    Scene scene_het("RefractionHetBVH16");
+    scene_het.load(view);
+    scene_het.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene_het.as_heterogeneous.variants.clear();
+    ASConfigVariant bvh16_only{};
+    bvh16_only.name = "BVH16 SAH";
+    bvh16_only.as_type = ASType::BVH;
+    bvh16_only.bvh_config.use_bvh16 = true;
+    bvh16_only.bvh_config.split_mode = BVHSplitMode::SAH;
+    bvh16_only.bvh_config.use_gpu = true;
+    scene_het.as_heterogeneous.variants.push_back(bvh16_only);
+    const uint32_t sp_het = scene_het.build_node_as(scene_het.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(sp_het, UINT32_MAX);
+    scene_het.set_active_space(sp_het);
+
+    const uint32_t width = 256;
+    const uint32_t height = 256;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    auto render = [&](Scene& s, glm::vec3 vpos, float ax, float az) {
+        Raytracer rt;
+        rt.parameters.view_pos = vpos;
+        rt.parameters.ax = ax;
+        rt.parameters.az = az;
+        rt.parameters.fov = 45.0f;
+        rt.parameters.enableRefraction = true;
+        rt.parameters.background_color = glm::vec4(1.0f, 0.0f, 1.0f, 1.0f);
+        rt.update_parameters(s, width, height);
+        rt.draw_first_hit(s, surface, width, height, 0);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<uchar4> px(width * height);
+        EXPECT_EQ(cudaMemcpy2DFromArray(px.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+        return px;
+    };
+
+    auto count_diff = [&](const std::vector<uchar4>& a, const std::vector<uchar4>& b) {
+        uint32_t diffs = 0;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            if (std::abs(int(a[i].x) - int(b[i].x)) > 2 ||
+                std::abs(int(a[i].y) - int(b[i].y)) > 2 ||
+                std::abs(int(a[i].z) - int(b[i].z)) > 2)
+            {
+                ++diffs;
+            }
+        }
+        return diffs;
+    };
+
+    struct CameraView
+    {
+        glm::vec3 pos;
+        float ax;
+        float az;
+    };
+    const CameraView views[] = {
+        {glm::vec3(0.25f, 0.25f, 0.35f), -0.15f, -0.45f},
+        {glm::vec3(0.45f, 0.20f, 0.55f), 0.22f, -1.15f},
+    };
+
+    for (const auto& cam : views)
+    {
+        const auto px_oct = render(scene_oct, cam.pos, cam.ax, cam.az);
+        const auto px_32 = render(scene_bvh32, cam.pos, cam.ax, cam.az);
+        const auto px_16 = render(scene_bvh16, cam.pos, cam.ax, cam.az);
+        const auto px_het = render(scene_het, cam.pos, cam.ax, cam.az);
+
+        EXPECT_EQ(count_diff(px_oct, px_32), 0u);
+        EXPECT_EQ(count_diff(px_oct, px_16), 0u);
+        EXPECT_EQ(count_diff(px_32, px_16), 0u);
+        EXPECT_EQ(count_diff(px_oct, px_het), 0u);
+    }
+
+    // Large world-space offset (~1000.0) test: ensures BVH AABB padding survives FP32 ULP rounding
+    // and BVH16 quantization without zero-thickness slab collapse on axis-aligned walls.
+    const glm::vec3 world_shift(1000.0f, 1000.0f, 1000.0f);
+    auto shift_meshes = [&](auto meshes) {
+        for (auto& mt : meshes)
+            mt.first = glm::translate(glm::mat4(1.0f), world_shift) * mt.first;
+        return meshes;
+    };
+
+    Scene shifted_oct("RefractionShiftedOct");
+    shifted_oct.load(view);
+    shifted_oct.as_octree.config.max_depth = 10;
+    const uint32_t ssp_oct = shifted_oct.build_as(shift_meshes(shifted_oct.get_mesh_transform()), ASType::Octree);
+    shifted_oct.set_active_space(ssp_oct);
+
+    Scene shifted_bvh32("RefractionShiftedBVH32");
+    shifted_bvh32.load(view);
+    shifted_bvh32.as_bvh.config.use_bvh16 = false;
+    shifted_bvh32.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    const uint32_t ssp_32 = shifted_bvh32.build_as(shift_meshes(shifted_bvh32.get_mesh_transform()), ASType::BVH);
+    shifted_bvh32.set_active_space(ssp_32);
+
+    Scene shifted_bvh16("RefractionShiftedBVH16");
+    shifted_bvh16.load(view);
+    shifted_bvh16.as_bvh.config.use_bvh16 = true;
+    shifted_bvh16.as_bvh.config.split_mode = BVHSplitMode::SAH;
+    const uint32_t ssp_16 = shifted_bvh16.build_as(shift_meshes(shifted_bvh16.get_mesh_transform()), ASType::BVH);
+    shifted_bvh16.set_active_space(ssp_16);
+
+    const auto spx_oct = render(shifted_oct, views[0].pos + world_shift, views[0].ax, views[0].az);
+    const auto spx_32 = render(shifted_bvh32, views[0].pos + world_shift, views[0].ax, views[0].az);
+    const auto spx_16 = render(shifted_bvh16, views[0].pos + world_shift, views[0].ax, views[0].az);
+    EXPECT_EQ(count_diff(spx_oct, spx_32), 0u);
+    EXPECT_EQ(count_diff(spx_oct, spx_16), 0u);
+    EXPECT_EQ(count_diff(spx_32, spx_16), 0u);
+
+    // Parallel/near-parallel ray on box boundary edge checks (BVH16 and BVH32 leaf slab robustness)
+    {
+        const soa::soa_vector<BVHTreeInfo> h_trees16 = scene_bvh16.as_bvh.trees;
+        const soa::soa_vector<BVHNode16> h_as16 = scene_bvh16.as_bvh.as16;
+        const soa::soa_vector<BVHNode> h_as32 = scene_bvh32.as_bvh.as;
+        const auto& t16 = h_trees16[static_cast<size_t>(scene_bvh16.spaces[sp_16].root_box)];
+        const auto& t32 = scene_bvh32.as_bvh.trees[static_cast<size_t>(scene_bvh32.spaces[sp_32].root_box)];
+
+        const glm::vec3 parallel_dirs[] = {
+            glm::normalize(glm::vec3(1.0f, 0.0f, 0.2f)),
+            glm::normalize(glm::vec3(1.0f, 1e-8f, 0.2f)),
+            glm::normalize(glm::vec3(1.0f, -1e-8f, 0.2f)),
+        };
+        for (const glm::vec3& pdir : parallel_dirs)
+        {
+            const glm::vec3 porig(0.25f, 1.0f, 0.35f);
+            BVHStackEntry stack16[CurrentBVHNode::SHORT_STACK_SIZE];
+            CurrentBVHNode state16{};
+            int it16 = 0;
+            uint32_t hits16 = 0;
+            while (!state16.exited && it16 < 500)
+            {
+                const uint32_t cid = traverse_bvh16_impl<1>(&h_as16[0], t16.as_start, t16.bounds_min, t16.bounds_max, state16, stack16, porig, pdir, it16);
+                if (cid > 0) ++hits16;
+            }
+            EXPECT_GT(hits16, 0u);
+
+            BVHStackEntry stack32[CurrentBVHNode::SHORT_STACK_SIZE];
+            CurrentBVHNode state32{};
+            int it32 = 0;
+            uint32_t hits32 = 0;
+            while (!state32.exited && it32 < 500)
+            {
+                const uint32_t cid = traverse_bvh_impl<1>(&h_as32[0], t32.as_start, state32, stack32, porig, pdir, it32);
+                if (cid > 0) ++hits32;
+            }
+            EXPECT_GT(hits32, 0u);
+        }
+    }
+
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
 }

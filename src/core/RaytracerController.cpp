@@ -47,6 +47,12 @@ void BVHAS::register_containers(ContainerExplorer& explorer)
     explorer.register_container("bvh.box_content", box_content);
 }
 
+void HeterogeneousAS::register_containers(ContainerExplorer& explorer)
+{
+    explorer.register_container("heterogeneous.trees", trees);
+    explorer.register_container("heterogeneous.instances", instances);
+}
+
 
 RaytracerController::RaytracerController()
 {
@@ -125,16 +131,21 @@ void RaytracerController::initScenes()
         SceneData s;
         s.scene=std::make_unique<Scene>(scene_name);
         s.scene->load(scene_data);
+        s.explorer->register_container("nodes", s.scene->m_nodes);
 
         s.scene->as_octree.register_containers(*s.explorer);
         s.scene->as_uniform_grid.register_containers(*s.explorer);
         s.scene->as_kdtree.register_containers(*s.explorer);
         s.scene->as_bvh.register_containers(*s.explorer);
+        s.scene->as_heterogeneous.register_containers(*s.explorer);
         s.explorer->register_container("scene.materials", s.scene->m_materials, [this, sc = s.scene.get()](std::size_t)
         {
             std::lock_guard lock(device_data_mutex);
             sc->sync_materials_to_device();
         });
+
+        s.explorer->register_container("scene.nodes", s.scene->m_nodes);
+
         s.explorer->register_container("scene.textures", s.scene->m_textures);
         s.explorer->register_container("scene.meshes",s.scene->m_meshes);
         for (auto& mesh: s.scene->m_meshes)
@@ -470,12 +481,17 @@ bool RaytracerController::ui_frame_info()
 
 
 
-static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_space_id, int& id_counter)
+static void render_node_tree(Scene& scene, uint32_t node_id, uint32_t& selected_node_id, uint32_t active_space_id, int& id_counter)
 {
+    if (node_id >= scene.m_nodes.size())
+        return;
+
+    const Node& node = scene.m_nodes[node_id];
     ImGui::PushID(++id_counter);
 
-    bool is_selected = (selected_node == &node);
+    bool is_selected = (selected_node_id == node_id);
     bool is_active_render = (node.as_ref.is_valid() && node.as_ref.space_id == active_space_id);
+    const bool is_shared = scene.is_mesh_node_shared(node_id);
 
     std::string label = node.name.empty() ? "Node" : node.name;
     if (node.as_ref.is_valid())
@@ -486,7 +502,12 @@ static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_s
         else if (node.as_ref.type == ASType::UniformGrid) type_name = "UniformGrid";
         else if (node.as_ref.type == ASType::KDTree) type_name = "KDTree";
         else if (node.as_ref.type == ASType::BVH) type_name = "BVH";
-        label += " [" + type_name + " #" + std::to_string(node.as_ref.space_id) + "]";
+        else if (node.as_ref.type == ASType::Heterogeneous) type_name = "Heterogeneous";
+        label += " [" + type_name + " #" + std::to_string(node.as_ref.space_id) + (is_shared ? " (shared)" : "") + "]";
+    }
+    else if (is_shared)
+    {
+        label += " [shared]";
     }
     if (is_active_render)
     {
@@ -504,33 +525,33 @@ static void render_node_tree(Node& node, Node*& selected_node, uint32_t active_s
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
         if (is_active_render)
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
-        ImGui::TreeNodeEx((void*)&node, flags, "%s", label.c_str());
+        ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(node_id)), flags, "%s", label.c_str());
         if (is_active_render)
             ImGui::PopStyleColor();
 
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         {
-            selected_node = &node;
+            selected_node_id = node_id;
         }
     }
     else
     {
         if (is_active_render)
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
-        bool node_open = ImGui::TreeNodeEx((void*)&node, flags, "%s", label.c_str());
+        bool node_open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(node_id)), flags, "%s", label.c_str());
         if (is_active_render)
             ImGui::PopStyleColor();
 
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         {
-            selected_node = &node;
+            selected_node_id = node_id;
         }
 
         if (node_open)
         {
-            for (auto& child : node.children)
+            for (uint32_t child_id : node.children)
             {
-                render_node_tree(child, selected_node, active_space_id, id_counter);
+                render_node_tree(scene, child_id, selected_node_id, active_space_id, id_counter);
             }
             ImGui::TreePop();
         }
@@ -567,7 +588,7 @@ bool RaytracerController::ui_scenes_manager()
         if (ImGui::BeginChild("scene_tree", ImVec2(left_width, available.y), true))
         {
             int id_counter = 0;
-            render_node_tree(active_scene.root_node, scene_data.selected_node, active_scene.get_active_space(), id_counter);
+            render_node_tree(active_scene, active_scene.root_node_id, scene_data.selected_node_id, active_scene.get_active_space(), id_counter);
         }
         ImGui::EndChild();
 
@@ -578,162 +599,200 @@ bool RaytracerController::ui_scenes_manager()
             static bool auto_select = true;
             static bool auto_play = true;
 
-            if (scene_data.selected_node == nullptr)
+            if (scene_data.selected_node_id >= active_scene.m_nodes.size())
             {
-                scene_data.selected_node = &active_scene.root_node;
+                scene_data.selected_node_id = active_scene.root_node_id;
             }
 
-            Node& node = *scene_data.selected_node;
-
-            ImGui::Text("Node: %s", node.name.c_str());
-            ImGui::Separator();
-
-            auto trans = node.getTranslation();
-            auto scale = node.getScale();
-            ImGui::Text("Translation: (%.2f, %.2f, %.2f)", trans.x, trans.y, trans.z);
-            ImGui::Text("Scale:       (%.2f, %.2f, %.2f)", scale.x, scale.y, scale.z);
-
-            if (node.meshId > 0 && node.meshId - 1 < active_scene.m_meshes.size())
+            if (scene_data.selected_node_id < active_scene.m_nodes.size())
             {
-                auto& mesh = active_scene.m_meshes[node.meshId - 1];
-                ImGui::Text("Direct Mesh: %s", mesh.name.c_str());
-                ImGui::Text("  Triangles: %u", (uint32_t)mesh.triangles.size());
-                ImGui::Text("  Vertices:  %u", (uint32_t)mesh.vertices.size());
-            }
-            else
-            {
-                ImGui::Text("Direct Mesh: None");
-            }
+                Node& node = active_scene.m_nodes[scene_data.selected_node_id];
 
-            size_t sub_meshes = node.count_subtree_meshes();
-            size_t sub_triangles = node.count_subtree_triangles(active_scene.m_meshes);
-            size_t sub_vertices = node.count_subtree_vertices(active_scene.m_meshes);
-            ImGui::Text("Subtree Meshes:    %zu", sub_meshes);
-            ImGui::Text("Subtree Triangles: %zu", sub_triangles);
-            ImGui::Text("Subtree Vertices:  %zu", sub_vertices);
+                ImGui::Text("Node: %s (#%u)%s",
+                            node.name.c_str(),
+                            scene_data.selected_node_id,
+                            active_scene.is_mesh_node_shared(scene_data.selected_node_id) ? " [shared]" : "");
+                ImGui::Separator();
 
-            ImGui::Separator();
-            ImGui::Text("Acceleration Structure");
+                auto trans = node.getTranslation();
+                auto scale = node.getScale();
+                ImGui::Text("Translation: (%.2f, %.2f, %.2f)", trans.x, trans.y, trans.z);
+                ImGui::Text("Scale:       (%.2f, %.2f, %.2f)", scale.x, scale.y, scale.z);
 
-            if (node.as_ref.is_valid())
-            {
-                const char* type_str = "Unknown";
-                if (node.as_ref.type == ASType::Optix) type_str = "OptiX";
-                else if (node.as_ref.type == ASType::Octree) type_str = "Octree";
-                else if (node.as_ref.type == ASType::UniformGrid) type_str = "UniformGrid";
-                else if (node.as_ref.type == ASType::KDTree) type_str = "KDTree";
-                else if (node.as_ref.type == ASType::BVH) type_str = "BVH";
-                ImGui::Text("Status: Built (%s, Space #%u)", type_str, node.as_ref.space_id);
-                if (active_scene.spaces.is_allocated(node.as_ref.space_id))
+                if (node.meshId > 0 && node.meshId - 1 < active_scene.m_meshes.size())
                 {
-                    auto sp = active_scene.spaces[node.as_ref.space_id];
-                    if (node.as_ref.type == ASType::Octree)
-                        active_scene.as_octree.info_ui(node.as_ref.space_id, sp);
-                    else if (node.as_ref.type == ASType::UniformGrid)
-                        active_scene.as_uniform_grid.info_ui(node.as_ref.space_id, sp);
-                    else if (node.as_ref.type == ASType::KDTree)
-                        active_scene.as_kdtree.info_ui(node.as_ref.space_id, sp);
-                    else if (node.as_ref.type == ASType::BVH)
-                        active_scene.as_bvh.info_ui(node.as_ref.space_id, sp);
-                    else if (node.as_ref.type == ASType::Optix)
-                        active_scene.as_optix.info_ui(node.as_ref.space_id, sp);
+                    auto& mesh = active_scene.m_meshes[node.meshId - 1];
+                    ImGui::Text("Direct Mesh: %s", mesh.name.c_str());
+                    ImGui::Text("  Triangles: %u", (uint32_t)mesh.triangles.size());
+                    ImGui::Text("  Vertices:  %u", (uint32_t)mesh.vertices.size());
                 }
-                if (active_scene.get_active_space() == node.as_ref.space_id)
+                else
                 {
-                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Currently Active in Renderer");
+                    ImGui::Text("Direct Mesh: None");
                 }
-            }
-            else
-            {
-                ImGui::Text("Status: Not built");
-            }
 
-            static int selected_as_type = 0; // 0: Octree, 1: Uniform Grid, 2: KD-Tree, 3: BVH, 4: OptiX
-            const char* as_type_names[] = {"Octree", "Uniform Grid", "KD-Tree", "BVH", "OptiX (Hardware RT)"};
-            ImGui::Combo("AS Type", &selected_as_type, as_type_names, 5);
+                size_t sub_meshes = node.count_subtree_meshes(active_scene.m_nodes);
+                size_t sub_triangles = node.count_subtree_triangles(active_scene.m_nodes, active_scene.m_meshes);
+                size_t sub_vertices = node.count_subtree_vertices(active_scene.m_nodes, active_scene.m_meshes);
+                ImGui::Text("Subtree Meshes:    %zu", sub_meshes);
+                ImGui::Text("Subtree Triangles: %zu", sub_triangles);
+                ImGui::Text("Subtree Vertices:  %zu", sub_vertices);
 
-            ImGui::BeginDisabled(sub_triangles == 0);
-            if (ImGui::Button("Build AS"))
-            {
-                pause();
-                device_data_mutex.lock();
+                ImGui::Separator();
+                ImGui::Text("Acceleration Structure");
+
                 if (node.as_ref.is_valid())
                 {
-                    active_scene.free_space(node.as_ref.space_id);
-                    node.as_ref = {};
+                    const char* type_str = "Unknown";
+                    if (node.as_ref.type == ASType::Optix) type_str = "OptiX";
+                    else if (node.as_ref.type == ASType::Octree) type_str = "Octree";
+                    else if (node.as_ref.type == ASType::UniformGrid) type_str = "UniformGrid";
+                    else if (node.as_ref.type == ASType::KDTree) type_str = "KDTree";
+                    else if (node.as_ref.type == ASType::BVH) type_str = "BVH";
+                    else if (node.as_ref.type == ASType::Heterogeneous) type_str = "Heterogeneous";
+                    ImGui::Text("Status: Built (%s, Space #%u)", type_str, node.as_ref.space_id);
+                    if (active_scene.spaces.is_allocated(node.as_ref.space_id))
+                    {
+                        auto sp = active_scene.spaces[node.as_ref.space_id];
+                        if (node.as_ref.type == ASType::Octree)
+                            active_scene.as_octree.info_ui(node.as_ref.space_id, sp);
+                        else if (node.as_ref.type == ASType::UniformGrid)
+                            active_scene.as_uniform_grid.info_ui(node.as_ref.space_id, sp);
+                        else if (node.as_ref.type == ASType::KDTree)
+                            active_scene.as_kdtree.info_ui(node.as_ref.space_id, sp);
+                        else if (node.as_ref.type == ASType::BVH)
+                            active_scene.as_bvh.info_ui(node.as_ref.space_id, sp);
+                        else if (node.as_ref.type == ASType::Heterogeneous)
+                            active_scene.as_heterogeneous.info_ui(node.as_ref.space_id, sp);
+                        else if (node.as_ref.type == ASType::Optix)
+                            active_scene.as_optix.info_ui(node.as_ref.space_id, sp);
+                    }
+                    if (const MeshBuildRecord* mesh_rec = active_scene.as_heterogeneous.find_mesh_record_by_space(node.as_ref.space_id))
+                    {
+                        if (ImGui::TreeNode("Heterogeneous Candidate Benchmarks"))
+                        {
+                            ImGui::Text("  Instances:        %u", mesh_rec->instance_count);
+                            ImGui::Text("  Selected Variant: %s", mesh_rec->selected_variant_name.c_str());
+                            ImGui::Text("  BLAS Build Time:  %.2f ms", mesh_rec->selected_build_ms);
+                            for (const auto& cand : mesh_rec->candidates)
+                            {
+                                ImGui::Text("    %-24s | %6.3f ms | %6.2f ms build | %6.1f B/tri %s",
+                                            cand.variant_name.c_str(),
+                                            cand.probe_trace_ms,
+                                            cand.build_ms,
+                                            cand.bytes_per_triangle,
+                                            cand.within_memory_limit ? "" : "[over]");
+                            }
+                            ImGui::TreePop();
+                        }
+                    }
+                    if (active_scene.get_active_space() == node.as_ref.space_id)
+                    {
+                        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "Currently Active in Renderer");
+                    }
+                    if (node.as_ref.type == ASType::Heterogeneous &&
+                        active_scene.spaces.is_allocated(node.as_ref.space_id))
+                    {
+                        ImGui::PushID("built_heterogeneous_tlas_controls");
+                        active_scene.as_heterogeneous.tlas_type_combo_ui();
+                        if (ImGui::Button("Rebuild TLAS Only"))
+                        {
+                            pause();
+                            device_data_mutex.lock();
+                            active_scene.rebuild_heterogeneous_tlas(node.as_ref.space_id);
+                            if (auto_select)
+                            {
+                                active_scene.set_active_space(node.as_ref.space_id);
+                            }
+                            device_data_mutex.unlock();
+                            if (auto_play)
+                                play();
+                        }
+                        ImGui::PopID();
+                    }
+                }
+                else
+                {
+                    ImGui::Text("Status: Not built");
                 }
 
-                auto relative_meshes = active_scene.get_mesh_transform(&node);
-                if (!relative_meshes.empty())
+                static int selected_as_type = 0; // 0: Octree, 1: Uniform Grid, 2: KD-Tree, 3: BVH, 4: OptiX, 5: Heterogeneous
+                const char* as_type_names[] = {"Octree", "Uniform Grid", "KD-Tree", "BVH", "OptiX (Hardware RT)", "Heterogeneous"};
+                ImGui::Combo("AS Type", &selected_as_type, as_type_names, 6);
+
+                ImGui::BeginDisabled(sub_triangles == 0);
+                if (ImGui::Button("Build AS"))
                 {
+                    pause();
+                    device_data_mutex.lock();
+
                     ASType as_type = ASType::Octree;
                     if (selected_as_type == 1) as_type = ASType::UniformGrid;
                     else if (selected_as_type == 2) as_type = ASType::KDTree;
                     else if (selected_as_type == 3) as_type = ASType::BVH;
                     else if (selected_as_type == 4) as_type = ASType::Optix;
-                    uint32_t new_space_id = active_scene.build_as(
-                        relative_meshes, as_type);
-                    node.as_ref = {new_space_id, as_type};
+                    else if (selected_as_type == 5) as_type = ASType::Heterogeneous;
 
-                    if (auto_select)
+                    uint32_t new_space_id = active_scene.build_node_as(scene_data.selected_node_id, as_type);
+                    if (new_space_id != UINT32_MAX && auto_select)
                     {
                         active_scene.set_active_space(new_space_id);
                     }
+                    device_data_mutex.unlock();
+                    if (auto_play)
+                        play();
                 }
-                device_data_mutex.unlock();
-                if (auto_play)
-                    play();
-            }
-            ImGui::EndDisabled();
+                ImGui::EndDisabled();
 
-            if (selected_as_type == 0)
-            {
-                active_scene.as_octree.config_ui();
-            }
-            else if (selected_as_type == 1)
-            {
-                active_scene.as_uniform_grid.config_ui();
-            }
-            else if (selected_as_type == 2)
-            {
-                active_scene.as_kdtree.config_ui();
-            }
-            else if (selected_as_type == 3)
-            {
-                active_scene.as_bvh.config_ui();
-            }
-
-            ImGui::Separator();
-
-            ImGui::Checkbox("Auto select for render after build", &auto_select);
-            ImGui::Checkbox("Auto play after build", &auto_play);
-
-            ImGui::SameLine();
-
-            ImGui::BeginDisabled(!node.as_ref.is_valid());
-            if (ImGui::Button("Select for Render"))
-            {
-                device_data_mutex.lock();
-                active_scene.set_active_space(node.as_ref.space_id);
-                device_data_mutex.unlock();
-            }
-            ImGui::EndDisabled();
-
-            ImGui::SameLine();
-
-            ImGui::BeginDisabled(!node.as_ref.is_valid());
-            if (ImGui::Button("Free AS"))
-            {
-                pause();
-                device_data_mutex.lock();
-                if (node.as_ref.is_valid())
+                if (selected_as_type == 0)
                 {
-                    active_scene.free_space(node.as_ref.space_id);
-                    node.as_ref = {};
+                    active_scene.as_octree.config_ui();
                 }
-                device_data_mutex.unlock();
+                else if (selected_as_type == 1)
+                {
+                    active_scene.as_uniform_grid.config_ui();
+                }
+                else if (selected_as_type == 2)
+                {
+                    active_scene.as_kdtree.config_ui();
+                }
+                else if (selected_as_type == 3)
+                {
+                    active_scene.as_bvh.config_ui();
+                }
+                else if (selected_as_type == 5)
+                {
+                    active_scene.as_heterogeneous.config_ui();
+                }
+
+                ImGui::Separator();
+
+                ImGui::Checkbox("Auto select for render after build", &auto_select);
+                ImGui::Checkbox("Auto play after build", &auto_play);
+
+                ImGui::SameLine();
+
+                ImGui::BeginDisabled(!node.as_ref.is_valid());
+                if (ImGui::Button("Select for Render"))
+                {
+                    device_data_mutex.lock();
+                    active_scene.set_active_space(node.as_ref.space_id);
+                    device_data_mutex.unlock();
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
+
+                ImGui::BeginDisabled(!node.as_ref.is_valid());
+                if (ImGui::Button("Free AS"))
+                {
+                    pause();
+                    device_data_mutex.lock();
+                    active_scene.free_node_as(scene_data.selected_node_id);
+                    device_data_mutex.unlock();
+                }
+                ImGui::EndDisabled();
             }
-            ImGui::EndDisabled();
         }
         ImGui::EndChild();
     }

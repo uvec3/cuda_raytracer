@@ -9,6 +9,7 @@
 #include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../acceleration_structures/kdtree/KDTreeGeometry.cuh"
 #include "../acceleration_structures/bvh/BVHGeometry.cuh"
+#include "../acceleration_structures/heterogeneous/HeterogeneousGeometry.cuh"
 
 
 
@@ -64,6 +65,8 @@ glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& 
         return p.as_kdtree.template first_hit<HasNagata>(p, source, direction);
     else if constexpr (AsType == ASType::BVH)
         return p.as_bvh.template first_hit<HasNagata, UseBVH16>(p, source, direction);
+    else if constexpr (AsType == ASType::Heterogeneous)
+        return p.as_heterogeneous.template first_hit<HasNagata>(p, source, direction);
     else
         return p.as_octree.template first_hit<HasNagata>(p, source, direction);
 }
@@ -77,6 +80,8 @@ glm::vec4 trace_pixel_first_hit(uint32_t x, uint32_t y, const RenderParameters& 
         return trace_pixel_first_hit<ASType::KDTree>(x, y, p);
     if (p.active_as_type == ASType::BVH)
         return trace_pixel_first_hit<ASType::BVH>(x, y, p);
+    if (p.active_as_type == ASType::Heterogeneous)
+        return trace_pixel_first_hit<ASType::Heterogeneous>(x, y, p);
     return trace_pixel_first_hit<ASType::Octree>(x, y, p);
 }
 

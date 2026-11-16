@@ -57,9 +57,27 @@ public:
                               uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
                               auto find_triangle_cube_relation);
 
+    struct AdaptiveGridLayout
+    {
+        glm::uvec3 dims{1u};
+        float cell_size = 1e-4f;
+    };
+
+    // CurrentGridCell stores 10-bit cell coordinates (0..1023 per axis).
+    static constexpr uint32_t kMaxAxisResolution = 1024u;
+
+    /**
+     * @brief Solves for cubic-cell uniform grid dimensions from target voxel density and AABB extents.
+     *
+     * Solves N_x * N_y * N_z = target_voxels with N_i = d_i * t, clamping axes to [1, kMaxAxisResolution]
+     * (re-solving over active axes when thin/planar axes clamp to 1) and scaling cell_size so the grid
+     * encloses [0, aabb_size].
+     */
+    static AdaptiveGridLayout compute_grid_dimensions(glm::vec3 aabb_size, uint32_t primitive_count, float voxels_per_triangle);
+
     struct Config
     {
-        int resolution = 20;
+        float voxels_per_triangle = 1.0f;
         bool swapYZ = true;
         bool sort_space = true;
         PrimitiveType triangle_type = PrimitiveType::Triangle;

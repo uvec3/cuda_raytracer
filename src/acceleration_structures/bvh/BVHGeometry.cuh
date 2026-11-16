@@ -80,6 +80,13 @@ struct alignas(16) BVHNode16
                 --qmin;
             if (qmax < 65535u && (tree_min[a] + static_cast<float>(qmax) * step[a] < node.bounds_max[a]))
                 ++qmax;
+            if (qmin >= qmax)
+            {
+                if (qmax < 65535u)
+                    ++qmax;
+                else if (qmin > 0u)
+                    --qmin;
+            }
 
             out.bounds[a] = (qmax << 16) | (qmin & 0xFFFFu);
         }
@@ -132,6 +139,23 @@ glm::vec3 bvh_safe_inv_dir(glm::vec3 dir)
 }
 
 __host__ __device__ __forceinline__
+bool bvh_finish_aabb_interval(
+    float tmin,
+    float box_tmax,
+    float ray_t_max,
+    float& out_tmin,
+    float& out_tmax)
+{
+    // Conservative slab exit tolerance (Ize 2013) to cover FP32/-use_fast_math/quantization rounding
+    // on planar surfaces and box edges without risking false misses.
+    const float safe_tmax = fmaf(box_tmax, 1.000002f, 1e-6f);
+    const float tmax = fminf(ray_t_max, safe_tmax);
+    out_tmin = tmin;
+    out_tmax = tmax;
+    return tmin <= tmax;
+}
+
+__host__ __device__ __forceinline__
 bool bvh_intersect_aabb(
     glm::vec3 bmin,
     glm::vec3 bmax,
@@ -148,13 +172,11 @@ bool bvh_intersect_aabb(
     const glm::vec3 tbigger = glm::max(t0, t1);
 
     const float tmin = fmaxf(ray_t_min, fmaxf(tsmaller.x, fmaxf(tsmaller.y, tsmaller.z)));
-    const float tmax = fminf(ray_t_max, fminf(tbigger.x, fminf(tbigger.y, tbigger.z)));
-    out_tmin = tmin;
-    out_tmax = tmax;
-    return tmin <= tmax;
+    const float box_tmax = fminf(tbigger.x, fminf(tbigger.y, tbigger.z));
+    return bvh_finish_aabb_interval(tmin, box_tmax, ray_t_max, out_tmin, out_tmax);
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentBVHNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_bvh_impl(
     const BVHNode* as,
     uint32_t as_start,
@@ -268,7 +290,7 @@ __host__ __device__ inline uint32_t traverse_bvh_impl(
         }
 
         const bool pick_left = hit0 && (!hit1 || tmin0 <= tmin1);
-        if (hit0 && hit1 && state.stack_size < CurrentBVHNode::SHORT_STACK_SIZE)
+        if (hit0 && hit1 && state.stack_size < MaxStackSize)
         {
             const int32_t far_entry_id = pick_left
                 ? (child1.is_leaf() ? ~static_cast<int32_t>(right_idx) : static_cast<int32_t>(child1.left_child()))
@@ -310,7 +332,7 @@ __host__ __device__ inline uint32_t traverse_bvh_impl(
     return 0;
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentBVHNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_bvh(
     const BVHASDeviceView& view,
     int tree_id,
@@ -329,7 +351,7 @@ __host__ __device__ inline uint32_t traverse_bvh(
     }
 
     const uint32_t as_start = view.trees[static_cast<uint32_t>(tree_id)].as_start;
-    return traverse_bvh_impl<StackStride>(
+    return traverse_bvh_impl<StackStride, MaxStackSize>(
         &view.as[0],
         as_start,
         state,
@@ -355,15 +377,8 @@ uint4 bvh16_load_raw(const BVHNode16* __restrict__ as16, uint32_t idx)
 __host__ __device__ __forceinline__
 void bvh16_decode_axis(uint32_t packed, float scale, float bias, float& out_t0, float& out_t1)
 {
-#if defined(__CUDA_ARCH__)
-    // Pack 16-bit q into the low mantissa bits of 1.0f (= 1.0f + q * 2^-23);
-    // the +1.0f offset and 2^-23 factor are pre-folded into (scale, bias).
-    const float q0 = __uint_as_float(__byte_perm(packed, 0x3F800000u, 0x7610u));
-    const float q1 = __uint_as_float(__byte_perm(packed, 0x3F800000u, 0x7632u));
-#else
-    const float q0 = 1.0f + static_cast<float>(packed & 0xFFFFu) * (1.0f / 8388608.0f);
-    const float q1 = 1.0f + static_cast<float>(packed >> 16) * (1.0f / 8388608.0f);
-#endif
+    const float q0 = static_cast<float>(packed & 0xFFFFu);
+    const float q1 = static_cast<float>(packed >> 16);
     out_t0 = fmaf(q0, scale, bias);
     out_t1 = fmaf(q1, scale, bias);
 }
@@ -378,8 +393,8 @@ void bvh16_compute_ray_transform(
     glm::vec3& q_bias)
 {
     const glm::vec3 ext = glm::max(tree_bmax - tree_bmin, glm::vec3(1e-12f));
-    q_scale = (ext * (8388608.0f / 65535.0f)) * inv_dir;
-    q_bias = ((tree_bmin - orig) * inv_dir) - q_scale;
+    q_scale = (ext * (1.0f / 65535.0f)) * inv_dir;
+    q_bias = (tree_bmin - orig) * inv_dir;
 #if defined(__CUDA_ARCH__)
     // Pin materialized (q_scale, q_bias) so NVCC does not rematerialize them inside traversal loops.
     asm volatile(""
@@ -404,13 +419,11 @@ bool bvh16_intersect_aabb(
     bvh16_decode_axis(raw.z, q_scale.z, q_bias.z, tz0, tz1);
 
     const float tmin = fmaxf(ray_t_min, fmaxf(fminf(tx0, tx1), fmaxf(fminf(ty0, ty1), fminf(tz0, tz1))));
-    const float tmax = fminf(ray_t_max, fminf(fmaxf(tx0, tx1), fminf(fmaxf(ty0, ty1), fmaxf(tz0, tz1))));
-    out_tmin = tmin;
-    out_tmax = tmax;
-    return tmin <= tmax;
+    const float box_tmax = fminf(fmaxf(tx0, tx1), fminf(fmaxf(ty0, ty1), fmaxf(tz0, tz1)));
+    return bvh_finish_aabb_interval(tmin, box_tmax, ray_t_max, out_tmin, out_tmax);
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentBVHNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_bvh16_precomputed(
     const BVHNode16* __restrict__ as16,
     glm::vec3 q_scale,
@@ -491,7 +504,7 @@ __host__ __device__ inline uint32_t traverse_bvh16_precomputed(
         }
 
         const bool pick_left = hit0 && (!hit1 || tmin0 <= tmin1);
-        if (hit0 && hit1 && state.stack_size < CurrentBVHNode::SHORT_STACK_SIZE)
+        if (hit0 && hit1 && state.stack_size < MaxStackSize)
         {
             const uint32_t far_data = pick_left ? raw1.w : raw0.w;
             const bool far_is_leaf = (far_data & 0x80000000u) != 0u;
@@ -535,7 +548,7 @@ __host__ __device__ inline uint32_t traverse_bvh16_precomputed(
     return 0;
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentBVHNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_bvh16_impl(
     const BVHNode16* as16,
     uint32_t as_start,
@@ -584,11 +597,11 @@ __host__ __device__ inline uint32_t traverse_bvh16_impl(
     glm::vec3 q_bias{};
     bvh16_compute_ray_transform(tree_bmin, tree_bmax, orig, inv_dir, q_scale, q_bias);
 
-    return traverse_bvh16_precomputed<StackStride>(
+    return traverse_bvh16_precomputed<StackStride, MaxStackSize>(
         as16, q_scale, q_bias, state, stack_base, iterations, finite_max_t, ray_t_min);
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentBVHNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_bvh16(
     const BVHASDeviceView& view,
     int tree_id,
@@ -607,7 +620,7 @@ __host__ __device__ inline uint32_t traverse_bvh16(
     }
 
     const auto tree = view.trees[static_cast<uint32_t>(tree_id)];
-    return traverse_bvh16_impl<StackStride>(
+    return traverse_bvh16_impl<StackStride, MaxStackSize>(
         &view.as16[0],
         tree.as_start,
         tree.bounds_min,
@@ -676,9 +689,9 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
                         ++box_hits;
                         if (p.show_triangles)
                         {
-                            intersect_box_primitives<HasNagata>(
+                            intersect_box_primitives<HasNagata, false>(
                                 box_content, container_id, p, source, direction,
-                                root_tmin, root_tmax, closest_triangle, closest_tuv);
+                                ray_t_min, fminf(closest_tuv.x, 1e30f), closest_triangle, closest_tuv);
                         }
                     }
                 }
@@ -703,14 +716,14 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
                             ++box_hits;
                             if (p.show_triangles)
                             {
-                                intersect_box_primitives<HasNagata>(
+                                intersect_box_primitives<HasNagata, false>(
                                     box_content,
                                     container_id,
                                     p,
                                     source,
                                     direction,
-                                    current_node.t_min,
-                                    glm::min(current_node.t_max, closest_tuv.x),
+                                    ray_t_min,
+                                    fminf(closest_tuv.x, 1e30f),
                                     closest_triangle,
                                     closest_tuv);
                             }
@@ -733,14 +746,14 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
                     ++box_hits;
                     if (p.show_triangles)
                     {
-                        intersect_box_primitives<HasNagata>(
+                        intersect_box_primitives<HasNagata, false>(
                             box_content,
                             container_id,
                             p,
                             source,
                             direction,
-                            current_node.t_min,
-                            glm::min(current_node.t_max, closest_tuv.x),
+                            ray_t_min,
+                            fminf(closest_tuv.x, 1e30f),
                             closest_triangle,
                             closest_tuv);
                     }

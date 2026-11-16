@@ -155,6 +155,13 @@ namespace bvh_detail
             n1 = glm::vec3(vertices[patch.v1].normal);
             n2 = glm::vec3(vertices[patch.v2].normal);
         }
+        else if (ptype == PrimitiveType::Subspace)
+        {
+            SubspacePrimitive sub = load_primitive<SubspacePrimitive>(primitives, prim_slot_id, chunk0);
+            v0 = sub.bounds_min;
+            v1 = sub.bounds_max;
+            v2 = 0.5f * (sub.bounds_min + sub.bounds_max);
+        }
 
         if (ptype == PrimitiveType::NagataPatch)
         {
@@ -167,10 +174,12 @@ namespace bvh_detail
         }
 
         out_centroid = 0.5f * (out_min + out_max);
-        // Prevent zero-thickness slabs on planar triangles
-        constexpr float pad = 1e-6f;
-        out_min -= glm::vec3(pad);
-        out_max += glm::vec3(pad);
+        // Prevent zero-thickness slabs on planar triangles, scaling with coordinate magnitude
+        // so padding survives FP32 ULP rounding and BVH16 quantization.
+        const glm::vec3 abs_max = glm::max(glm::abs(out_min), glm::abs(out_max));
+        const glm::vec3 pad = glm::max(glm::vec3(1e-5f), abs_max * 1e-5f);
+        out_min -= pad;
+        out_max += pad;
     }
 
     __host__ __device__ __forceinline__ int compute_sah_bin(float c, float cmin, float cext)
@@ -933,9 +942,13 @@ void BVHAS::finalize_tree_pools(
     const uint32_t tree_id = static_cast<uint32_t>(trees.alloc_element());
     const uint32_t total_nodes = static_cast<uint32_t>(host_nodes.size());
     const bool use_16b = config.use_bvh16;
+    // Keep every BVH16 tree allocation an even number of nodes (starting after the 1-node sentinel)
+    // so every tree root begins at an odd index and all sibling pairs align to 32-byte boundaries.
+    const uint32_t as16_alloc_count = (total_nodes + 1u) & ~1u;
     const uint32_t as_start = use_16b
-        ? static_cast<uint32_t>(as16.alloc(total_nodes))
+        ? static_cast<uint32_t>(as16.alloc(as16_alloc_count))
         : static_cast<uint32_t>(as.alloc(total_nodes));
+    assert(!use_16b || ((as_start & 1u) == 1u));
     const uint32_t total_pairs = static_cast<uint32_t>(leaf_pairs.size());
     const uint32_t bc_start = static_cast<uint32_t>(box_content.alloc(total_pairs + 1u));
 
@@ -976,6 +989,10 @@ void BVHAS::finalize_tree_pools(
         for (uint32_t i = 0; i < total_nodes; ++i)
         {
             as16[as_start + i] = BVHNode16::from_node(host_nodes[i], bounds_min, bounds_max);
+        }
+        if (as16_alloc_count > total_nodes)
+        {
+            as16[as_start + total_nodes] = BVHNode16{};
         }
     }
     else
@@ -1455,6 +1472,8 @@ void BVHAS::build(uint32_t space_id, Space space)
         occupied_slots = InlinedTriangle::occupied_slots;
     else if (config.triangle_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
+    else if (config.triangle_type == PrimitiveType::Subspace)
+        occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;
     if (number_of_triangles == 0)

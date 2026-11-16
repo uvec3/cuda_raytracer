@@ -8,6 +8,7 @@
 #include "../acceleration_structures/uniform_grid/UniformGridGeometry.cuh"
 #include "../acceleration_structures/kdtree/KDTreeGeometry.cuh"
 #include "../acceleration_structures/bvh/BVHGeometry.cuh"
+#include "../acceleration_structures/heterogeneous/HeterogeneousGeometry.cuh"
 
 
 enum class ProjectionType
@@ -68,6 +69,7 @@ struct RenderParameters
     UniformGridASDeviceView as_uniform_grid{};
     KDTreeASDeviceView as_kdtree{};
     BVHASDeviceView as_bvh{};
+    HeterogeneousASDeviceView as_heterogeneous{};
 
     //geometry context
     soa::soa_view<PrimitiveChunk16> primitives{};

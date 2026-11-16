@@ -18,6 +18,7 @@
 #endif
 
 
+template <bool ClipToBounds = true>
 __host__ __device__ __forceinline__ bool intersectRayTriangle(
     const glm::vec3 orig, const glm::vec3 dir,
     float tMin,
@@ -36,7 +37,7 @@ __host__ __device__ __forceinline__ bool intersectRayTriangle(
     // The subsequent math will yield Inf or NaN, which will fail the boolean checks below.
     float invDet = 1.0f / det;
 
-    // Shift origin to box entry so |tvec| ~ box_size instead of ~1.0 (avoids catastrophic cancellation at deep levels)
+    // Shift origin to box/ray tMin to preserve precision and enforce t >= tMin on secondary bounces.
     glm::vec3 local_orig = orig + dir * tMin;
     glm::vec3 tvec = local_orig - v0;
     glm::vec3 qvec = glm::cross(tvec, edge1);
@@ -47,9 +48,20 @@ __host__ __device__ __forceinline__ bool intersectRayTriangle(
     float t_local = glm::dot(edge2, qvec) * invDet;
     float t_tmp = tMin + t_local;
 
-    float box_dt = tMax - tMin;
-    float t_eps = glm::max(1e-6f, box_dt * 1e-2f);
     constexpr float uv_eps = 1e-5f;
+
+    bool t_in_range;
+    if constexpr (ClipToBounds)
+    {
+        float box_dt = tMax - tMin;
+        float t_eps = glm::max(1e-6f, box_dt * 1e-2f);
+        t_in_range = (t_tmp > 1e-7f) & (t_local >= -t_eps) & (t_local <= box_dt + t_eps);
+    }
+    else
+    {
+        // Object-partitioned BVH leaves bound the triangle tightly; never clip against the leaf slab.
+        t_in_range = (t_tmp > 1e-7f) & (t_local >= 0.0f) & (t_tmp <= tMax);
+    }
 
     // Use bitwise AND (&) instead of logical AND (&&).
     // This prevents the compiler from generating short-circuit branching.
@@ -59,9 +71,7 @@ __host__ __device__ __forceinline__ bool intersectRayTriangle(
                     (u_tmp <= 1.0f + uv_eps) &
                     (v_tmp >= -uv_eps) &
                     (u_tmp + v_tmp <= 1.0f + uv_eps) &
-                    (t_tmp > 1e-7f) &
-                    (t_local >= -t_eps) &
-                    (t_local <= box_dt + t_eps);
+                    t_in_range;
 
     // Only write to the output variables if the intersection is valid.
     if (is_valid) {

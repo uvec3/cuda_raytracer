@@ -11,9 +11,19 @@
 #include "../geometry_common.cuh"
 
 //returns whether to continue tracing the ray
-template <bool HasNagata = true, typename RenderParams>
+template <bool HasNagata = true, bool TransformNormal = false, typename RenderParams>
 __host__ __device__ inline
-glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::vec3& ray_dir, glm::vec3 tuv, const RenderParams& p, bool& continue_traversal)
+glm::vec4 fragment_hit_shader_impl(
+    uint32_t primitive_id,
+    glm::vec3& ray_src,
+    glm::vec3& ray_dir,
+    glm::vec3 tuv,
+    const RenderParams& p,
+    glm::vec4 s2l_row0,
+    glm::vec4 s2l_row1,
+    glm::vec4 s2l_row2,
+    glm::vec3 blas_scale,
+    bool& continue_traversal)
 {
     using namespace glm;
 
@@ -42,7 +52,10 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
             glm::vec3 v0 = glm::vec3(p.vertices[tri.v0].position);
             glm::vec3 v1 = glm::vec3(p.vertices[tri.v1].position);
             glm::vec3 v2 = glm::vec3(p.vertices[tri.v2].position);
-            normal = glm::normalize(glm::cross(v1 - v0, v2 - v0));
+            glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+            if constexpr (TransformNormal)
+                n *= blas_scale;
+            normal = glm::normalize(n);
         }
 
         auto uv0 = glm::vec2(p.vertices[tri.v0].uv);
@@ -63,7 +76,10 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
         }
         else
         {
-            normal = glm::normalize(glm::cross(ftri.v1 - ftri.v0, ftri.v2 - ftri.v0));
+            glm::vec3 n = glm::cross(ftri.v1 - ftri.v0, ftri.v2 - ftri.v0);
+            if constexpr (TransformNormal)
+                n *= blas_scale;
+            normal = glm::normalize(n);
         }
 
         glm::vec2 uv0 = glm::unpackHalf2x16(ftri.uv_0);
@@ -90,6 +106,8 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
                 glm::vec3 v1 = glm::vec3(p.vertices[patch.v1].position);
                 glm::vec3 v2 = glm::vec3(p.vertices[patch.v2].position);
                 normal = evaluateNagataNormal2(v0,v1,v2, patch.C12,patch.C23,patch.C31,w0,w1);
+                if constexpr (TransformNormal)
+                    normal = glm::normalize(normal * blas_scale);
             }
 
             glm::vec2 uv0 = p.vertices[patch.v0].uv;
@@ -97,6 +115,17 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
             glm::vec2 uv2 = p.vertices[patch.v2].uv;
             uv_interp = uv0 * w0 + uv1 * w1 + uv2 * w2;
         }
+    }
+
+    if constexpr (TransformNormal)
+    {
+        const glm::vec3 n_scene =
+            glm::vec3(s2l_row0) * normal.x +
+            glm::vec3(s2l_row1) * normal.y +
+            glm::vec3(s2l_row2) * normal.z;
+        const float len2 = glm::dot(n_scene, n_scene);
+        if (len2 > 1e-20f)
+            normal = n_scene / sqrtf(len2);
     }
 
     vec3 intersection=ray_src+ray_dir*tuv[0];
@@ -171,6 +200,56 @@ glm::vec4 fragment_hit_shader(uint32_t primitive_id, glm::vec3& ray_src, glm::ve
     return out_color;
 }
 
+template <bool HasNagata = true, typename RenderParams>
+__host__ __device__ inline
+glm::vec4 fragment_hit_shader(
+    uint32_t primitive_id,
+    glm::vec3& ray_src,
+    glm::vec3& ray_dir,
+    glm::vec3 tuv,
+    const RenderParams& p,
+    bool& continue_traversal)
+{
+    return fragment_hit_shader_impl<HasNagata, false>(
+        primitive_id,
+        ray_src,
+        ray_dir,
+        tuv,
+        p,
+        glm::vec4(1.0f, 0.0f, 0.0f, 0.0f),
+        glm::vec4(0.0f, 1.0f, 0.0f, 0.0f),
+        glm::vec4(0.0f, 0.0f, 1.0f, 0.0f),
+        glm::vec3(1.0f),
+        continue_traversal);
+}
+
+template <bool HasNagata = true, typename RenderParams>
+__host__ __device__ inline
+glm::vec4 fragment_hit_shader_instanced(
+    uint32_t primitive_id,
+    glm::vec3& ray_src,
+    glm::vec3& ray_dir,
+    glm::vec3 tuv,
+    const RenderParams& p,
+    glm::vec4 s2l_row0,
+    glm::vec4 s2l_row1,
+    glm::vec4 s2l_row2,
+    glm::vec3 blas_scale,
+    bool& continue_traversal)
+{
+    return fragment_hit_shader_impl<HasNagata, true>(
+        primitive_id,
+        ray_src,
+        ray_dir,
+        tuv,
+        p,
+        s2l_row0,
+        s2l_row1,
+        s2l_row2,
+        blas_scale,
+        continue_traversal);
+}
+
 template <typename RenderParams>
 __host__ __device__ inline
 glm::vec4 miss_shader(glm::vec3 ray_src, glm::vec3 ray_dir, const RenderParams& p)
@@ -193,7 +272,7 @@ glm::vec4 blend_colors(glm::vec4 current_color, glm::vec4 new_color)
     return glm::vec4(base,alpha);
 }
 
-template <bool HasNagata = true, typename RenderParams>
+template <bool HasNagata = true, bool ClipToBounds = true, typename RenderParams>
 __host__ __device__ inline
 void intersect_box_primitives(
     soa::soa_view<BoxContent> box_content,
@@ -216,7 +295,7 @@ void intersect_box_primitives(
             Triangle tri = chunk0.as<Triangle>();
 
             glm::vec3 tuv;
-            bool hit = intersectRayTriangle(
+            bool hit = intersectRayTriangle<ClipToBounds>(
                 source, direction, t_min, t_max,
                 glm::vec3(p.vertices[tri.v0].position), glm::vec3(p.vertices[tri.v1].position), glm::vec3(p.vertices[tri.v2].position),
                 tuv.x, tuv.y, tuv.z);
@@ -232,7 +311,7 @@ void intersect_box_primitives(
             InlinedTriangle ftri = load_primitive<InlinedTriangle>(p.primitives, prim_id, chunk0);
 
             glm::vec3 tuv;
-            bool hit = intersectRayTriangle(
+            bool hit = intersectRayTriangle<ClipToBounds>(
                 source, direction, t_min, t_max,
                 ftri.v0, ftri.v1, ftri.v2,
                 tuv.x, tuv.y, tuv.z);

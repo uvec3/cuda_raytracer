@@ -4,6 +4,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <thrust/device_vector.h>
 #include <thrust/fill.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -56,6 +57,13 @@ namespace uniform_grid_detail
             n1 = glm::vec3(vertices[patch.v1].normal);
             n2 = glm::vec3(vertices[patch.v2].normal);
         }
+        else if (ptype == PrimitiveType::Subspace)
+        {
+            SubspacePrimitive sub = load_primitive<SubspacePrimitive>(primitives, prim_slot_id, chunk0);
+            v0 = sub.bounds_min;
+            v1 = sub.bounds_max;
+            v2 = 0.5f * (sub.bounds_min + sub.bounds_max);
+        }
         return ptype;
     }
 
@@ -93,14 +101,6 @@ namespace uniform_grid_detail
             return glm::max(a, b);
         }
     };
-
-    inline uint32_t axis_cell_count(float extent, float cell_size, uint32_t max_res)
-    {
-        if (extent <= 0.0f)
-            return 1u;
-        const uint32_t count = static_cast<uint32_t>(std::ceil((extent / cell_size) - 1e-5f));
-        return std::min(std::max(count, 1u), max_res);
-    }
 } // namespace uniform_grid_detail
 
 __global__ void count_triangle_grid_cells_kernel(
@@ -230,9 +230,9 @@ UniformGridAS::UniformGridAS(GeometryContext* geometry_context)
 
 void UniformGridAS::config_ui()
 {
-    ImGui::DragInt("Resolution (longest axis)", &config.resolution, 1.0f, 1, 2048);
-    if (config.resolution < 1)
-        config.resolution = 1;
+    ImGui::DragFloat("Voxels per triangle", &config.voxels_per_triangle, 0.05f, 0.01f, 64.0f, "%.2f");
+    if (config.voxels_per_triangle < 0.01f)
+        config.voxels_per_triangle = 0.01f;
 
     ImGui::Checkbox("Swap y and z", &config.swapYZ);
     ImGui::Checkbox("Sort space", &config.sort_space);
@@ -432,12 +432,136 @@ void UniformGridAS::insert_triangles(
             space_id, space, dims, cell_size, primitives_start, number_of_triangles, occupied_slots,
             FindCubeIntersection<PrimitiveApproximation::Nagata>{});
     }
+    else if (config.triangle_type == PrimitiveType::Subspace)
+    {
+        insert_triangles_gpu(
+            space_id, space, dims, cell_size, primitives_start, number_of_triangles, occupied_slots,
+            FindCubeIntersection<PrimitiveApproximation::Approximate>{});
+    }
     else
     {
         insert_triangles_gpu(
             space_id, space, dims, cell_size, primitives_start, number_of_triangles, occupied_slots,
             FindCubeIntersection<PrimitiveApproximation::Precise>{});
     }
+}
+
+UniformGridAS::AdaptiveGridLayout UniformGridAS::compute_grid_dimensions(
+    glm::vec3 aabb_size,
+    uint32_t primitive_count,
+    float voxels_per_triangle)
+{
+    const double clamped_density = std::max(static_cast<double>(voxels_per_triangle), 1e-4);
+    const double target_voxels = std::max(1.0, clamped_density * static_cast<double>(std::max(primitive_count, 1u)));
+
+    const double extents[3] = {
+        std::max(0.0, static_cast<double>(aabb_size.x)),
+        std::max(0.0, static_cast<double>(aabb_size.y)),
+        std::max(0.0, static_cast<double>(aabb_size.z))
+    };
+
+    if (extents[0] <= 0.0 && extents[1] <= 0.0 && extents[2] <= 0.0)
+    {
+        return AdaptiveGridLayout{.dims = glm::uvec3(1u), .cell_size = 1e-4f};
+    }
+
+    // Iteratively fix any axis that would fall below 1 cell (or has zero extent) to N_i = 1
+    // and re-solve t over the remaining active axes so prod(N_i) stays close to target_voxels.
+    bool fixed_one[3] = {extents[0] <= 0.0, extents[1] <= 0.0, extents[2] <= 0.0};
+    double t = 1.0;
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        int active_axes = 0;
+        double active_prod = 1.0;
+        for (int a = 0; a < 3; ++a)
+        {
+            if (!fixed_one[a])
+            {
+                ++active_axes;
+                active_prod *= extents[a];
+            }
+        }
+        if (active_axes == 0 || active_prod <= 0.0)
+        {
+            t = 1.0;
+            break;
+        }
+
+        if (active_axes == 3)
+            t = std::cbrt(target_voxels / active_prod);
+        else if (active_axes == 2)
+            t = std::sqrt(target_voxels / active_prod);
+        else
+            t = target_voxels / active_prod;
+
+        bool added_fixed = false;
+        for (int a = 0; a < 3; ++a)
+        {
+            if (!fixed_one[a] && ((extents[a] * t) * (1.0 + 5e-7)) < 1.0)
+            {
+                fixed_one[a] = true;
+                added_fixed = true;
+            }
+        }
+        if (!added_fixed)
+        {
+            break;
+        }
+    }
+
+    const auto clamp_axis_res = [](double count) -> uint32_t
+    {
+        const double bounded = std::min(static_cast<double>(kMaxAxisResolution), std::max(1.0, count));
+        return static_cast<uint32_t>(bounded);
+    };
+
+    glm::uvec3 dims(1u);
+    for (int a = 0; a < 3; ++a)
+    {
+        if (!fixed_one[a])
+        {
+            const double floored = std::floor((extents[a] * t) * (1.0 + 5e-7));
+            dims[a] = clamp_axis_res(floored);
+        }
+    }
+
+    // Scale cubic cell_size so rounded-down or capped axes still enclose the full AABB.
+    double cell_size_d = 0.0;
+    for (int a = 0; a < 3; ++a)
+    {
+        if (extents[a] > 0.0)
+        {
+            cell_size_d = std::max(cell_size_d, extents[a] / static_cast<double>(dims[a]));
+        }
+    }
+    cell_size_d = std::max(cell_size_d, 1e-6);
+
+    // Trim trailing cells that lie strictly past an axis extent when cell_size grew on another axis.
+    for (int a = 0; a < 3; ++a)
+    {
+        if (extents[a] <= 0.0)
+        {
+            dims[a] = 1u;
+        }
+        else
+        {
+            const double needed_d = std::ceil(std::max(0.0, (extents[a] / cell_size_d) - 1e-7));
+            const uint32_t needed = clamp_axis_res(needed_d);
+            dims[a] = std::min(dims[a], needed);
+        }
+    }
+
+    float cell_size = std::max(static_cast<float>(cell_size_d), 1e-6f);
+    for (int a = 0; a < 3; ++a)
+    {
+        const float extent_f = std::max(aabb_size[a], 0.0f);
+        if (static_cast<float>(dims[a]) * cell_size < extent_f)
+        {
+            cell_size = std::nextafter(extent_f / static_cast<float>(dims[a]), std::numeric_limits<float>::infinity());
+        }
+    }
+
+    return AdaptiveGridLayout{.dims = dims, .cell_size = cell_size};
 }
 
 void UniformGridAS::build(uint32_t space_id, Space space)
@@ -450,6 +574,8 @@ void UniformGridAS::build(uint32_t space_id, Space space)
         occupied_slots = InlinedTriangle::occupied_slots;
     else if (config.triangle_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
+    else if (config.triangle_type == PrimitiveType::Subspace)
+        occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;
     if (number_of_triangles == 0)
@@ -473,15 +599,9 @@ void UniformGridAS::build(uint32_t space_id, Space space)
         glm::vec3(0.0f),
         uniform_grid_detail::MaxVec3Functor{});
 
-    const uint32_t res = static_cast<uint32_t>(std::max(config.resolution, 1));
-    const float max_extent = std::max(std::max(aabb_max.x, aabb_max.y), std::max(aabb_max.z, 1e-4f));
-    const float cell_size = max_extent / static_cast<float>(res);
-    const glm::uvec3 dims{
-        uniform_grid_detail::axis_cell_count(aabb_max.x, cell_size, res),
-        uniform_grid_detail::axis_cell_count(aabb_max.y, cell_size, res),
-        uniform_grid_detail::axis_cell_count(aabb_max.z, cell_size, res)};
+    const AdaptiveGridLayout layout = compute_grid_dimensions(aabb_max, number_of_triangles, config.voxels_per_triangle);
 
-    insert_triangles(space_id, space, dims, cell_size, space.primitives_start, number_of_triangles, occupied_slots);
+    insert_triangles(space_id, space, layout.dims, layout.cell_size, space.primitives_start, number_of_triangles, occupied_slots);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();

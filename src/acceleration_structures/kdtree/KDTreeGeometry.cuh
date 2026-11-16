@@ -97,7 +97,7 @@ bool kdtree_ray_aabb(
     return t_min <= t_max && t_max >= 0.0f;
 }
 
-template <uint32_t StackStride = 1, typename GetBoundsFn>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentKDNode::SHORT_STACK_SIZE, typename GetBoundsFn>
 __host__ __device__ inline uint32_t traverse_kdtree_impl(
     const KDNode* as,
     uint32_t as_start,
@@ -147,7 +147,7 @@ __host__ __device__ inline uint32_t traverse_kdtree_impl(
             {
                 state.stack_count = state.stack_count - 1;
                 state.stack_head = (state.stack_head == 0)
-                    ? static_cast<uint32_t>(CurrentKDNode::SHORT_STACK_SIZE - 1)
+                    ? static_cast<uint32_t>(MaxStackSize - 1)
                     : (state.stack_head - 1);
                 const KDStackEntry entry = stack_base[static_cast<uint32_t>(state.stack_head) * StackStride];
                 node_idx = entry.node_id;
@@ -194,10 +194,10 @@ __host__ __device__ inline uint32_t traverse_kdtree_impl(
             else
             {
                 stack_base[static_cast<uint32_t>(state.stack_head) * StackStride] = KDStackEntry{far_idx, seg_t_max};
-                state.stack_head = (state.stack_head + 1 == CurrentKDNode::SHORT_STACK_SIZE)
+                state.stack_head = (state.stack_head + 1 == MaxStackSize)
                     ? 0u
                     : (state.stack_head + 1);
-                if (state.stack_count < CurrentKDNode::SHORT_STACK_SIZE)
+                if (state.stack_count < MaxStackSize)
                 {
                     state.stack_count = state.stack_count + 1;
                 }
@@ -232,7 +232,7 @@ __host__ __device__ inline uint32_t traverse_kdtree_impl(
     return 0;
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentKDNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_kdtree(
     const KDNode* as,
     glm::vec3 bounds_min,
@@ -244,7 +244,7 @@ __host__ __device__ inline uint32_t traverse_kdtree(
     glm::vec3 dir,
     int& iterations)
 {
-    return traverse_kdtree_impl<StackStride>(
+    return traverse_kdtree_impl<StackStride, MaxStackSize>(
         as,
         as_start,
         [&](glm::vec3& bmin, glm::vec3& bmax)
@@ -259,7 +259,7 @@ __host__ __device__ inline uint32_t traverse_kdtree(
         iterations);
 }
 
-template <uint32_t StackStride = 1>
+template <uint32_t StackStride = 1, uint32_t MaxStackSize = CurrentKDNode::SHORT_STACK_SIZE>
 __host__ __device__ inline uint32_t traverse_kdtree(
     const KDTreeASDeviceView& view,
     int tree_id,
@@ -277,7 +277,7 @@ __host__ __device__ inline uint32_t traverse_kdtree(
 
     const uint32_t u_tree_id = static_cast<uint32_t>(tree_id);
     const uint32_t as_start = view.trees[u_tree_id].as_start;
-    return traverse_kdtree_impl<StackStride>(
+    return traverse_kdtree_impl<StackStride, MaxStackSize>(
         &view.as[0],
         as_start,
         [&](glm::vec3& bmin, glm::vec3& bmax)
