@@ -31,8 +31,8 @@ struct ResolutionPreset
     uint32_t height;
 };
 
-static const ResolutionPreset* get_resolution_presets();
-static int get_resolution_preset_count();
+const ResolutionPreset* get_resolution_presets();
+int get_resolution_preset_count();
 
 class Raytracer;
 class CudaVulkanSwapChain;
@@ -86,14 +86,15 @@ public:
     glm::vec4 debug_pixel_result{0};
     glm::uvec2 current_image_size{0};
 
-    int resolution_mode = 0; // 0: Window (Dynamic), 1: 720p, 2: 1080p, 3: 1440p, 4: UWQHD, 5: 4K, 6: 8K, 7: Custom
-    int last_fixed_mode = 3; // Default fixed preset: 1440p
+    int resolution_mode = 0; // 0: Window (Dynamic), 1..(count-2): Presets, (count-1): Custom
+    int last_fixed_mode = 3; // Default fixed preset
     int custom_resolution[2] = {1920, 1080};
     bool scale_display_to_window = true;
-    int selected_as_type = 0; // 0: Octree, 1: Uniform Grid, 2: KD-Tree, 3: BVH, 4: OptiX, 5: Heterogeneous
+    int selected_as_type = 3; // 0: Octree, 1: Uniform Grid, 2: KD-Tree, 3: BVH, 4: OptiX, 5: Heterogeneous
     bool auto_select_after_build = true;
     bool auto_play_after_build = true;
     bool copy_image_with_alpha = false;
+    bool load_scene_textures = true;
 
     //frame start finish events
     cudaEvent_t start, finish;

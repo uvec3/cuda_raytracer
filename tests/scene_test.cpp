@@ -3089,3 +3089,34 @@ TEST(BVHAS, RefractionBoxEdgePlanesMatchOctreeGPU)
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
 }
+
+TEST(Scene, SkipTexturesWhenDisabled)
+{
+    auto game_view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(game_view.empty());
+
+    Scene scene_with_textures("WithTextures");
+    scene_with_textures.load(game_view, true);
+    ASSERT_TRUE(scene_with_textures.is_loaded());
+    ASSERT_FALSE(scene_with_textures.m_textures.empty());
+
+    Scene scene_without_textures("WithoutTextures");
+    scene_without_textures.load(game_view, false);
+    ASSERT_TRUE(scene_without_textures.is_loaded());
+    EXPECT_TRUE(scene_without_textures.m_textures.empty());
+    EXPECT_EQ(scene_without_textures.m_meshes.size(), scene_with_textures.m_meshes.size());
+    EXPECT_EQ(scene_without_textures.m_nodes.size(), scene_with_textures.m_nodes.size());
+    EXPECT_EQ(scene_without_textures.m_materials.size(), scene_with_textures.m_materials.size());
+    for (size_t i = 0; i < scene_without_textures.m_materials.size(); ++i)
+    {
+        auto&& mat = scene_without_textures.m_materials[i];
+        EXPECT_EQ(mat.baseColorTextureIndex, 0u);
+        EXPECT_EQ(mat.normalTextureIndex, 0u);
+        EXPECT_EQ(mat.transmissionTextureIndex, 0u);
+        EXPECT_EQ(mat.thicknessTextureIndex, 0u);
+        EXPECT_EQ(mat.baseColorTexture, 0ull);
+        EXPECT_EQ(mat.normalTexture, 0ull);
+        EXPECT_EQ(mat.transmissionTexture, 0ull);
+        EXPECT_EQ(mat.thicknessTexture, 0ull);
+    }
+}

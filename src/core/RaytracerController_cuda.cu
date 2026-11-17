@@ -17,6 +17,18 @@ void RaytracerController::destroyRaytracer()
 }
 
 
+static const char* get_resolution_preset_label(void* data, int idx)
+{
+    return static_cast<const ResolutionPreset*>(data)[idx].label;
+}
+
+static int resolve_fixed_resolution_mode(int last_fixed_mode, int preset_count)
+{
+    if (last_fixed_mode > 0 && last_fixed_mode < preset_count)
+        return last_fixed_mode;
+    return preset_count > 2 ? 2 : std::max(0, preset_count - 1);
+}
+
 bool RaytracerController::ui_rendering_parameters()
 {
     bool open=true;
@@ -55,37 +67,30 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::Separator();
         ImGui::Text("Resolution");
 
+        const ResolutionPreset* presets = get_resolution_presets();
+        const int preset_count = get_resolution_preset_count();
+        if (preset_count > 0)
+            resolution_mode = std::clamp(resolution_mode, 0, preset_count - 1);
+
         bool resolution_changed = false;
         bool is_fixed = (resolution_mode != 0);
         if (ImGui::Checkbox("Fixed resolution", &is_fixed))
         {
             if (is_fixed)
-                resolution_mode = (last_fixed_mode > 0 ? last_fixed_mode : 2); // Default to 1080p
+                resolution_mode = resolve_fixed_resolution_mode(last_fixed_mode, preset_count);
             else
                 resolution_mode = 0; // Window (Dynamic)
             resolution_changed = true;
         }
 
-        static const char* const preset_names[] = {
-            "Window (Dynamic)",
-            "1280 x 720 (720p HD)",
-            "1920 x 1080 (1080p FHD)",
-            "2560 x 1440 (1440p QHD)",
-            "3440 x 1440 (UWQHD 21:9)",
-            "3840 x 2160 (4K UHD)",
-            "7680 x 4320 (8K UHD)",
-            "Custom"
-        };
-        constexpr int preset_count = static_cast<int>(sizeof(preset_names) / sizeof(preset_names[0]));
-
-        if (ImGui::Combo("Preset", &resolution_mode, preset_names, preset_count))
+        if (ImGui::Combo("Preset", &resolution_mode, get_resolution_preset_label, const_cast<ResolutionPreset*>(presets), preset_count))
         {
             if (resolution_mode != 0)
                 last_fixed_mode = resolution_mode;
             resolution_changed = true;
         }
 
-        if (resolution_mode == preset_count - 1) // Custom
+        if (preset_count > 0 && resolution_mode == preset_count - 1) // Custom
         {
             if (ImGui::InputInt2("Custom size (W x H)", custom_resolution))
             {
@@ -157,38 +162,13 @@ void RaytracerController::ui_keys()
     auto& p=raytracer->parameters;
     float dt=io.DeltaTime;
 
-    if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))//fov with scroll + Alt
-    {
-        p.fov-=io.MouseWheel;
-    }
-    else//movement speed
-    {
-        movement_speed+=movement_speed*io.MouseWheel*0.1;
-        if (movement_speed<0.000001)
-            movement_speed=0.000001;
-    }
+
 
 
 
 
     if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))//fov with scroll + Alt
     {
-        if (ImGui::IsKeyPressed(ImGuiKey_1))
-        {
-            p.show_iterations=!p.show_iterations;
-        }
-
-        if (ImGui::IsKeyPressed(ImGuiKey_2))
-        {
-            p.show_boxes=!p.show_boxes;
-        }
-
-        if (ImGui::IsKeyPressed(ImGuiKey_3))
-        {
-            p.show_triangles=!p.show_triangles;
-        }
-
-
         if (ImGui::IsKeyPressed(ImGuiKey_R))
         {
             p.enableRefraction=!p.enableRefraction;
@@ -202,7 +182,7 @@ void RaytracerController::ui_keys()
         if (ImGui::IsKeyPressed(ImGuiKey_F))//fixed resolution switch
         {
             if (resolution_mode==0)
-                resolution_mode=last_fixed_mode;
+                resolution_mode = resolve_fixed_resolution_mode(last_fixed_mode, get_resolution_preset_count());
             else
                 resolution_mode=0;
         }
@@ -218,7 +198,7 @@ void RaytracerController::ui_surface_input()
     auto& p=raytracer->parameters;
     float dt=io.DeltaTime;
 
-
+    
     if (ImGui::IsItemHovered())
     {
         //camera
@@ -253,6 +233,36 @@ void RaytracerController::ui_surface_input()
 
     if (ImGui::IsWindowFocused() && !ImGui::IsKeyDown(ImGuiKey_LeftAlt) )
     {
+
+        if (ImGui::IsKeyPressed(ImGuiKey_1))
+        {
+            p.show_iterations=!p.show_iterations;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_2))
+        {
+            p.show_boxes=!p.show_boxes;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_3))
+        {
+            p.show_triangles=!p.show_triangles;
+        }
+
+
+        if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))//fov with scroll + Alt
+        {
+            p.fov-=io.MouseWheel;
+        }
+        else//movement speed
+        {
+            movement_speed+=movement_speed*io.MouseWheel*0.1;
+            if (movement_speed<0.000001)
+                movement_speed=0.000001;
+        }
+
+
+
         glm::vec3 move{0};
         if (ImGui::IsKeyDown(ImGuiKey_E))
             move+=glm::vec3(0,1,0);

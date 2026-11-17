@@ -36,6 +36,9 @@ struct RenderParameters
     float iterations_max = 100.0f;
     float boxes_max = 10.0f;
 
+    //traversal
+    int max_iterations=2000;
+
     //lighting
     float ambient_light = 0.1f;
     float diffuse_light = 0.9f;

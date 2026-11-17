@@ -87,7 +87,7 @@ public:
 	Scene(Scene&& other) noexcept;
 	Scene& operator=(Scene&& other) noexcept;
 
-	void load(std::string_view data);
+	void load(std::string_view data, bool load_textures = true);
 	void sync_materials_to_device();
 	void destroy_textures();
 

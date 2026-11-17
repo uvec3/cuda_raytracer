@@ -222,7 +222,7 @@ void Scene::sync_materials_to_device()
     d_materials = geometry_context.materials;
 }
 
-void Scene::load(std::string_view data)
+void Scene::load(std::string_view data, bool load_textures)
 {
     tg3_parse_options opts;
     tg3_error_stack errors;
@@ -249,7 +249,7 @@ void Scene::load(std::string_view data)
         return;
     }
 
-    std::vector<uint32_t> textureIds = loadTextures(model);
+    std::vector<uint32_t> textureIds = load_textures ? loadTextures(model) : std::vector<uint32_t>{};
     std::vector<uint32_t> materialIds = loadMaterials(model, textureIds);
     std::vector<uint32_t> meshIds = loadMeshes(model, materialIds);
 

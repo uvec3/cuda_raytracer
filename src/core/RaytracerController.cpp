@@ -173,7 +173,7 @@ bool RaytracerController::ensure_scene_loaded(int scene_index)
     if (scene_data.empty())
         return false;
 
-    s.scene->load(scene_data);
+    s.scene->load(scene_data, load_scene_textures);
     if (!s.scene->is_loaded())
         return false;
 
@@ -370,6 +370,7 @@ static const ResolutionPreset s_resolution_presets[] = {
     {"Window (Dynamic)",        0,    0},
     {"1280 x 720 (720p HD)", 1280,  720},
     {"1920 x 1080 (1080p FHD)", 1920, 1080},
+    {"2560 x 2560", 2560, 2560},
     {"2560 x 1440 (1440p QHD)", 2560, 1440},
     {"3440 x 1440 (UWQHD 21:9)", 3440, 1440},
     {"3840 x 2160 (4K UHD)", 3840, 2160},
@@ -718,6 +719,8 @@ bool RaytracerController::ui_scenes_manager()
             }
             ImGui::EndCombo();
         }
+
+        ImGui::Checkbox("Load textures", &load_scene_textures);
 
         if (!has_active_loaded_scene())
         {
