@@ -77,9 +77,9 @@ public:
 
     struct Config
     {
-        float voxels_per_triangle = 1.0f;
+        float voxels_per_triangle = 4.0f;
         bool swapYZ = true;
-        bool sort_space = true;
+        bool sort_space = false;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 

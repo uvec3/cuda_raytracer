@@ -44,10 +44,11 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
     else if (scene.spaces.is_allocated(active_space))
     {
         const ASType active_type = scene.spaces[active_space].as_type;
-        const uint32_t block_dim_x = (active_type == ASType::Heterogeneous) ? 8u : 16u; // must be multiple of 8
-        const uint32_t block_dim_y = 16u; // must be multiple of 8
+        static_assert(RENDER_BLOCK_THREADS == 64, "threadPixelPos() assumes an 8x8 tile (64 threads/block)");
+        constexpr uint32_t block_dim_x = 8u;
+        constexpr uint32_t block_dim_y = 8u;
         dim3 grid_dim{(width - 1) / block_dim_x + 1, (height - 1) / block_dim_y + 1, 1};
-        dim3 block_dim{64, block_dim_x / 8, block_dim_y / 8};
+        dim3 block_dim{RENDER_BLOCK_THREADS, 1, 1};
 
         const bool has_nagata = scene.spaces[active_space].has_nagata;
         auto launch = [&]<ASType Type, bool UseBVH16 = false>()

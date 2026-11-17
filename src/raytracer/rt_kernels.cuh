@@ -44,10 +44,8 @@ inline void write_texture(cudaSurfaceObject_t surface,uint32_t x, uint32_t y, gl
     (unsigned char)( value.g * 255.0f),
     (unsigned char)( value.b * 255.0f),
     (unsigned char)( value.a * 255.0f)
-);
+    );
 
-    // WRITE TO SURFACE
-    // The X coordinate in surf2Dwrite is in BYTES, not elements
     surf2Dwrite(pixelColor, surface, x * sizeof(uchar4), y);
 }
 #endif

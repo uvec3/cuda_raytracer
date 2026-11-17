@@ -76,7 +76,7 @@ public:
         bool swapYZ = true;
 
         bool use_gpu = true;
-        bool sort_space = true;
+        bool sort_space = false;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 

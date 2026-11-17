@@ -70,13 +70,13 @@ public:
     struct Config
     {
         BVHSplitMode split_mode = BVHSplitMode::SAH;
-        int max_depth = 24;
+        int max_depth = 30;
         int max_leaf_primitives = 4;
         float traversal_cost = 1.0f;
         float intersection_cost = 1.5f;
         bool use_gpu = true;
         bool swapYZ = true;
-        bool sort_space = true;
+        bool sort_space = false;
         bool use_bvh16 = true;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };

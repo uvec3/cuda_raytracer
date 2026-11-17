@@ -647,10 +647,10 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
     glm::vec4 hit_primitive_color{0};
 
 #if defined(__CUDA_ARCH__)
-    __shared__ BVHStackEntry shared_stack[CurrentBVHNode::SHORT_STACK_SIZE][256];
+    __shared__ BVHStackEntry shared_stack[CurrentBVHNode::SHORT_STACK_SIZE][RENDER_BLOCK_THREADS];
     const uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * (blockDim.x * blockDim.y);
     BVHStackEntry* stack_base = &shared_stack[0][tid];
-    constexpr uint32_t stack_stride = 256;
+    constexpr uint32_t stack_stride = RENDER_BLOCK_THREADS;
 #else
     BVHStackEntry host_stack[CurrentBVHNode::SHORT_STACK_SIZE];
     BVHStackEntry* stack_base = host_stack;

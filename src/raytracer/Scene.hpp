@@ -114,7 +114,6 @@ public:
 	uint32_t build_heterogeneous_as(Range&& meshes);
 
 	uint32_t build_heterogeneous_instances(const std::vector<MeshInstanceDesc>& instances);
-	void rebuild_heterogeneous_tlas(uint32_t space_id);
 	uint32_t build_node_as(uint32_t node_id, ASType type);
 	void free_node_as(uint32_t node_id);
 
@@ -152,6 +151,8 @@ public:
 private:
 	uint32_t m_active_space = 0;
 	int m_root_box = -1;
+
+	void free_tlas_space_only(uint32_t space_id);
 
 	std::vector<uint32_t> loadTextures(const tg3_model& model);
 	std::vector<uint32_t> loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds);

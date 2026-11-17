@@ -33,7 +33,7 @@ struct RenderParameters
     bool show_triangles = true;
     bool show_boxes = false;
     int time_max = 50000;
-    float iterations_max = 25.0f;
+    float iterations_max = 100.0f;
     float boxes_max = 10.0f;
 
     //lighting

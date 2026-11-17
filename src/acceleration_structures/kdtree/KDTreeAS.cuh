@@ -65,13 +65,13 @@ public:
     struct Config
     {
         KDSplitMode split_mode = KDSplitMode::SAH;
-        int max_depth = 20;
+        int max_depth = 30;
         int max_leaf_primitives = 8;
         float traversal_cost = 1.0f;
         float intersection_cost = 1.5f;
         bool use_gpu = true;
         bool swapYZ = true;
-        bool sort_space = true;
+        bool sort_space = false;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 

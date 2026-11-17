@@ -309,10 +309,10 @@ glm::vec4 KDTreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
     CurrentKDNode current_node{};
 
 #if defined(__CUDA_ARCH__)
-    __shared__ KDStackEntry shared_stack[CurrentKDNode::SHORT_STACK_SIZE][256];
+    __shared__ KDStackEntry shared_stack[CurrentKDNode::SHORT_STACK_SIZE][RENDER_BLOCK_THREADS];
     const uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * (blockDim.x * blockDim.y);
     KDStackEntry* stack_base = &shared_stack[0][tid];
-    constexpr uint32_t stack_stride = 256;
+    constexpr uint32_t stack_stride = RENDER_BLOCK_THREADS;
 #else
     KDStackEntry host_stack[CurrentKDNode::SHORT_STACK_SIZE];
     KDStackEntry* stack_base = host_stack;

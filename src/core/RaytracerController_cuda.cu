@@ -140,23 +140,74 @@ void RaytracerController::pause()
 
 void RaytracerController::draw_cuda(cudaSurfaceObject_t surface, uint32_t width, uint32_t height)
 {
-    Scene* scene_ptr = nullptr;
+    std::lock_guard lock(ui_mutex);
+    CUDA_CHECK(cudaEventRecord(start, render_stream));
+    if (has_active_loaded_scene())
     {
-        std::lock_guard lock(ui_mutex);
-        scene_ptr = scenes[active_scene_number].scene.get();
-        if (scene_ptr)
-            raytracer->update_parameters(*scene_ptr, width, height);
-
-
-        if (!scene_ptr)
-            return;
-
-        CUDA_CHECK(cudaEventRecord(start, render_stream));
-        raytracer->draw_first_hit(*scene_ptr, surface, width, height, render_stream);
-        CUDA_CHECK(cudaEventRecord(finish, render_stream));
+        Scene& active_scene = *scenes[active_scene_number].scene;
+        raytracer->update_parameters(active_scene, width, height);
+        raytracer->draw_first_hit(active_scene, surface, width, height, render_stream);
     }
+    CUDA_CHECK(cudaEventRecord(finish, render_stream));
 }
 
+void RaytracerController::ui_keys()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    auto& p=raytracer->parameters;
+    float dt=io.DeltaTime;
+
+    if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))//fov with scroll + Alt
+    {
+        p.fov-=io.MouseWheel;
+    }
+    else//movement speed
+    {
+        movement_speed+=movement_speed*io.MouseWheel*0.1;
+        if (movement_speed<0.000001)
+            movement_speed=0.000001;
+    }
+
+
+
+
+    if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))//fov with scroll + Alt
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey_1))
+        {
+            p.show_iterations=!p.show_iterations;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_2))
+        {
+            p.show_boxes=!p.show_boxes;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_3))
+        {
+            p.show_triangles=!p.show_triangles;
+        }
+
+
+        if (ImGui::IsKeyPressed(ImGuiKey_R))
+        {
+            p.enableRefraction=!p.enableRefraction;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_S))
+        {
+            p.enableShadows=!p.enableShadows;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F))//fixed resolution switch
+        {
+            if (resolution_mode==0)
+                resolution_mode=last_fixed_mode;
+            else
+                resolution_mode=0;
+        }
+    }
+}
 
 void RaytracerController::ui_surface_input()
 {
@@ -170,6 +221,7 @@ void RaytracerController::ui_surface_input()
 
     if (ImGui::IsItemHovered())
     {
+        //camera
         if (ImGui::IsMouseDown(0))
         {
             auto delta= io.MouseDelta;
@@ -177,6 +229,7 @@ void RaytracerController::ui_surface_input()
             p.az+=-delta.x*sensitivity;
         }
 
+        //select debug pixel
         if (ImGui::IsMouseDown(2))
         {
             auto pos=ImGui::GetMousePos();
@@ -195,20 +248,10 @@ void RaytracerController::ui_surface_input()
             debug_pixel = {px, py};
         }
 
-        if (ImGui::IsKeyDown(ImGuiKey_LeftAlt))
-        {
-            p.fov+=io.MouseWheel;
-        }
-        else
-        {
-            movement_speed+=movement_speed*io.MouseWheel*0.1;
-            if (movement_speed<0.000001)
-                movement_speed=0.000001;
-        }
     }
 
 
-    if (ImGui::IsWindowFocused())
+    if (ImGui::IsWindowFocused() && !ImGui::IsKeyDown(ImGuiKey_LeftAlt) )
     {
         glm::vec3 move{0};
         if (ImGui::IsKeyDown(ImGuiKey_E))
@@ -253,7 +296,7 @@ bool RaytracerController::ui_debug_pixel()
         ImGui::Text("Pixel to debug: x=%d y=%d",debug_pixel.x,debug_pixel.y);
         ImGui::Text("width=%d height=%d",current_image_size.x,current_image_size.y);
 
-        if (!cuda_is_running&&device_data_mutex.try_lock())
+        if (!cuda_is_running && has_active_loaded_scene() && device_data_mutex.try_lock())
         {
             if (ImGui::Button("Evaluate"))
             {

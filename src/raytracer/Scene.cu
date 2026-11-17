@@ -7,8 +7,11 @@
 #include <glm/gtx/matrix_decompose.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <optional>
+#include <utility>
 #include <thrust/reduce.h>
 #include <thrust/transform.h>
 #include <thrust/device_vector.h>
@@ -327,16 +330,19 @@ void Scene::release_space_resources(uint32_t space_id)
     else if (space.as_type == ASType::Heterogeneous)
     {
         const auto owned_blas = as_heterogeneous.get_owned_blas_spaces(space_id);
+        as_heterogeneous.free_space(space_id, space);
         for (uint32_t blas_id : owned_blas)
         {
-            for (auto& node : m_nodes)
+            if (!as_heterogeneous.is_blas_space_owned(blas_id))
             {
-                if (node.as_ref.is_valid() && node.as_ref.space_id == blas_id)
-                    node.as_ref = {};
+                for (auto& node : m_nodes)
+                {
+                    if (node.as_ref.is_valid() && node.as_ref.space_id == blas_id)
+                        node.as_ref = {};
+                }
+                free_space(blas_id);
             }
-            free_space(blas_id);
         }
-        as_heterogeneous.free_space(space_id, spaces[space_id]);
     }
     else if (space.as_type == ASType::Optix)
     {
@@ -352,6 +358,32 @@ void Scene::release_space_resources(uint32_t space_id)
     }
     reset_space_fields(spaces[space_id]);
     geometry_context.d_spaces = spaces;
+}
+
+void Scene::free_tlas_space_only(uint32_t space_id)
+{
+    if (!spaces.is_allocated(space_id) || spaces[space_id].as_type != ASType::Heterogeneous)
+        return;
+
+    auto space = spaces[space_id];
+    as_heterogeneous.free_space(space_id, space);
+    if (space.vertices_size > 0)
+    {
+        geometry_context.vertices.free(space.vertices_start);
+    }
+    if (space.primitives_size > 0)
+    {
+        geometry_context.primitives.free(space.primitives_start);
+    }
+    reset_space_fields(spaces[space_id]);
+    spaces.free(space_id);
+    geometry_context.d_spaces = spaces;
+
+    if (m_active_space == space_id)
+    {
+        m_active_space = UINT32_MAX;
+        m_root_box = -1;
+    }
 }
 
 void Scene::free_space(uint32_t space_id)
@@ -763,53 +795,191 @@ namespace
         return out;
     }
 
+    struct ResolvedTexture
+    {
+        uint32_t index = 0;
+        cudaTextureObject_t obj = 0;
+    };
+
+    struct MaterialTransmissionData
+    {
+        float transmissionFactor = 0.0f;
+        int32_t transmissionTextureIdx = -1;
+    };
+
+    struct MaterialVolumeData
+    {
+        float thicknessFactor = 0.0f;
+        int32_t thicknessTextureIdx = -1;
+        glm::vec3 attenuationColor = glm::vec3(1.0f);
+        float attenuationDistance = std::numeric_limits<float>::infinity();
+    };
+
+    const tg3_value* find_extension_in_container(const tg3_extras_ext& ext_container, const char* ext_name)
+    {
+        for (uint32_t i = 0; i < ext_container.extensions_count; ++i)
+        {
+            const auto& ext = ext_container.extensions[i];
+            if (tg3_str_equals_cstr(ext.name, ext_name))
+                return &ext.value;
+        }
+        return nullptr;
+    }
+
+    const tg3_value* find_material_extension(const tg3_material* tg3mat, const char* ext_name)
+    {
+        if (!tg3mat)
+            return nullptr;
+        if (const tg3_value* ext_val = find_extension_in_container(tg3mat->ext, ext_name))
+            return ext_val;
+        return find_extension_in_container(tg3mat->pbr_metallic_roughness.ext, ext_name);
+    }
+
+    const tg3_value* find_object_member(const tg3_value& obj, const char* key)
+    {
+        if (obj.type != TG3_VALUE_OBJECT || !obj.object_data)
+            return nullptr;
+        for (uint32_t i = 0; i < obj.object_count; ++i)
+        {
+            const auto& kv = obj.object_data[i];
+            if (tg3_str_equals_cstr(kv.key, key))
+                return &kv.value;
+        }
+        return nullptr;
+    }
+
+    std::optional<float> read_json_float(const tg3_value& val)
+    {
+        if (val.type == TG3_VALUE_REAL)
+        {
+            const float f = static_cast<float>(val.real_val);
+            return std::isfinite(f) ? std::optional<float>(f) : std::nullopt;
+        }
+        if (val.type == TG3_VALUE_INT)
+        {
+            return static_cast<float>(val.int_val);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<float> read_ext_float(const tg3_value& obj, const char* key)
+    {
+        const tg3_value* member = find_object_member(obj, key);
+        return member ? read_json_float(*member) : std::nullopt;
+    }
+
+    std::optional<glm::vec3> read_ext_vec3(const tg3_value& obj, const char* key)
+    {
+        const tg3_value* member = find_object_member(obj, key);
+        if (!member || member->type != TG3_VALUE_ARRAY || !member->array_data || member->array_count != 3)
+            return std::nullopt;
+
+        glm::vec3 result(1.0f);
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            const auto comp = read_json_float(member->array_data[i]);
+            if (!comp)
+                return std::nullopt;
+            result[i] = *comp;
+        }
+        return result;
+    }
+
+    int32_t read_ext_texture_index(const tg3_value& obj, const char* key)
+    {
+        const tg3_value* tex_obj = find_object_member(obj, key);
+        if (!tex_obj)
+            return -1;
+        const tg3_value* idx_val = find_object_member(*tex_obj, "index");
+        if (!idx_val || idx_val->type != TG3_VALUE_INT)
+            return -1;
+        if (idx_val->int_val < 0 || idx_val->int_val > std::numeric_limits<int32_t>::max())
+            return -1;
+        return static_cast<int32_t>(idx_val->int_val);
+    }
+
     float get_material_ior(const tg3_material* tg3mat, float metallicFactor)
     {
         // Default IOR fallback: 1.5 for dielectric (metallicFactor < 1.0), 1.0 for conductor/metal (metallicFactor == 1.0)
         const float fallback_ior = (metallicFactor < 1.0f) ? 1.5f : 1.0f;
 
-        if (!tg3mat)
-            return fallback_ior;
-
-        auto extract_ior_from_ext = [](const tg3_extras_ext& ext_container) -> std::optional<float>
+        if (const tg3_value* ext_val = find_material_extension(tg3mat, "KHR_materials_ior"))
         {
-            for (uint32_t i = 0; i < ext_container.extensions_count; ++i)
+            if (auto ior = read_ext_float(*ext_val, "ior"))
             {
-                const auto& ext = ext_container.extensions[i];
-                if (tg3_str_equals_cstr(ext.name, "KHR_materials_ior"))
-                {
-                    if (ext.value.type == TG3_VALUE_OBJECT)
-                    {
-                        for (uint32_t j = 0; j < ext.value.object_count; ++j)
-                        {
-                            const auto& kv = ext.value.object_data[j];
-                            if (tg3_str_equals_cstr(kv.key, "ior"))
-                            {
-                                if (kv.value.type == TG3_VALUE_REAL)
-                                    return static_cast<float>(kv.value.real_val);
-                                if (kv.value.type == TG3_VALUE_INT)
-                                    return static_cast<float>(kv.value.int_val);
-                            }
-                        }
-                    }
-                    // Extension is present but "ior" property omitted -> glTF spec default is 1.5
-                    return 1.5f;
-                }
+                return (*ior > 0.0f) ? *ior : fallback_ior;
             }
-            return std::nullopt;
-        };
-
-        if (auto ior = extract_ior_from_ext(tg3mat->ext))
-        {
-            return (*ior > 0.0f) ? *ior : fallback_ior;
-        }
-
-        if (auto ior = extract_ior_from_ext(tg3mat->pbr_metallic_roughness.ext))
-        {
-            return (*ior > 0.0f) ? *ior : fallback_ior;
+            // Extension is present but "ior" property omitted -> glTF spec default is 1.5
+            return 1.5f;
         }
 
         return fallback_ior;
+    }
+
+    float clamp_unit(float value)
+    {
+        return (value < 0.0f) ? 0.0f : ((value > 1.0f) ? 1.0f : value);
+    }
+
+    MaterialTransmissionData get_material_transmission(const tg3_material* tg3mat)
+    {
+        MaterialTransmissionData data{};
+        const tg3_value* ext_val = find_material_extension(tg3mat, "KHR_materials_transmission");
+        if (!ext_val)
+            return data;
+
+        if (auto factor = read_ext_float(*ext_val, "transmissionFactor"))
+        {
+            data.transmissionFactor = clamp_unit(*factor);
+        }
+        data.transmissionTextureIdx = read_ext_texture_index(*ext_val, "transmissionTexture");
+        return data;
+    }
+
+    MaterialVolumeData get_material_volume(const tg3_material* tg3mat)
+    {
+        MaterialVolumeData data{};
+        const tg3_value* ext_val = find_material_extension(tg3mat, "KHR_materials_volume");
+        if (!ext_val)
+            return data;
+
+        if (auto thickness = read_ext_float(*ext_val, "thicknessFactor"))
+        {
+            data.thicknessFactor = (*thickness > 0.0f) ? *thickness : 0.0f;
+        }
+        data.thicknessTextureIdx = read_ext_texture_index(*ext_val, "thicknessTexture");
+        if (auto color = read_ext_vec3(*ext_val, "attenuationColor"))
+        {
+            data.attenuationColor = glm::vec3(
+                clamp_unit(color->x),
+                clamp_unit(color->y),
+                clamp_unit(color->z));
+        }
+        if (auto distance = read_ext_float(*ext_val, "attenuationDistance"))
+        {
+            if (*distance > 0.0f)
+            {
+                data.attenuationDistance = *distance;
+            }
+        }
+        return data;
+    }
+
+    ResolvedTexture resolve_material_texture(
+        int32_t gltfTexIdx,
+        const std::vector<uint32_t>& textureIds,
+        const std::vector<Texture>& textures)
+    {
+        ResolvedTexture resolved{};
+        if (gltfTexIdx >= 0 && static_cast<uint32_t>(gltfTexIdx) < textureIds.size())
+        {
+            resolved.index = textureIds[gltfTexIdx];
+            if (resolved.index > 0 && resolved.index - 1 < textures.size())
+            {
+                resolved.obj = textures[resolved.index - 1].texObj;
+            }
+        }
+        return resolved;
     }
 } // namespace
 
@@ -1171,9 +1341,17 @@ std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::ve
         m_materials[idx0].emissiveFactor = glm::vec3(0.0f, 0.0f, 0.0f);
         m_materials[idx0].baseColorTextureIndex = 0;
         m_materials[idx0].normalTextureIndex = 0;
+        m_materials[idx0].transmissionTextureIndex = 0;
+        m_materials[idx0].thicknessTextureIndex = 0;
         m_materials[idx0].baseColorTexture = 0;
         m_materials[idx0].normalTexture = 0;
+        m_materials[idx0].transmissionTexture = 0;
+        m_materials[idx0].thicknessTexture = 0;
         m_materials[idx0].ior = 1;
+        m_materials[idx0].transmissionFactor = 0.0f;
+        m_materials[idx0].thicknessFactor = 0.0f;
+        m_materials[idx0].attenuationColor = glm::vec3(1.0f);
+        m_materials[idx0].attenuationDistance = std::numeric_limits<float>::infinity();
     }
 
     for (uint32_t i = 0; i < model.materials_count; ++i)
@@ -1194,35 +1372,30 @@ std::vector<uint32_t> Scene::loadMaterials(const tg3_model& model, const std::ve
             static_cast<float>(tg3mat->emissive_factor[1]),
             static_cast<float>(tg3mat->emissive_factor[2]));
 
-        uint32_t baseTexId = 0;
-        cudaTextureObject_t baseTexObj = 0;
-        int32_t gltfBaseTexIdx = tg3mat->pbr_metallic_roughness.base_color_texture.index;
-        if (gltfBaseTexIdx >= 0 && static_cast<uint32_t>(gltfBaseTexIdx) < textureIds.size())
-        {
-            baseTexId = textureIds[gltfBaseTexIdx];
-            if (baseTexId > 0 && baseTexId - 1 < m_textures.size())
-            {
-                baseTexObj = m_textures[baseTexId - 1].texObj;
-            }
-        }
+        const auto baseTex = resolve_material_texture(
+            tg3mat->pbr_metallic_roughness.base_color_texture.index, textureIds, m_textures);
+        const auto normTex = resolve_material_texture(
+            tg3mat->normal_texture.index, textureIds, m_textures);
+        const auto transmission = get_material_transmission(tg3mat);
+        const auto volume = get_material_volume(tg3mat);
+        const auto transTex = resolve_material_texture(
+            transmission.transmissionTextureIdx, textureIds, m_textures);
+        const auto thickTex = resolve_material_texture(
+            volume.thicknessTextureIdx, textureIds, m_textures);
 
-        uint32_t normTexId = 0;
-        cudaTextureObject_t normTexObj = 0;
-        int32_t gltfNormTexIdx = tg3mat->normal_texture.index;
-        if (gltfNormTexIdx >= 0 && static_cast<uint32_t>(gltfNormTexIdx) < textureIds.size())
-        {
-            normTexId = textureIds[gltfNormTexIdx];
-            if (normTexId > 0 && normTexId - 1 < m_textures.size())
-            {
-                normTexObj = m_textures[normTexId - 1].texObj;
-            }
-        }
-
-        mat.baseColorTextureIndex = baseTexId;
-        mat.normalTextureIndex = normTexId;
-        mat.baseColorTexture = baseTexObj;
-        mat.normalTexture = normTexObj;
+        mat.baseColorTextureIndex = baseTex.index;
+        mat.normalTextureIndex = normTex.index;
+        mat.transmissionTextureIndex = transTex.index;
+        mat.thicknessTextureIndex = thickTex.index;
+        mat.baseColorTexture = baseTex.obj;
+        mat.normalTexture = normTex.obj;
+        mat.transmissionTexture = transTex.obj;
+        mat.thicknessTexture = thickTex.obj;
         mat.ior = get_material_ior(tg3mat, mat.metallicFactor);
+        mat.transmissionFactor = transmission.transmissionFactor;
+        mat.thicknessFactor = volume.thicknessFactor;
+        mat.attenuationColor = volume.attenuationColor;
+        mat.attenuationDistance = volume.attenuationDistance;
 
         materialIds[i] = static_cast<uint32_t>(matIdx);
     }
@@ -1503,6 +1676,22 @@ namespace
         return candidate;
     }
 
+    bool is_reusable_heterogeneous_blas_type(ASType type)
+    {
+        return type == ASType::BVH ||
+               type == ASType::KDTree ||
+               type == ASType::UniformGrid ||
+               type == ASType::Octree;
+    }
+
+    bool is_valid_heterogeneous_blas_space(soa_pool<Space>& spaces, uint32_t space_id)
+    {
+        return space_id != UINT32_MAX &&
+               spaces.is_allocated(space_id) &&
+               is_reusable_heterogeneous_blas_type(spaces[space_id].as_type) &&
+               spaces[space_id].root_box >= 0;
+    }
+
     void refresh_heterogeneous_tlas_nagata_flags(
         soa_pool<Space>& spaces,
         const HeterogeneousAS& as_heterogeneous)
@@ -1557,7 +1746,7 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
     if (valid_instances.empty())
         return UINT32_MAX;
 
-    const auto build_t0 = std::chrono::high_resolution_clock::now();
+    const bool rebuild_blas = as_heterogeneous.config.rebuild_blas;
     const bool swap_yz = as_heterogeneous.config.swapYZ;
 
     glm::mat4 S_yz(1.0f);
@@ -1648,9 +1837,41 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
     std::vector<MeshBuildRecord> mesh_records;
     mesh_records.reserve(unique_meshes.size());
     bool any_has_nagata = false;
+    double blas_eval_prep_ms = 0.0;
 
     for (auto& u : unique_meshes)
     {
+        uint32_t reused_blas_space_id = UINT32_MAX;
+        if (!rebuild_blas && u.mesh_node_id < m_nodes.size())
+        {
+            const ASRef& node_ref = m_nodes[u.mesh_node_id].as_ref;
+            if (node_ref.is_valid() &&
+                is_valid_heterogeneous_blas_space(spaces, node_ref.space_id) &&
+                spaces[node_ref.space_id].as_type == node_ref.type)
+            {
+                reused_blas_space_id = node_ref.space_id;
+            }
+        }
+
+        if (reused_blas_space_id != UINT32_MAX)
+        {
+            u.blas_space_id = reused_blas_space_id;
+            MeshBuildRecord rec = as_heterogeneous.make_existing_blas_record(
+                reused_blas_space_id,
+                spaces[reused_blas_space_id],
+                static_cast<uint32_t>(u.mesh->triangles.size()),
+                static_cast<uint32_t>(u.mesh->vertices.size()),
+                u.mesh->name,
+                u.mesh_node_id,
+                u.instance_count,
+                u.local_bounds_min,
+                u.local_bounds_max);
+            any_has_nagata = any_has_nagata || static_cast<bool>(spaces[reused_blas_space_id].has_nagata);
+            mesh_records.push_back(std::move(rec));
+            continue;
+        }
+
+        const auto mesh_t0 = std::chrono::high_resolution_clock::now();
         const uint32_t blas_space_id = create_space();
         u.blas_space_id = blas_space_id;
 
@@ -1677,6 +1898,9 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
             u.local_bounds_min,
             u.local_bounds_max);
         geometry_context.d_spaces = spaces;
+        const auto mesh_t1 = std::chrono::high_resolution_clock::now();
+        const double mesh_total_ms = std::chrono::duration<double, std::milli>(mesh_t1 - mesh_t0).count();
+        blas_eval_prep_ms += std::max(0.0, mesh_total_ms - rec.selected_build_ms);
 
         any_has_nagata = any_has_nagata || static_cast<bool>(spaces[blas_space_id].has_nagata);
 
@@ -1717,14 +1941,31 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
             m_scene_to_local = glm::inverse(m_local_to_scene);
         }
 
+        uint32_t active_space_id = u.blas_space_id;
+        ASType active_as_type = mrec.selected_as_type;
+        if (!rebuild_blas &&
+            desc.instance_node_id < m_nodes.size() &&
+            desc.instance_node_id != u.mesh_node_id)
+        {
+            const ASRef& inst_ref = m_nodes[desc.instance_node_id].as_ref;
+            if (inst_ref.is_valid() &&
+                is_valid_heterogeneous_blas_space(spaces, inst_ref.space_id) &&
+                spaces[inst_ref.space_id].as_type == inst_ref.type)
+            {
+                active_space_id = inst_ref.space_id;
+                active_as_type = inst_ref.type;
+                any_has_nagata = any_has_nagata || static_cast<bool>(spaces[active_space_id].has_nagata);
+            }
+        }
+
         HeterogeneousInstanceRecord irec{};
         irec.instance_name = desc.instance_name.empty() ? u.mesh->name : desc.instance_name;
         irec.instance_node_id = desc.instance_node_id;
         irec.mesh_node_id = u.mesh_node_id;
         irec.default_space_id = u.blas_space_id;
-        irec.active_space_id = u.blas_space_id;
+        irec.active_space_id = active_space_id;
         irec.default_as_type = mrec.selected_as_type;
-        irec.active_as_type = mrec.selected_as_type;
+        irec.active_as_type = active_as_type;
         irec.s2l_row0 = glm::vec4(m_scene_to_local[0][0], m_scene_to_local[1][0], m_scene_to_local[2][0], m_scene_to_local[3][0]);
         irec.s2l_row1 = glm::vec4(m_scene_to_local[0][1], m_scene_to_local[1][1], m_scene_to_local[2][1], m_scene_to_local[3][1]);
         irec.s2l_row2 = glm::vec4(m_scene_to_local[0][2], m_scene_to_local[1][2], m_scene_to_local[2][2], m_scene_to_local[3][2]);
@@ -1741,6 +1982,7 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
         subspaces.push_back(sub);
     }
 
+    const auto tlas_prep_t0 = std::chrono::high_resolution_clock::now();
     const uint32_t tlas_space_id = create_space();
     spaces[tlas_space_id].normalization_translate = scene_trans;
     spaces[tlas_space_id].normalization_scale = scene_scale;
@@ -1748,16 +1990,16 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
     geometry_context.d_spaces = spaces;
 
     as_heterogeneous.pack_subspaces(tlas_space_id, spaces[tlas_space_id], subspaces);
-
-    const auto pre_tlas_t1 = std::chrono::high_resolution_clock::now();
-    const double pre_tlas_ms = std::chrono::duration<double, std::milli>(pre_tlas_t1 - build_t0).count();
+    const auto tlas_prep_t1 = std::chrono::high_resolution_clock::now();
+    const double tlas_prep_ms = std::chrono::duration<double, std::milli>(tlas_prep_t1 - tlas_prep_t0).count();
 
     as_heterogeneous.finalize_tlas(
         tlas_space_id,
         spaces[tlas_space_id],
         std::move(mesh_records),
         std::move(instance_records),
-        pre_tlas_ms);
+        blas_eval_prep_ms,
+        tlas_prep_ms);
 
     geometry_context.d_spaces = spaces;
     return tlas_space_id;
@@ -1775,14 +2017,41 @@ uint32_t Scene::build_node_as(uint32_t node_id, ASType type)
         if (instances.empty())
             return UINT32_MAX;
 
+        const bool rebuild_blas = as_heterogeneous.config.rebuild_blas;
+        const bool was_active_space =
+            m_nodes[node_id].as_ref.is_valid() &&
+            m_nodes[node_id].as_ref.space_id == m_active_space;
+
         std::unordered_set<uint32_t> visited;
         std::vector<uint32_t> subtree_nodes;
         collect_subtree_node_ids(m_nodes, node_id, visited, subtree_nodes);
 
+        uint32_t recovered_target_leaf_blas = UINT32_MAX;
+        if (!rebuild_blas &&
+            m_nodes[node_id].meshId > 0 &&
+            m_nodes[node_id].as_ref.is_valid() &&
+            m_nodes[node_id].as_ref.type == ASType::Heterogeneous)
+        {
+            if (const auto* recs = as_heterogeneous.get_mesh_records(m_nodes[node_id].as_ref.space_id))
+            {
+                for (const auto& rec : *recs)
+                {
+                    if (rec.mesh_node_id == node_id && is_valid_heterogeneous_blas_space(spaces, rec.space_id))
+                    {
+                        recovered_target_leaf_blas = rec.space_id;
+                        break;
+                    }
+                }
+            }
+        }
+
         for (uint32_t sub_id : subtree_nodes)
         {
             ASRef& sub_ref = m_nodes[sub_id].as_ref;
-            if (sub_ref.is_valid())
+            if (!sub_ref.is_valid())
+                continue;
+
+            if (rebuild_blas)
             {
                 const uint32_t old_space = sub_ref.space_id;
                 if (!as_heterogeneous.is_blas_space_owned(old_space))
@@ -1791,7 +2060,48 @@ uint32_t Scene::build_node_as(uint32_t node_id, ASType type)
                     free_space(old_space);
                     sub_ref = {};
                 }
+                continue;
             }
+
+            const bool is_target = (sub_id == node_id);
+            const bool is_mesh_leaf = (m_nodes[sub_id].meshId > 0);
+            const bool is_single_mesh_instance = (!is_mesh_leaf && m_nodes[sub_id].count_subtree_meshes(m_nodes) == 1);
+
+            if (sub_ref.type == ASType::Heterogeneous)
+            {
+                free_tlas_space_only(sub_ref.space_id);
+                sub_ref = {};
+            }
+            else if (is_mesh_leaf || (!is_target && is_single_mesh_instance))
+            {
+                if (!is_valid_heterogeneous_blas_space(spaces, sub_ref.space_id) ||
+                    spaces[sub_ref.space_id].as_type != sub_ref.type)
+                {
+                    as_heterogeneous.unbind_instance_node_override(sub_id);
+                    const uint32_t old_space = sub_ref.space_id;
+                    if (!as_heterogeneous.is_blas_space_owned(old_space))
+                    {
+                        free_space(old_space);
+                    }
+                    sub_ref = {};
+                }
+            }
+            else
+            {
+                const uint32_t old_space = sub_ref.space_id;
+                if (!as_heterogeneous.is_blas_space_owned(old_space))
+                {
+                    as_heterogeneous.unbind_instance_node_override(sub_id);
+                    free_space(old_space);
+                }
+                sub_ref = {};
+            }
+        }
+
+        if (recovered_target_leaf_blas != UINT32_MAX &&
+            is_valid_heterogeneous_blas_space(spaces, recovered_target_leaf_blas))
+        {
+            m_nodes[node_id].as_ref = ASRef{recovered_target_leaf_blas, spaces[recovered_target_leaf_blas].as_type};
         }
 
         const uint32_t new_space_id = build_heterogeneous_instances(instances);
@@ -1799,7 +2109,7 @@ uint32_t Scene::build_node_as(uint32_t node_id, ASType type)
             return UINT32_MAX;
 
         m_nodes[node_id].as_ref = ASRef{new_space_id, ASType::Heterogeneous};
-        if (m_active_space == new_space_id)
+        if (was_active_space || m_active_space == new_space_id)
         {
             set_active_space(new_space_id);
         }
@@ -1845,7 +2155,10 @@ uint32_t Scene::build_node_as(uint32_t node_id, ASType type)
 
     if (as_heterogeneous.is_blas_space_owned(target_space_id))
     {
-        as_heterogeneous.on_blas_space_rebuilt(target_space_id, type, rebuild_ms);
+        size_t nodes_bytes = 0;
+        size_t content_bytes = 0;
+        as_heterogeneous.compute_as_memory_bytes(type, spaces[target_space_id], nodes_bytes, content_bytes);
+        as_heterogeneous.on_blas_space_rebuilt(target_space_id, type, rebuild_ms, nodes_bytes, content_bytes);
     }
     else if (m_nodes[node_id].meshId == 0 && m_nodes[node_id].count_subtree_meshes(m_nodes) == 1)
     {
@@ -1860,20 +2173,6 @@ uint32_t Scene::build_node_as(uint32_t node_id, ASType type)
         set_active_space(target_space_id);
     }
     return target_space_id;
-}
-
-void Scene::rebuild_heterogeneous_tlas(uint32_t space_id)
-{
-    if (!spaces.is_allocated(space_id) || spaces[space_id].as_type != ASType::Heterogeneous)
-        return;
-
-    as_heterogeneous.rebuild_tlas_only(space_id, spaces[space_id]);
-    geometry_context.d_spaces = spaces;
-
-    if (m_active_space == space_id)
-    {
-        set_active_space(space_id);
-    }
 }
 
 void Scene::free_node_as(uint32_t node_id)

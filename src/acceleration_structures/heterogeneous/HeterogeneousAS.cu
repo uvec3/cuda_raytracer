@@ -67,7 +67,7 @@ namespace heterogeneous_host_detail
         uint32_t seed,
         uint32_t* out_checksum)
     {
-        constexpr uint32_t block_threads = HeterogeneousASDeviceView::BLOCK_THREADS;
+        constexpr uint32_t block_threads = HeterogeneousASDeviceView::PROBE_BLOCK_THREADS;
         constexpr uint32_t blas_stack_size = HeterogeneousASDeviceView::BLAS_STACK_SIZE;
 
         __shared__ BVHStackEntry shared_stack[blas_stack_size][block_threads];
@@ -438,7 +438,14 @@ void HeterogeneousAS::compute_as_memory_bytes(
 {
     out_content_bytes = static_cast<size_t>(space.box_content_size) * sizeof(BoxContent);
     if (as_type == ASType::BVH)
-        out_nodes_bytes = static_cast<size_t>(space.as_size) * sizeof(BVHNode16);
+    {
+        const bool is_bvh16 = (m_bvh != nullptr &&
+            space.root_box >= 0 &&
+            m_bvh->trees.is_allocated(static_cast<size_t>(space.root_box)))
+            ? (m_bvh->trees[static_cast<size_t>(space.root_box)].use_bvh16 != 0u)
+            : true;
+        out_nodes_bytes = static_cast<size_t>(space.as_size) * (is_bvh16 ? sizeof(BVHNode16) : sizeof(BVHNode));
+    }
     else if (as_type == ASType::KDTree)
         out_nodes_bytes = static_cast<size_t>(space.as_size) * sizeof(KDNode);
     else if (as_type == ASType::UniformGrid)
@@ -478,7 +485,7 @@ float HeterogeneousAS::benchmark_candidate_gpu(
     const UniformGridASDeviceView grid_view = m_uniform_grid ? m_uniform_grid->device_view() : UniformGridASDeviceView{};
     const OctreeASDeviceView oct_view = m_octree ? m_octree->device_view() : OctreeASDeviceView{};
 
-    constexpr uint32_t block_threads = HeterogeneousASDeviceView::BLOCK_THREADS;
+    constexpr uint32_t block_threads = HeterogeneousASDeviceView::PROBE_BLOCK_THREADS;
     const uint32_t grid_blocks = (ray_count - 1u) / block_threads + 1u;
 
     auto launch_probe = [&]<ASType Type>()
@@ -641,6 +648,8 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
         record.selected_variant_name = fallback.name;
         record.selected_as_type = ASType::BVH;
         record.selected_build_ms = final_ms;
+        record.selected_as_nodes_bytes = nodes_bytes;
+        record.selected_box_content_bytes = content_bytes;
         restore_standalone_configs(saved_configs);
         return record;
     }
@@ -679,8 +688,45 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
     build_single_as(variants[winning_variant_idx].as_type, blas_space_id, blas_space);
     const auto final_t1 = std::chrono::high_resolution_clock::now();
     record.selected_build_ms = std::chrono::duration<double, std::milli>(final_t1 - final_t0).count();
+    compute_as_memory_bytes(
+        record.selected_as_type,
+        blas_space,
+        record.selected_as_nodes_bytes,
+        record.selected_box_content_bytes);
 
     restore_standalone_configs(saved_configs);
+    return record;
+}
+
+MeshBuildRecord HeterogeneousAS::make_existing_blas_record(
+    uint32_t blas_space_id,
+    Space blas_space,
+    uint32_t num_triangles,
+    uint32_t num_vertices,
+    const std::string& mesh_name,
+    uint32_t mesh_node_id,
+    uint32_t instance_count,
+    glm::vec3 local_bounds_min,
+    glm::vec3 local_bounds_max) const
+{
+    MeshBuildRecord record{};
+    record.mesh_name = mesh_name;
+    record.mesh_node_id = mesh_node_id;
+    record.space_id = blas_space_id;
+    record.instance_count = instance_count;
+    record.num_triangles = num_triangles;
+    record.num_vertices = num_vertices;
+    record.local_bounds_min = local_bounds_min;
+    record.local_bounds_max = local_bounds_max;
+    record.selected_as_type = blas_space.as_type;
+    record.selected_variant_name = std::string("Existing (") +
+        heterogeneous_host_detail::as_type_short_name(blas_space.as_type) + ")";
+    record.selected_build_ms = 0.0;
+    compute_as_memory_bytes(
+        blas_space.as_type,
+        blas_space,
+        record.selected_as_nodes_bytes,
+        record.selected_box_content_bytes);
     return record;
 }
 
@@ -778,7 +824,8 @@ void HeterogeneousAS::finalize_tlas(
     Space tlas_space,
     std::vector<MeshBuildRecord>&& mesh_records,
     std::vector<HeterogeneousInstanceRecord>&& instance_records,
-    double pre_tlas_elapsed_ms)
+    double blas_eval_prep_ms,
+    double tlas_prep_ms)
 {
     assert(m_geometry_context != nullptr);
 
@@ -789,7 +836,8 @@ void HeterogeneousAS::finalize_tlas(
     restore_standalone_configs(saved_configs);
 
     const auto tlas_t1 = std::chrono::high_resolution_clock::now();
-    const double tlas_ms = std::chrono::duration<double, std::milli>(tlas_t1 - tlas_t0).count();
+    const double tlas_ms = std::max(0.0, tlas_prep_ms) +
+        std::chrono::duration<double, std::milli>(tlas_t1 - tlas_t0).count();
 
     const uint32_t inst_count = static_cast<uint32_t>(instance_records.size());
     uint32_t inst_offset = 0;
@@ -823,7 +871,7 @@ void HeterogeneousAS::finalize_tlas(
     {
         sum_selected_blas_ms += rec.selected_build_ms;
     }
-    const double blas_eval_prep_ms = std::max(0.0, pre_tlas_elapsed_ms - sum_selected_blas_ms);
+    const double clamped_eval_prep_ms = std::max(0.0, blas_eval_prep_ms);
 
     m_space_metadata[tlas_space_id] = SpaceMetadata{
         .tlas_as_type = tlas_as_type,
@@ -832,46 +880,11 @@ void HeterogeneousAS::finalize_tlas(
         .instances_count = inst_count,
         .tlas_build_ms = tlas_ms,
         .blas_build_ms = sum_selected_blas_ms,
-        .blas_eval_and_prep_ms = blas_eval_prep_ms,
-        .total_build_ms = sum_selected_blas_ms + blas_eval_prep_ms + tlas_ms,
+        .blas_eval_and_prep_ms = clamped_eval_prep_ms,
+        .total_build_ms = sum_selected_blas_ms + clamped_eval_prep_ms + tlas_ms,
         .mesh_records = std::move(mesh_records),
         .instance_records = std::move(instance_records)
     };
-
-    sync_to_device();
-}
-
-void HeterogeneousAS::rebuild_tlas_only(uint32_t tlas_space_id, Space tlas_space)
-{
-    if (m_geometry_context == nullptr || tlas_space.as_type != ASType::Heterogeneous)
-        return;
-
-    const int tree_id = tlas_space.root_box;
-    auto it = m_space_metadata.find(tlas_space_id);
-    if (tree_id < 0 || it == m_space_metadata.end())
-        return;
-
-    free_tlas_inner_as(tlas_space_id, tlas_space, it->second.tlas_as_type, it->second.tlas_root_box);
-
-    const auto tlas_t0 = std::chrono::high_resolution_clock::now();
-    const SavedASConfigs saved_configs = save_standalone_configs();
-    const ASType tlas_as_type = configure_tlas_builder(config.tlas_type);
-    build_single_as(tlas_as_type, tlas_space_id, tlas_space);
-    restore_standalone_configs(saved_configs);
-    const auto tlas_t1 = std::chrono::high_resolution_clock::now();
-    const double tlas_ms = std::chrono::duration<double, std::milli>(tlas_t1 - tlas_t0).count();
-
-    const int32_t new_tlas_root_box = tlas_space.root_box;
-    trees[static_cast<size_t>(tree_id)].tlas_root_box = new_tlas_root_box;
-    trees[static_cast<size_t>(tree_id)].tlas_as_type = static_cast<uint32_t>(tlas_as_type);
-
-    tlas_space.root_box = tree_id;
-    tlas_space.as_type = ASType::Heterogeneous;
-
-    it->second.tlas_as_type = tlas_as_type;
-    it->second.tlas_root_box = new_tlas_root_box;
-    it->second.tlas_build_ms = tlas_ms;
-    it->second.total_build_ms = it->second.blas_build_ms + it->second.blas_eval_and_prep_ms + tlas_ms;
 
     sync_to_device();
 }
@@ -904,7 +917,12 @@ bool HeterogeneousAS::is_blas_space_owned(uint32_t blas_space_id) const
     return false;
 }
 
-void HeterogeneousAS::on_blas_space_rebuilt(uint32_t blas_space_id, ASType new_as_type, double new_build_ms)
+void HeterogeneousAS::on_blas_space_rebuilt(
+    uint32_t blas_space_id,
+    ASType new_as_type,
+    double new_build_ms,
+    size_t new_as_nodes_bytes,
+    size_t new_box_content_bytes)
 {
     const char* short_name = heterogeneous_host_detail::as_type_short_name(new_as_type);
     for (auto& [tlas_id, meta] : m_space_metadata)
@@ -917,6 +935,8 @@ void HeterogeneousAS::on_blas_space_rebuilt(uint32_t blas_space_id, ASType new_a
                 rec.selected_as_type = new_as_type;
                 rec.selected_variant_name = std::string("Manual (") + short_name + ")";
                 rec.selected_build_ms = (new_as_type == ASType::None) ? 0.0 : new_build_ms;
+                rec.selected_as_nodes_bytes = (new_as_type == ASType::None) ? 0 : new_as_nodes_bytes;
+                rec.selected_box_content_bytes = (new_as_type == ASType::None) ? 0 : new_box_content_bytes;
                 touched = true;
             }
         }
@@ -1098,6 +1118,7 @@ bool HeterogeneousAS::tlas_type_combo_ui(const char* label)
 void HeterogeneousAS::config_ui()
 {
     tlas_type_combo_ui("TLAS Type");
+    ImGui::Checkbox("Rebuild BLAS", &config.rebuild_blas);
 
     ImGui::DragFloat("Max AS Bytes / Tri", &config.max_memory_bytes_per_triangle, 1.0f, 4.0f, 512.0f, "%.1f B");
     ImGui::DragInt("Probe Rays / Candidate", &config.num_probe_rays, 256.0f, 1024, 262144);
@@ -1161,14 +1182,7 @@ void HeterogeneousAS::info_ui(uint32_t space_id, Space space)
         else if (rec.selected_as_type == ASType::UniformGrid) ++count_grid;
         else if (rec.selected_as_type == ASType::Octree) ++count_oct;
 
-        for (const auto& cand : rec.candidates)
-        {
-            if (cand.variant_name == rec.selected_variant_name)
-            {
-                total_blas_as_bytes += cand.as_nodes_bytes + cand.box_content_bytes;
-                break;
-            }
-        }
+        total_blas_as_bytes += rec.selected_as_nodes_bytes + rec.selected_box_content_bytes;
     }
 
     ImGui::Text("  Selections: BVH16=%u, KD=%u, Grid=%u, Oct=%u", count_bvh, count_kd, count_grid, count_oct);

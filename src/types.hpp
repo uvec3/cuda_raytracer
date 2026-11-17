@@ -26,6 +26,8 @@
 #undef min
 #undef max
 
+inline constexpr uint32_t RENDER_BLOCK_THREADS = 64;
+
 enum class ASType : uint32_t
 {
     None =0,
@@ -323,11 +325,19 @@ struct Material
     float& metallicFactor;
     float& roughnessFactor;
     float& ior;
+    float& transmissionFactor;
+    float& thicknessFactor;
+    glm::vec3& attenuationColor;
+    float& attenuationDistance;
     glm::vec3& emissiveFactor;
     uint32_t& baseColorTextureIndex;
     uint32_t& normalTextureIndex;
+    uint32_t& transmissionTextureIndex;
+    uint32_t& thicknessTextureIndex;
     cudaTextureObject_t& baseColorTexture;
     cudaTextureObject_t& normalTexture;
+    cudaTextureObject_t& transmissionTexture;
+    cudaTextureObject_t& thicknessTexture;
 };
 
 struct Ray

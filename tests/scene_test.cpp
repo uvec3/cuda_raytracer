@@ -2581,18 +2581,19 @@ TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
     Scene scene("HeterogeneousRebuildTlasOnly");
     scene.load(view);
 
+    EXPECT_TRUE(scene.as_heterogeneous.config.rebuild_blas);
     scene.as_heterogeneous.config.tlas_type = ASType::BVH;
     scene.as_heterogeneous.config.num_probe_rays = 2048;
     scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
 
-    const uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
     ASSERT_NE(tlas_space, UINT32_MAX);
     ASSERT_TRUE(scene.spaces.is_allocated(tlas_space));
     scene.set_active_space(tlas_space);
 
-    const int tree_id = scene.spaces[tlas_space].root_box;
-    ASSERT_GE(tree_id, 0);
-    EXPECT_EQ(scene.as_heterogeneous.trees[static_cast<size_t>(tree_id)].tlas_as_type, static_cast<uint32_t>(ASType::BVH));
+    const int init_tree_id = scene.spaces[tlas_space].root_box;
+    ASSERT_GE(init_tree_id, 0);
+    EXPECT_EQ(scene.as_heterogeneous.trees[static_cast<size_t>(init_tree_id)].tlas_as_type, static_cast<uint32_t>(ASType::BVH));
 
     const double init_tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
     const double init_blas_ms = scene.as_heterogeneous.get_blas_build_time_ms(tlas_space);
@@ -2613,6 +2614,7 @@ TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
     for (const auto& rec : *mesh_records)
     {
         EXPECT_GT(rec.selected_build_ms, 0.0);
+        EXPECT_FALSE(rec.candidates.empty());
         original_blas_spaces.push_back(rec.space_id);
     }
 
@@ -2652,21 +2654,26 @@ TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
     std::vector<uchar4> host_pixels(width * height);
     const ASType target_tlas_types[] = {ASType::KDTree, ASType::UniformGrid, ASType::Octree, ASType::BVH};
 
+    scene.as_heterogeneous.config.rebuild_blas = false;
     for (ASType target_tlas : target_tlas_types)
     {
         scene.as_heterogeneous.config.tlas_type = target_tlas;
-        scene.rebuild_heterogeneous_tlas(tlas_space);
+        tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+        ASSERT_NE(tlas_space, UINT32_MAX);
 
         EXPECT_TRUE(scene.spaces.is_allocated(tlas_space));
+        EXPECT_EQ(scene.get_active_space(), tlas_space);
+        EXPECT_EQ(scene.m_nodes[scene.root_node_id].as_ref.space_id, tlas_space);
         EXPECT_EQ(scene.spaces[tlas_space].as_type, ASType::Heterogeneous);
-        EXPECT_EQ(scene.spaces[tlas_space].root_box, tree_id);
+        const int tree_id = scene.spaces[tlas_space].root_box;
+        ASSERT_GE(tree_id, 0);
         EXPECT_EQ(scene.as_heterogeneous.trees[static_cast<size_t>(tree_id)].tlas_as_type, static_cast<uint32_t>(target_tlas));
 
         const double tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
         EXPECT_GT(tlas_ms, 0.0);
-        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_build_time_ms(tlas_space), init_blas_ms);
-        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_eval_prep_time_ms(tlas_space), init_eval_ms);
-        EXPECT_NEAR(scene.as_heterogeneous.get_build_time_ms(tlas_space), tlas_ms + init_blas_ms + init_eval_ms, 1e-6);
+        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_build_time_ms(tlas_space), 0.0);
+        EXPECT_DOUBLE_EQ(scene.as_heterogeneous.get_blas_eval_prep_time_ms(tlas_space), 0.0);
+        EXPECT_NEAR(scene.as_heterogeneous.get_build_time_ms(tlas_space), tlas_ms, 1e-6);
 
         const auto* post_meshes = scene.as_heterogeneous.get_mesh_records(tlas_space);
         ASSERT_NE(post_meshes, nullptr);
@@ -2675,7 +2682,25 @@ TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
         {
             EXPECT_EQ((*post_meshes)[i].space_id, original_blas_spaces[i]);
             EXPECT_TRUE(scene.spaces.is_allocated(original_blas_spaces[i]));
+            EXPECT_TRUE((*post_meshes)[i].candidates.empty());
+            EXPECT_DOUBLE_EQ((*post_meshes)[i].selected_build_ms, 0.0);
+            EXPECT_EQ((*post_meshes)[i].selected_variant_name.rfind("Existing (", 0), 0u);
         }
+
+        const auto* post_insts = scene.as_heterogeneous.get_instance_records(tlas_space);
+        ASSERT_NE(post_insts, nullptr);
+        bool override_preserved = false;
+        for (const auto& irec : *post_insts)
+        {
+            if (irec.instance_node_id == inst_node_id)
+            {
+                EXPECT_EQ(irec.active_space_id, override_space);
+                EXPECT_EQ(irec.active_as_type, ASType::KDTree);
+                override_preserved = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(override_preserved);
 
         raytracer.update_parameters(scene, width, height);
         raytracer.draw_first_hit(scene, surface, width, height, 0);
@@ -2691,17 +2716,190 @@ TEST(HeterogeneousAS, RebuildTlasOnlyAndTimingsGPU)
         EXPECT_GT(hit_pixels, 0u);
     }
 
+    // Re-enabling rebuild_blas samples and rebuilds all BLAS spaces cleanly
+    scene.as_heterogeneous.config.rebuild_blas = true;
+    tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    EXPECT_FALSE(scene.m_nodes[inst_node_id].as_ref.is_valid());
+    const auto* rebuilt_insts = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(rebuilt_insts, nullptr);
+    for (const auto& irec : *rebuilt_insts)
+    {
+        EXPECT_EQ(irec.active_space_id, irec.default_space_id);
+        if (irec.instance_node_id == inst_node_id)
+        {
+            EXPECT_NE(irec.active_space_id, override_space);
+        }
+    }
+    EXPECT_GT(scene.as_heterogeneous.get_blas_build_time_ms(tlas_space), 0.0);
+    const auto* rebuilt_meshes = scene.as_heterogeneous.get_mesh_records(tlas_space);
+    ASSERT_NE(rebuilt_meshes, nullptr);
+    ASSERT_EQ(rebuilt_meshes->size(), original_blas_spaces.size());
+    std::vector<uint32_t> rebuilt_blas_spaces;
+    for (const auto& rec : *rebuilt_meshes)
+    {
+        EXPECT_GT(rec.selected_build_ms, 0.0);
+        EXPECT_FALSE(rec.candidates.empty());
+        rebuilt_blas_spaces.push_back(rec.space_id);
+    }
+
+    raytracer.update_parameters(scene, width, height);
+    raytracer.draw_first_hit(scene, surface, width, height, 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy2DFromArray(host_pixels.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+    uint32_t rebuilt_hits = 0;
+    for (const auto& px : host_pixels)
+    {
+        if (px.x > 0 || px.y > 0 || px.z > 0)
+            ++rebuilt_hits;
+    }
+    EXPECT_GT(rebuilt_hits, 0u);
+
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
 
-    scene.free_node_as(inst_node_id);
-    EXPECT_FALSE(scene.spaces.is_allocated(override_space));
     scene.free_node_as(scene.root_node_id);
     EXPECT_FALSE(scene.spaces.is_allocated(tlas_space));
-    for (uint32_t blas_id : original_blas_spaces)
+    for (uint32_t blas_id : rebuilt_blas_spaces)
     {
         EXPECT_FALSE(scene.spaces.is_allocated(blas_id));
     }
+}
+
+TEST(HeterogeneousAS, ReusePrebuiltStandaloneAndBuildMissingBlasGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("HeterogeneousReusePartial");
+    scene.load(view);
+    ASSERT_GE(scene.m_mesh_node_ids.size(), 2u);
+
+    uint32_t inst_override_node = UINT32_MAX;
+    uint32_t mesh_node_0 = UINT32_MAX;
+    for (uint32_t nid = 0; nid < static_cast<uint32_t>(scene.m_nodes.size()); ++nid)
+    {
+        const Node& n = scene.m_nodes[nid];
+        if (n.meshId == 0 && n.children.size() == 1 && n.count_subtree_meshes(scene.m_nodes) == 1)
+        {
+            const uint32_t child_id = n.children[0];
+            if (child_id < scene.m_nodes.size() && scene.m_nodes[child_id].meshId > 0)
+            {
+                inst_override_node = nid;
+                mesh_node_0 = child_id;
+                break;
+            }
+        }
+    }
+    ASSERT_NE(inst_override_node, UINT32_MAX);
+    ASSERT_NE(mesh_node_0, UINT32_MAX);
+
+    uint32_t mesh_node_1 = UINT32_MAX;
+    for (uint32_t candidate_mesh_nid : scene.m_mesh_node_ids)
+    {
+        if (candidate_mesh_nid != mesh_node_0)
+        {
+            mesh_node_1 = candidate_mesh_nid;
+            break;
+        }
+    }
+    ASSERT_NE(mesh_node_1, UINT32_MAX);
+
+    const uint32_t prebuilt_bvh_space = scene.build_node_as(mesh_node_0, ASType::BVH);
+    const uint32_t prebuilt_optix_space = scene.build_node_as(mesh_node_1, ASType::Optix);
+    ASSERT_NE(prebuilt_bvh_space, UINT32_MAX);
+    ASSERT_NE(prebuilt_optix_space, UINT32_MAX);
+
+    const uint32_t prebuilt_override_space = scene.build_node_as(inst_override_node, ASType::KDTree);
+    ASSERT_NE(prebuilt_override_space, UINT32_MAX);
+
+    scene.as_heterogeneous.config.rebuild_blas = false;
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 2048;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    EXPECT_GT(scene.as_heterogeneous.get_blas_build_time_ms(tlas_space), 0.0);
+    EXPECT_TRUE(!scene.spaces.is_allocated(prebuilt_optix_space) ||
+                scene.spaces[prebuilt_optix_space].as_type != ASType::Optix);
+    EXPECT_NE(scene.m_nodes[mesh_node_1].as_ref.type, ASType::Optix);
+
+    const auto* mesh_recs = scene.as_heterogeneous.get_mesh_records(tlas_space);
+    ASSERT_NE(mesh_recs, nullptr);
+    bool checked_0 = false;
+    bool checked_1 = false;
+    uint32_t rebuilt_space_1 = UINT32_MAX;
+    for (const auto& rec : *mesh_recs)
+    {
+        if (rec.mesh_node_id == mesh_node_0)
+        {
+            EXPECT_EQ(rec.space_id, prebuilt_bvh_space);
+            EXPECT_EQ(rec.selected_as_type, ASType::BVH);
+            EXPECT_EQ(rec.selected_variant_name, "Existing (BVH16)");
+            EXPECT_TRUE(rec.candidates.empty());
+            EXPECT_DOUBLE_EQ(rec.selected_build_ms, 0.0);
+            checked_0 = true;
+        }
+        else
+        {
+            EXPECT_FALSE(rec.candidates.empty());
+            EXPECT_GT(rec.selected_build_ms, 0.0);
+            if (rec.mesh_node_id == mesh_node_1)
+            {
+                rebuilt_space_1 = rec.space_id;
+                checked_1 = true;
+            }
+        }
+    }
+    EXPECT_TRUE(checked_0);
+    EXPECT_TRUE(checked_1);
+    ASSERT_NE(rebuilt_space_1, UINT32_MAX);
+
+    const auto* inst_recs = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(inst_recs, nullptr);
+    bool found_override = false;
+    for (const auto& irec : *inst_recs)
+    {
+        if (irec.instance_node_id == inst_override_node)
+        {
+            EXPECT_EQ(irec.default_space_id, prebuilt_bvh_space);
+            EXPECT_EQ(irec.active_space_id, prebuilt_override_space);
+            EXPECT_EQ(irec.active_as_type, ASType::KDTree);
+            found_override = true;
+        }
+    }
+    EXPECT_TRUE(found_override);
+
+    // Free only mesh_node_0's BLAS and rebuild with rebuild_blas = false -> only mesh_node_0 is re-sampled
+    scene.free_node_as(mesh_node_0);
+    tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    mesh_recs = scene.as_heterogeneous.get_mesh_records(tlas_space);
+    ASSERT_NE(mesh_recs, nullptr);
+    for (const auto& rec : *mesh_recs)
+    {
+        if (rec.mesh_node_id == mesh_node_0)
+        {
+            EXPECT_FALSE(rec.candidates.empty());
+            EXPECT_GT(rec.selected_build_ms, 0.0);
+        }
+        else
+        {
+            EXPECT_TRUE(rec.candidates.empty());
+            EXPECT_DOUBLE_EQ(rec.selected_build_ms, 0.0);
+            if (rec.mesh_node_id == mesh_node_1)
+            {
+                EXPECT_EQ(rec.space_id, rebuilt_space_1);
+            }
+        }
+    }
+
+    scene.free_node_as(inst_override_node);
+    EXPECT_FALSE(scene.spaces.is_allocated(prebuilt_override_space));
+    scene.free_node_as(scene.root_node_id);
+    EXPECT_FALSE(scene.spaces.is_allocated(tlas_space));
+    EXPECT_FALSE(scene.spaces.is_allocated(rebuilt_space_1));
 }
 
 TEST(BVHAS, RefractionBoxEdgePlanesMatchOctreeGPU)

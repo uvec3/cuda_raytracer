@@ -61,7 +61,7 @@ public:
 
     std::vector<WindowInfo> windows;
     std::vector<SceneData> scenes;
-    int active_scene_number=0;
+    int active_scene_number=-1;
 
 
     //cuda loop
@@ -90,6 +90,10 @@ public:
     int last_fixed_mode = 3; // Default fixed preset: 1440p
     int custom_resolution[2] = {1920, 1080};
     bool scale_display_to_window = true;
+    int selected_as_type = 0; // 0: Octree, 1: Uniform Grid, 2: KD-Tree, 3: BVH, 4: OptiX, 5: Heterogeneous
+    bool auto_select_after_build = true;
+    bool auto_play_after_build = true;
+    bool copy_image_with_alpha = false;
 
     //frame start finish events
     cudaEvent_t start, finish;
@@ -102,6 +106,10 @@ public:
 
     void initScenes();
 
+    bool ensure_scene_loaded(int scene_index);
+
+    bool has_active_loaded_scene() const;
+
     void createRaytracer();
     void destroyRaytracer();
 
@@ -112,6 +120,8 @@ public:
     void ui_surface_input();
 
     void ui_menu();
+
+    void ui_keys();
 
     void ui_image();
 
@@ -126,6 +136,10 @@ public:
     bool ui_debug_pixel();
 
     bool ui_scenes_manager();
+
+    void ui_node_inspector();
+
+    void build_as();
 
     void draw_one_frame();
 

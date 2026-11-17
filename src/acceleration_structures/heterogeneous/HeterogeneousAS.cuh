@@ -52,6 +52,8 @@ struct MeshBuildRecord
     std::string selected_variant_name;
     ASType selected_as_type = ASType::BVH;
     double selected_build_ms = 0.0;
+    size_t selected_as_nodes_bytes = 0;
+    size_t selected_box_content_bytes = 0;
     std::vector<MeshCandidateResult> candidates;
 };
 
@@ -87,11 +89,12 @@ public:
     struct Config
     {
         ASType tlas_type = ASType::BVH; // Supports BVH (BVH16), KDTree, UniformGrid, Octree
+        bool rebuild_blas = true;
         float max_memory_bytes_per_triangle = 64.0f;
         int num_probe_rays = 16384;
         uint32_t random_seed = 1337u;
         bool swapYZ = true;
-        bool sort_space = true;
+        bool sort_space = false;
         PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 
@@ -146,14 +149,24 @@ public:
         glm::vec3 local_bounds_min,
         glm::vec3 local_bounds_max);
 
+    MeshBuildRecord make_existing_blas_record(
+        uint32_t blas_space_id,
+        Space blas_space,
+        uint32_t num_triangles,
+        uint32_t num_vertices,
+        const std::string& mesh_name,
+        uint32_t mesh_node_id,
+        uint32_t instance_count,
+        glm::vec3 local_bounds_min,
+        glm::vec3 local_bounds_max) const;
+
     void finalize_tlas(
         uint32_t tlas_space_id,
         Space tlas_space,
         std::vector<MeshBuildRecord>&& mesh_records,
         std::vector<HeterogeneousInstanceRecord>&& instance_records,
-        double pre_tlas_elapsed_ms);
-
-    void rebuild_tlas_only(uint32_t tlas_space_id, Space tlas_space);
+        double blas_eval_prep_ms,
+        double tlas_prep_ms = 0.0);
 
     void pack_subspaces(
         uint32_t tlas_space_id,
@@ -162,7 +175,17 @@ public:
 
     std::vector<uint32_t> get_owned_blas_spaces(uint32_t space_id) const;
     bool is_blas_space_owned(uint32_t blas_space_id) const;
-    void on_blas_space_rebuilt(uint32_t blas_space_id, ASType new_as_type, double new_build_ms = 0.0);
+    void on_blas_space_rebuilt(
+        uint32_t blas_space_id,
+        ASType new_as_type,
+        double new_build_ms = 0.0,
+        size_t new_as_nodes_bytes = 0,
+        size_t new_box_content_bytes = 0);
+    void compute_as_memory_bytes(
+        ASType as_type,
+        Space space,
+        size_t& out_nodes_bytes,
+        size_t& out_content_bytes) const;
     void bind_instance_node_override(uint32_t instance_node_id, uint32_t override_space_id, ASType override_as_type);
     void unbind_instance_node_override(uint32_t instance_node_id);
     void free_space(uint32_t space_id, Space space);
@@ -211,11 +234,6 @@ private:
     void build_single_as(ASType as_type, uint32_t space_id, Space space);
     void free_single_as_only(ASType as_type, uint32_t space_id, Space space);
     void free_tlas_inner_as(uint32_t space_id, Space space, ASType tlas_as_type, int32_t tlas_root_box);
-    void compute_as_memory_bytes(
-        ASType as_type,
-        Space space,
-        size_t& out_nodes_bytes,
-        size_t& out_content_bytes) const;
     float benchmark_candidate_gpu(
         ASType as_type,
         int32_t root_box,

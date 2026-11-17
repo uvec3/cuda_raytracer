@@ -30,7 +30,8 @@ struct HeterogeneousASDeviceView
     static constexpr uint32_t TLAS_STACK_SIZE = 12;
     static constexpr uint32_t BLAS_STACK_SIZE = 20;
     static constexpr uint32_t TOTAL_STACK_SIZE = TLAS_STACK_SIZE + BLAS_STACK_SIZE; // 32
-    static constexpr uint32_t BLOCK_THREADS = 32; // 32 * 128 * 8B = 32 KB shared memory
+    static constexpr uint32_t BLOCK_THREADS = RENDER_BLOCK_THREADS; // 32 * 64 * 8B = 16 KB shared memory
+    static constexpr uint32_t PROBE_BLOCK_THREADS = 32;             // 20 * 32 * 8B = 5 KB shared memory
 
     soa::soa_view<HeterogeneousTreeInfo> trees;
     soa::soa_view<HeterogeneousInstanceInfo> instances;

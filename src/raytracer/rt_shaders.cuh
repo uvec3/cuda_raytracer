@@ -147,7 +147,7 @@ glm::vec4 fragment_hit_shader_impl(
 
     if (mat_id < p.materials.size())
     {
-        auto mat = p.materials[mat_id];
+        auto&& mat = p.materials[mat_id];
         base_color = mat.baseColor;
         emissive = mat.emissiveFactor;
 
@@ -165,7 +165,7 @@ glm::vec4 fragment_hit_shader_impl(
     glm::vec4 out_color = glm::vec4(glm::vec3(base_color) * lighting + emissive, base_color.a);
 
     //decide whether to refract and continue
-    if (p.enableRefraction && base_color.a<1.0f)
+    if (p.enableRefraction && p.materials[mat_id].transmissionFactor>0.f)
     {
         float eta = p.materials[mat_id].ior;
 
@@ -179,13 +179,13 @@ glm::vec4 fragment_hit_shader_impl(
             normal=-normal;
         }
 
-
         auto refracted=glm::refract(ray_dir,normal,eta);
         if (refracted!=glm::vec3(0))
         {
             ray_dir=refracted;
             ray_src=intersection;
             continue_traversal = true;
+            out_color.a=1.f-p.materials[mat_id].transmissionFactor;
         }
         else
         {
