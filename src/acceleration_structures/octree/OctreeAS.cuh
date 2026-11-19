@@ -50,11 +50,11 @@ public:
     void info_ui(uint32_t space_id, Space space);
     void register_containers(ContainerExplorer& explorer);
 
-    void build(uint32_t space_id, Space space);
+    void build(uint32_t space_id, Space space, PrimitiveType primitive_type = PrimitiveType::Triangle);
     void free_space(uint32_t space_id, Space space);
 
     void insert_triangles(uint32_t space_id, Space space, uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
-                          int depth_min, int depth_max, float triangle_box_stop_ratio, bool use_gpu = true);
+                          int depth_min, int depth_max, float triangle_box_stop_ratio, PrimitiveType primitive_type, bool use_gpu = true);
     void insert_triangles_gpu(uint32_t space_id, Space space, uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
                               int depth_min, int depth_max, float triangle_box_stop_ratio, auto find_triangle_cube_relation);
     void insert_triangles_cpu(uint32_t space_id, Space space, uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
@@ -73,11 +73,7 @@ public:
         int max_depth = 19;
         float triangle_to_box_stop_ratio = 1.1f;
         bool stretch = false;
-        bool swapYZ = true;
-
         bool use_gpu = true;
-        bool sort_space = false;
-        PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 
     Config config;

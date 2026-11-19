@@ -75,23 +75,7 @@ void OctreeAS::config_ui()
     ImGui::InputInt("Max depth", &config.max_depth, 1);
     ImGui::InputFloat("Triangle to box stop ratio", &config.triangle_to_box_stop_ratio, 0.1f);
     ImGui::Checkbox("Stretch", &config.stretch);
-    ImGui::Checkbox("Swap y and z", &config.swapYZ);
     ImGui::Checkbox("Build on GPU", &config.use_gpu);
-    ImGui::Checkbox("Sort space", &config.sort_space);
-
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
-    int tri_type_idx = 0;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
-        tri_type_idx = 1;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
-        tri_type_idx = 2;
-
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
-    {
-        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
-        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
-        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
-    }
 }
 
 void OctreeAS::info_ui(uint32_t space_id, Space space)
@@ -918,7 +902,7 @@ void OctreeAS::insert_triangles_cpu(uint32_t space_id, Space space, uint32_t pri
 }
 
 void OctreeAS::insert_triangles(uint32_t space_id, Space space, uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
-                                int depth_min, int depth_max, float triangle_box_stop_ratio, bool use_gpu)
+                                int depth_min, int depth_max, float triangle_box_stop_ratio, PrimitiveType primitive_type, bool use_gpu)
 {
     auto dispatch = [&](auto relation_func)
     {
@@ -932,11 +916,11 @@ void OctreeAS::insert_triangles(uint32_t space_id, Space space, uint32_t primiti
         }
     };
 
-    if (config.triangle_type == PrimitiveType::NagataPatch)
+    if (primitive_type == PrimitiveType::NagataPatch)
     {
         dispatch(FindCubeIntersection<PrimitiveApproximation::Nagata>{});
     }
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
     {
         dispatch(FindCubeIntersection<PrimitiveApproximation::Approximate>{});
     }
@@ -946,23 +930,23 @@ void OctreeAS::insert_triangles(uint32_t space_id, Space space, uint32_t primiti
     }
 }
 
-void OctreeAS::build(uint32_t space_id, Space space)
+void OctreeAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)
 {
     assert(m_geometry_context != nullptr);
     auto t0 = std::chrono::high_resolution_clock::now();
 
     uint32_t occupied_slots = Triangle::occupied_slots;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
+    if (primitive_type == PrimitiveType::FullTriangle)
         occupied_slots = InlinedTriangle::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
+    else if (primitive_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
         occupied_slots = SubspacePrimitive::occupied_slots;
 
     uint32_t number_of_triangles = space.primitives_size / occupied_slots;
 
     insert_triangles(space_id, space, space.primitives_start, number_of_triangles, occupied_slots,
-                     config.min_depth, config.max_depth, config.triangle_to_box_stop_ratio, config.use_gpu);
+                     config.min_depth, config.max_depth, config.triangle_to_box_stop_ratio, primitive_type, config.use_gpu);
     sync_to_device();
 
     auto t1 = std::chrono::high_resolution_clock::now();

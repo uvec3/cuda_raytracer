@@ -365,8 +365,10 @@ struct GeometryContext
 struct Mesh
 {
     std::string name;
-    soa::soa_vector<Vertex> vertices;
-    soa::soa_vector<Triangle> triangles;
+    soa::soa_view<Vertex> d_vertices{};
+    soa::soa_view<Triangle> d_triangles{};
+    glm::vec3 local_bounds_min{0.0f};
+    glm::vec3 local_bounds_max{0.0f};
     glm::mat3 transform=1;
     uint32_t space_id=UINT32_MAX;
 };

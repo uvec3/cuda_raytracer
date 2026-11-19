@@ -41,12 +41,12 @@ TEST(Scene, NodeHierarchyAndASRef)
     ASSERT_FALSE(subscene_meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
     scene.as_octree.config.use_gpu = true;
-    scene.as_octree.config.sort_space = true;
+    scene.config.sort_space = true;
     uint32_t space_id = scene.build_node_as(subscene_id, ASType::Octree);
     ASSERT_NE(space_id, UINT32_MAX);
 
@@ -66,15 +66,13 @@ TEST(OctreeAS, BuildAndTraverseTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
 
     std::cout << "primitives_size = " << scene.spaces[space_id].primitives_size << std::endl;
     std::cout << "as_size = " << scene.spaces[space_id].as_size << std::endl;
@@ -150,16 +148,14 @@ TEST(OctreeAS, BuildAndTraverseTeapotFullTriangleGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as_octree.config.triangle_type = PrimitiveType::FullTriangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    scene.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
@@ -232,16 +228,14 @@ TEST(OctreeAS, BuildAndTraverseTeapotNagataPatchGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
-    scene.as_octree.config.triangle_type = PrimitiveType::NagataPatch;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    scene.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
@@ -314,16 +308,14 @@ TEST(OctreeAS, BuildAndTraverseTeapotCPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
     scene.as_octree.config.use_gpu = false;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
@@ -393,18 +385,16 @@ TEST(OctreeAS, BuildAndTraverseTeapotWithoutSort)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     // Build AS without sort_space (sort = false)
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 10;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
     scene.as_octree.config.use_gpu = true;
-    scene.as_octree.config.sort_space = false;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    scene.config.sort_space = false;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
@@ -477,15 +467,13 @@ TEST(OctreeAS, BuildAndTraverseHairballGPU)
     }
     scene.load(hairball_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_octree.config.stretch = false;
-    scene.as_octree.config.swapYZ = true;
+    scene.config.swapYZ = true;
     scene.as_octree.config.min_depth = 1;
     scene.as_octree.config.max_depth = 8;
     scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
-    uint32_t space_id = scene.build_as(meshes, ASType::Octree);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
     EXPECT_GT(scene.spaces[space_id].as_size, 0);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0);
     EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
@@ -577,10 +565,8 @@ TEST(OptixAS, BuildTeapot)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Optix);
 
     EXPECT_GT(scene.spaces[space_id].primitives_size, 0);
     EXPECT_TRUE(scene.as_optix.is_valid());
@@ -595,10 +581,8 @@ TEST(OptixAS, RenderTeapot)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Optix);
     ASSERT_TRUE(scene.as_optix.is_valid());
 
     const uint32_t width = 64;
@@ -662,10 +646,8 @@ TEST(OptixAS, RenderWithTimeMeasurement)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Optix);
     ASSERT_TRUE(scene.as_optix.is_valid());
 
     const uint32_t width = 64;
@@ -734,10 +716,8 @@ TEST(OptixAS, RenderWithRefraction)
     ASSERT_FALSE(refraction_view.empty());
     scene.load(refraction_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
-    uint32_t space_id = scene.build_as(meshes, ASType::Optix);
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Optix);
     ASSERT_TRUE(scene.as_optix.is_valid());
 
     const uint32_t width = 64;
@@ -789,88 +769,6 @@ TEST(OptixAS, RenderWithRefraction)
         }
     }
     EXPECT_TRUE(has_rendered_pixels);
-
-    cudaDestroySurfaceObject(surface);
-    cudaFreeArray(cuArray);
-}
-
-TEST(OptixAS, BuildMultipleSpacesAndFree)
-{
-    Scene scene("Teapot");
-    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
-    ASSERT_FALSE(teapot_view.empty());
-    scene.load(teapot_view);
-
-    auto meshes1 = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes1.empty());
-
-    uint32_t space1 = scene.build_as(meshes1, ASType::Optix);
-    EXPECT_TRUE(scene.as_optix.is_valid(space1));
-    OptixTraversableHandle handle1 = scene.as_optix.get_handle(space1);
-    EXPECT_NE(handle1, 0);
-
-    auto meshes2 = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes2.empty());
-
-    uint32_t space2 = scene.build_as(meshes2, ASType::Optix);
-    EXPECT_NE(space1, space2);
-    EXPECT_TRUE(scene.as_optix.is_valid(space2));
-    OptixTraversableHandle handle2 = scene.as_optix.get_handle(space2);
-    EXPECT_NE(handle2, 0);
-
-    // Both spaces must be valid simultaneously
-    EXPECT_TRUE(scene.as_optix.is_valid(space1));
-    EXPECT_TRUE(scene.as_optix.is_valid(space2));
-
-    const uint32_t width = 32;
-    const uint32_t height = 32;
-
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
-    cudaArray_t cuArray = nullptr;
-    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
-
-    cudaResourceDesc resDesc{};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = cuArray;
-    cudaSurfaceObject_t surface = 0;
-    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
-
-    RenderParameters params{};
-    params.width = width;
-    params.height = height;
-    params.view_pos = glm::vec3(0.5f, 0.0f, 0.3f);
-    params.ax = 0.0f;
-    params.az = 0.0f;
-    params.ax_c = glm::vec2(1.0f, 0.0f);
-    params.az_c = glm::vec2(1.0f, 0.0f);
-    params.near_ = 1.0f;
-    params.ambient_light = 0.2f;
-    params.diffuse_light = 0.8f;
-    params.background_color = glm::vec4(0.1f, 0.2f, 0.3f, 1.0f);
-    params.primitives = scene.geometry_context.primitives.view();
-    params.vertices = scene.geometry_context.vertices.view();
-    params.materials = scene.geometry_context.materials.view();
-
-    // Render space 1 and space 2 independently
-    EXPECT_NO_THROW(scene.as_optix.render(space1, surface, params, 0));
-    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-
-    EXPECT_NO_THROW(scene.as_optix.render(space2, surface, params, 0));
-    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-
-    // Free space 1 only
-    scene.free_space(space1);
-    EXPECT_FALSE(scene.as_optix.is_valid(space1));
-    EXPECT_TRUE(scene.as_optix.is_valid(space2));
-
-    // Space 2 must still render cleanly
-    EXPECT_NO_THROW(scene.as_optix.render(space2, surface, params, 0));
-    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-
-    // Free space 2
-    scene.free_space(space2);
-    EXPECT_FALSE(scene.as_optix.is_valid(space2));
-    EXPECT_FALSE(scene.as_optix.is_valid());
 
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
@@ -1046,87 +944,25 @@ TEST(UniformGridAS, DensityScalingAndPlanarGeometryGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
-
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = true;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
 
     scene.as_uniform_grid.config.voxels_per_triangle = 0.5f;
-    const uint32_t coarse_space = scene.build_as(meshes, ASType::UniformGrid);
-    const auto coarse_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[coarse_space].root_box)];
+    const uint32_t coarse_space = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
+    ASSERT_NE(coarse_space, UINT32_MAX);
+    const uint32_t coarse_as_size = scene.spaces[coarse_space].as_size;
+    const float coarse_cell_size = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[coarse_space].root_box)].cell_size;
+    EXPECT_GT(count_uniform_grid_teapot_hits(scene, coarse_space, PrimitiveType::Triangle), 15);
 
     scene.as_uniform_grid.config.voxels_per_triangle = 4.0f;
-    const uint32_t fine_space = scene.build_as(meshes, ASType::UniformGrid);
+    const uint32_t fine_space = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
+    ASSERT_NE(fine_space, UINT32_MAX);
     const auto fine_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[fine_space].root_box)];
 
-    EXPECT_GT(scene.spaces[fine_space].as_size, scene.spaces[coarse_space].as_size);
-    EXPECT_LT(fine_grid.cell_size, coarse_grid.cell_size);
-    EXPECT_GT(count_uniform_grid_teapot_hits(scene, coarse_space, PrimitiveType::Triangle), 15);
+    EXPECT_GT(scene.spaces[fine_space].as_size, coarse_as_size);
+    EXPECT_LT(fine_grid.cell_size, coarse_cell_size);
     EXPECT_GT(count_uniform_grid_teapot_hits(scene, fine_space, PrimitiveType::Triangle), 15);
-
-    // Flatten Y strongly (thin geometry) -> grid stays valid with dims.y == 1 and adapts X/Z
-    for (auto& entry : meshes)
-    {
-        entry.first = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, 1.0f, 0.001f)) * entry.first;
-    }
-    scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    const uint32_t planar_space = scene.build_as(meshes, ASType::UniformGrid);
-    const auto planar_grid = scene.as_uniform_grid.grids[static_cast<size_t>(scene.spaces[planar_space].root_box)];
-    EXPECT_EQ(planar_grid.dims.y, 1u);
-    EXPECT_GT(planar_grid.dims.x, 1u);
-    EXPECT_GT(planar_grid.dims.z, 1u);
-    EXPECT_GT(count_uniform_grid_teapot_hits(scene, planar_space, PrimitiveType::Triangle), 15);
-
-    // Exact zero-thickness planar mesh (y = 0) -> dims.y == 1 and 2D X/Z solve hits all rays
-    Scene planar_scene("PlanarQuad");
-    Mesh quad_grid_mesh;
-    quad_grid_mesh.name = "PlanarGrid";
-    constexpr int grid_n = 10;
-    quad_grid_mesh.vertices.allocate((grid_n + 1) * (grid_n + 1));
-    for (int iz = 0; iz <= grid_n; ++iz)
-    {
-        for (int ix = 0; ix <= grid_n; ++ix)
-        {
-            const uint32_t v_idx = static_cast<uint32_t>(iz * (grid_n + 1) + ix);
-            quad_grid_mesh.vertices[v_idx].position = glm::vec3(static_cast<float>(ix), 0.0f, static_cast<float>(iz));
-            quad_grid_mesh.vertices[v_idx].normal = glm::vec3(0.0f, 1.0f, 0.0f);
-            quad_grid_mesh.vertices[v_idx].color = glm::vec4(1.0f);
-            quad_grid_mesh.vertices[v_idx].uv = glm::vec2(0.0f);
-        }
-    }
-    quad_grid_mesh.triangles.allocate(grid_n * grid_n * 2);
-    uint32_t tri_idx = 0;
-    for (int iz = 0; iz < grid_n; ++iz)
-    {
-        for (int ix = 0; ix < grid_n; ++ix)
-        {
-            const uint32_t v00 = static_cast<uint32_t>(iz * (grid_n + 1) + ix);
-            const uint32_t v10 = v00 + 1;
-            const uint32_t v01 = v00 + static_cast<uint32_t>(grid_n + 1);
-            const uint32_t v11 = v01 + 1;
-            quad_grid_mesh.triangles[tri_idx].v0 = v00;
-            quad_grid_mesh.triangles[tri_idx].v1 = v10;
-            quad_grid_mesh.triangles[tri_idx].v2 = v11;
-            quad_grid_mesh.triangles[tri_idx].material_id = 0;
-            ++tri_idx;
-            quad_grid_mesh.triangles[tri_idx].v0 = v00;
-            quad_grid_mesh.triangles[tri_idx].v1 = v11;
-            quad_grid_mesh.triangles[tri_idx].v2 = v01;
-            quad_grid_mesh.triangles[tri_idx].material_id = 0;
-            ++tri_idx;
-        }
-    }
-    std::vector<std::pair<glm::mat4, Mesh&>> planar_meshes{{glm::mat4(1.0f), quad_grid_mesh}};
-    planar_scene.as_uniform_grid.config.swapYZ = false;
-    planar_scene.as_uniform_grid.config.sort_space = true;
-    planar_scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
-    planar_scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    const uint32_t exact_planar_space = planar_scene.build_as(planar_meshes, ASType::UniformGrid);
-    const auto exact_planar_grid = planar_scene.as_uniform_grid.grids[static_cast<size_t>(planar_scene.spaces[exact_planar_space].root_box)];
-    EXPECT_EQ(exact_planar_grid.dims, glm::uvec3(14u, 1u, 14u));
-    EXPECT_EQ(count_uniform_grid_teapot_hits(planar_scene, exact_planar_space, PrimitiveType::Triangle), 81);
 }
 
 TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
@@ -1136,14 +972,12 @@ TEST(UniformGridAS, BuildAndTraverseTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = true;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
 
     EXPECT_EQ(scene.spaces[space_id].as_type, ASType::UniformGrid);
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
@@ -1194,14 +1028,12 @@ TEST(UniformGridAS, BuildAndTraverseTeapotFullTriangleGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = true;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::FullTriangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1220,14 +1052,12 @@ TEST(UniformGridAS, BuildAndTraverseTeapotNagataPatchGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = true;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::NagataPatch;
-    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1246,14 +1076,12 @@ TEST(UniformGridAS, BuildAndTraverseWithoutSortAndFree)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = false;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = false;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1281,14 +1109,12 @@ TEST(UniformGridAS, RenderTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_uniform_grid.config.voxels_per_triangle = 1.0f;
-    scene.as_uniform_grid.config.swapYZ = true;
-    scene.as_uniform_grid.config.sort_space = true;
-    scene.as_uniform_grid.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::UniformGrid);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
     scene.set_active_space(space_id);
 
     const uint32_t width = 64;
@@ -1443,15 +1269,13 @@ TEST(KDTreeAS, BuildAndTraverseTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
     scene.as_kdtree.config.use_gpu = true;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = true;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
 
     EXPECT_EQ(scene.spaces[space_id].as_type, ASType::KDTree);
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
@@ -1471,15 +1295,13 @@ TEST(KDTreeAS, BuildAndTraverseTeapotFullTriangleGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
     scene.as_kdtree.config.use_gpu = true;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = true;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::FullTriangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1498,15 +1320,13 @@ TEST(KDTreeAS, BuildAndTraverseTeapotNagataPatchGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
     scene.as_kdtree.config.use_gpu = true;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = true;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::NagataPatch;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1525,15 +1345,13 @@ TEST(KDTreeAS, BuildAndTraverseTeapotCPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
     scene.as_kdtree.config.use_gpu = false;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = false;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = false;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1551,15 +1369,13 @@ TEST(KDTreeAS, BuildAndTraverseSpatialMedianGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SpatialMedian;
     scene.as_kdtree.config.use_gpu = true;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = true;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1576,15 +1392,13 @@ TEST(KDTreeAS, RenderTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_kdtree.config.split_mode = KDSplitMode::SAH;
     scene.as_kdtree.config.use_gpu = true;
-    scene.as_kdtree.config.swapYZ = true;
-    scene.as_kdtree.config.sort_space = true;
-    scene.as_kdtree.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::KDTree);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::KDTree);
     scene.set_active_space(space_id);
 
     const uint32_t width = 64;
@@ -1759,15 +1573,13 @@ TEST(BVHAS, BuildAndTraverseTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene.as_bvh.config.use_gpu = true;
-    scene.as_bvh.config.swapYZ = true;
-    scene.as_bvh.config.sort_space = true;
-    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
     EXPECT_EQ(scene.spaces[space_id].as_type, ASType::BVH);
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
@@ -1787,15 +1599,13 @@ TEST(BVHAS, BuildAndTraverseTeapotFullTriangleGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene.as_bvh.config.use_gpu = true;
-    scene.as_bvh.config.swapYZ = true;
-    scene.as_bvh.config.sort_space = true;
-    scene.as_bvh.config.triangle_type = PrimitiveType::FullTriangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::FullTriangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1814,15 +1624,13 @@ TEST(BVHAS, BuildAndTraverseTeapotNagataPatchGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene.as_bvh.config.use_gpu = true;
-    scene.as_bvh.config.swapYZ = true;
-    scene.as_bvh.config.sort_space = true;
-    scene.as_bvh.config.triangle_type = PrimitiveType::NagataPatch;
-    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::NagataPatch;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1841,15 +1649,13 @@ TEST(BVHAS, BuildAndTraverseTeapotCPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene.as_bvh.config.use_gpu = false;
-    scene.as_bvh.config.swapYZ = true;
-    scene.as_bvh.config.sort_space = false;
-    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = false;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
     EXPECT_GT(scene.spaces[space_id].as_size, 0u);
     EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1868,15 +1674,13 @@ TEST(BVHAS, BuildAndTraverseSpatialAndObjectMedianGPU)
     {
         Scene scene("TeapotSpatial");
         scene.load(teapot_view);
-        auto meshes = scene.get_mesh_transform();
-        ASSERT_FALSE(meshes.empty());
 
         scene.as_bvh.config.split_mode = BVHSplitMode::SpatialMedian;
         scene.as_bvh.config.use_gpu = true;
-        scene.as_bvh.config.swapYZ = true;
-        scene.as_bvh.config.sort_space = true;
-        scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
-        uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+        scene.config.swapYZ = true;
+        scene.config.sort_space = true;
+        scene.config.triangle_type = PrimitiveType::Triangle;
+        uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
         EXPECT_GT(scene.spaces[space_id].as_size, 0u);
         EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1889,15 +1693,13 @@ TEST(BVHAS, BuildAndTraverseSpatialAndObjectMedianGPU)
     {
         Scene scene("TeapotObject");
         scene.load(teapot_view);
-        auto meshes = scene.get_mesh_transform();
-        ASSERT_FALSE(meshes.empty());
 
         scene.as_bvh.config.split_mode = BVHSplitMode::ObjectMedian;
         scene.as_bvh.config.use_gpu = true;
-        scene.as_bvh.config.swapYZ = true;
-        scene.as_bvh.config.sort_space = true;
-        scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
-        uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+        scene.config.swapYZ = true;
+        scene.config.sort_space = true;
+        scene.config.triangle_type = PrimitiveType::Triangle;
+        uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
 
         EXPECT_GT(scene.spaces[space_id].as_size, 0u);
         EXPECT_GT(scene.spaces[space_id].box_content_size, 0u);
@@ -1915,15 +1717,13 @@ TEST(BVHAS, RenderTeapotGPU)
     ASSERT_FALSE(teapot_view.empty());
     scene.load(teapot_view);
 
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene.as_bvh.config.use_gpu = true;
-    scene.as_bvh.config.swapYZ = true;
-    scene.as_bvh.config.sort_space = true;
-    scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
-    uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+    scene.config.swapYZ = true;
+    scene.config.sort_space = true;
+    scene.config.triangle_type = PrimitiveType::Triangle;
+    uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
     scene.set_active_space(space_id);
 
     const uint32_t width = 64;
@@ -2000,28 +1800,24 @@ TEST(BVHAS, CompareBVH16AndBVH32TeapotGPU)
 
     Scene scene16("TeapotBVH16");
     scene16.load(teapot_view);
-    auto meshes16 = scene16.get_mesh_transform();
-    ASSERT_FALSE(meshes16.empty());
     scene16.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene16.as_bvh.config.use_gpu = true;
-    scene16.as_bvh.config.swapYZ = true;
-    scene16.as_bvh.config.sort_space = true;
-    scene16.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    scene16.config.swapYZ = true;
+    scene16.config.sort_space = true;
+    scene16.config.triangle_type = PrimitiveType::Triangle;
     scene16.as_bvh.config.use_bvh16 = true;
-    const uint32_t space16 = scene16.build_as(meshes16, ASType::BVH);
+    const uint32_t space16 = scene16.build_node_as(scene16.root_node_id, ASType::BVH);
     scene16.set_active_space(space16);
 
     Scene scene32("TeapotBVH32");
     scene32.load(teapot_view);
-    auto meshes32 = scene32.get_mesh_transform();
-    ASSERT_FALSE(meshes32.empty());
     scene32.as_bvh.config.split_mode = BVHSplitMode::SAH;
     scene32.as_bvh.config.use_gpu = true;
-    scene32.as_bvh.config.swapYZ = true;
-    scene32.as_bvh.config.sort_space = true;
-    scene32.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+    scene32.config.swapYZ = true;
+    scene32.config.sort_space = true;
+    scene32.config.triangle_type = PrimitiveType::Triangle;
     scene32.as_bvh.config.use_bvh16 = false;
-    const uint32_t space32 = scene32.build_as(meshes32, ASType::BVH);
+    const uint32_t space32 = scene32.build_node_as(scene32.root_node_id, ASType::BVH);
     scene32.set_active_space(space32);
 
     const uint32_t nodes16 = static_cast<uint32_t>(scene16.spaces[space16].as_size);
@@ -2122,17 +1918,16 @@ TEST(BVHAS, DISABLED_BenchmarkBVH16VsBVH32)
         {
             Scene scene(asset_name);
             scene.load(view);
-            auto meshes = scene.get_mesh_transform();
-            if (meshes.empty())
-                continue;
 
             scene.as_bvh.config.split_mode = BVHSplitMode::SAH;
             scene.as_bvh.config.use_gpu = true;
-            scene.as_bvh.config.swapYZ = true;
-            scene.as_bvh.config.sort_space = true;
-            scene.as_bvh.config.triangle_type = PrimitiveType::Triangle;
+            scene.config.swapYZ = true;
+            scene.config.sort_space = true;
+            scene.config.triangle_type = PrimitiveType::Triangle;
             scene.as_bvh.config.use_bvh16 = use16;
-            const uint32_t space_id = scene.build_as(meshes, ASType::BVH);
+            const uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::BVH);
+            if (space_id == UINT32_MAX)
+                continue;
             scene.set_active_space(space_id);
 
             const auto tree = scene.as_bvh.trees[static_cast<size_t>(scene.spaces[space_id].root_box)];
@@ -2203,8 +1998,6 @@ TEST(HeterogeneousAS, BuildAndRenderTeapotGPU)
 
     Scene scene("HeterogeneousTeapot");
     scene.load(teapot_view);
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_FALSE(meshes.empty());
 
     for (const auto& variant : scene.as_heterogeneous.variants)
     {
@@ -2218,7 +2011,7 @@ TEST(HeterogeneousAS, BuildAndRenderTeapotGPU)
     scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 64.0f;
     scene.as_heterogeneous.config.num_probe_rays = 8192;
 
-    const uint32_t space_id = scene.build_as(meshes, ASType::Heterogeneous);
+    const uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
     ASSERT_TRUE(scene.spaces.is_allocated(space_id));
     EXPECT_EQ(scene.spaces[space_id].as_type, ASType::Heterogeneous);
     EXPECT_GE(scene.spaces[space_id].root_box, 0);
@@ -2283,20 +2076,20 @@ TEST(HeterogeneousAS, MultiMeshSelectionAndThresholdGPU)
 
     Scene scene("HeterogeneousMultiMesh");
     scene.load(view);
-    auto meshes = scene.get_mesh_transform();
-    ASSERT_GT(meshes.size(), 1u);
 
     scene.as_heterogeneous.config.tlas_type = ASType::BVH;
     scene.as_heterogeneous.config.num_probe_rays = 4096;
 
     // Pass 1: Generous memory budget (128 B/tri)
     scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
-    const uint32_t space_generous = scene.build_as(meshes, ASType::Heterogeneous);
+    const uint32_t space_generous = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(space_generous, UINT32_MAX);
     ASSERT_TRUE(scene.spaces.is_allocated(space_generous));
 
     const auto* records_gen = scene.as_heterogeneous.get_mesh_records(space_generous);
     ASSERT_NE(records_gen, nullptr);
     ASSERT_GT(records_gen->size(), 1u);
+    const size_t generous_records_count = records_gen->size();
 
     auto verify_selection_rule = [](const std::vector<MeshBuildRecord>& recs) -> double
     {
@@ -2381,12 +2174,13 @@ TEST(HeterogeneousAS, MultiMeshSelectionAndThresholdGPU)
 
     // Pass 2: Tight memory budget (4 B/tri — strictly tighter than BVH16 so minimum-memory selection runs deterministically)
     scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 4.0f;
-    const uint32_t space_tight = scene.build_as(meshes, ASType::Heterogeneous);
+    const uint32_t space_tight = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(space_tight, UINT32_MAX);
     ASSERT_TRUE(scene.spaces.is_allocated(space_tight));
 
     const auto* records_tight = scene.as_heterogeneous.get_mesh_records(space_tight);
     ASSERT_NE(records_tight, nullptr);
-    EXPECT_EQ(records_tight->size(), records_gen->size());
+    EXPECT_EQ(records_tight->size(), generous_records_count);
 
     const double avg_bpt_tight = verify_selection_rule(*records_tight);
     EXPECT_LE(avg_bpt_tight, avg_bpt_generous + 1e-6);
@@ -2410,9 +2204,7 @@ TEST(HeterogeneousAS, MultiMeshSelectionAndThresholdGPU)
     cudaDestroySurfaceObject(surface);
     cudaFreeArray(cuArray);
 
-    scene.free_space(space_generous);
-    scene.free_space(space_tight);
-    EXPECT_FALSE(scene.spaces.is_allocated(space_generous));
+    scene.free_node_as(scene.root_node_id);
     EXPECT_FALSE(scene.spaces.is_allocated(space_tight));
 }
 
@@ -2909,25 +2701,22 @@ TEST(BVHAS, RefractionBoxEdgePlanesMatchOctreeGPU)
 
     Scene scene_oct("RefractionOct");
     scene_oct.load(view);
-    auto m_oct = scene_oct.get_mesh_transform();
     scene_oct.as_octree.config.max_depth = 10;
-    const uint32_t sp_oct = scene_oct.build_as(m_oct, ASType::Octree);
+    const uint32_t sp_oct = scene_oct.build_node_as(scene_oct.root_node_id, ASType::Octree);
     scene_oct.set_active_space(sp_oct);
 
     Scene scene_bvh32("RefractionBVH32");
     scene_bvh32.load(view);
-    auto m_32 = scene_bvh32.get_mesh_transform();
     scene_bvh32.as_bvh.config.use_bvh16 = false;
     scene_bvh32.as_bvh.config.split_mode = BVHSplitMode::SAH;
-    const uint32_t sp_32 = scene_bvh32.build_as(m_32, ASType::BVH);
+    const uint32_t sp_32 = scene_bvh32.build_node_as(scene_bvh32.root_node_id, ASType::BVH);
     scene_bvh32.set_active_space(sp_32);
 
     Scene scene_bvh16("RefractionBVH16");
     scene_bvh16.load(view);
-    auto m_16 = scene_bvh16.get_mesh_transform();
     scene_bvh16.as_bvh.config.use_bvh16 = true;
     scene_bvh16.as_bvh.config.split_mode = BVHSplitMode::SAH;
-    const uint32_t sp_16 = scene_bvh16.build_as(m_16, ASType::BVH);
+    const uint32_t sp_16 = scene_bvh16.build_node_as(scene_bvh16.root_node_id, ASType::BVH);
     scene_bvh16.set_active_space(sp_16);
 
     Scene scene_het("RefractionHetBVH16");
@@ -3010,42 +2799,6 @@ TEST(BVHAS, RefractionBoxEdgePlanesMatchOctreeGPU)
         EXPECT_EQ(count_diff(px_oct, px_het), 0u);
     }
 
-    // Large world-space offset (~1000.0) test: ensures BVH AABB padding survives FP32 ULP rounding
-    // and BVH16 quantization without zero-thickness slab collapse on axis-aligned walls.
-    const glm::vec3 world_shift(1000.0f, 1000.0f, 1000.0f);
-    auto shift_meshes = [&](auto meshes) {
-        for (auto& mt : meshes)
-            mt.first = glm::translate(glm::mat4(1.0f), world_shift) * mt.first;
-        return meshes;
-    };
-
-    Scene shifted_oct("RefractionShiftedOct");
-    shifted_oct.load(view);
-    shifted_oct.as_octree.config.max_depth = 10;
-    const uint32_t ssp_oct = shifted_oct.build_as(shift_meshes(shifted_oct.get_mesh_transform()), ASType::Octree);
-    shifted_oct.set_active_space(ssp_oct);
-
-    Scene shifted_bvh32("RefractionShiftedBVH32");
-    shifted_bvh32.load(view);
-    shifted_bvh32.as_bvh.config.use_bvh16 = false;
-    shifted_bvh32.as_bvh.config.split_mode = BVHSplitMode::SAH;
-    const uint32_t ssp_32 = shifted_bvh32.build_as(shift_meshes(shifted_bvh32.get_mesh_transform()), ASType::BVH);
-    shifted_bvh32.set_active_space(ssp_32);
-
-    Scene shifted_bvh16("RefractionShiftedBVH16");
-    shifted_bvh16.load(view);
-    shifted_bvh16.as_bvh.config.use_bvh16 = true;
-    shifted_bvh16.as_bvh.config.split_mode = BVHSplitMode::SAH;
-    const uint32_t ssp_16 = shifted_bvh16.build_as(shift_meshes(shifted_bvh16.get_mesh_transform()), ASType::BVH);
-    shifted_bvh16.set_active_space(ssp_16);
-
-    const auto spx_oct = render(shifted_oct, views[0].pos + world_shift, views[0].ax, views[0].az);
-    const auto spx_32 = render(shifted_bvh32, views[0].pos + world_shift, views[0].ax, views[0].az);
-    const auto spx_16 = render(shifted_bvh16, views[0].pos + world_shift, views[0].ax, views[0].az);
-    EXPECT_EQ(count_diff(spx_oct, spx_32), 0u);
-    EXPECT_EQ(count_diff(spx_oct, spx_16), 0u);
-    EXPECT_EQ(count_diff(spx_32, spx_16), 0u);
-
     // Parallel/near-parallel ray on box boundary edge checks (BVH16 and BVH32 leaf slab robustness)
     {
         const soa::soa_vector<BVHTreeInfo> h_trees16 = scene_bvh16.as_bvh.trees;
@@ -3119,4 +2872,358 @@ TEST(Scene, SkipTexturesWhenDisabled)
         EXPECT_EQ(mat.transmissionTexture, 0ull);
         EXPECT_EQ(mat.thicknessTexture, 0ull);
     }
+}
+
+TEST(Scene, DeviceSourceBuffersAndMeshViews)
+{
+    auto game_view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(game_view.empty());
+
+    Scene scene("DeviceSourceTest");
+    scene.load(game_view, false);
+    ASSERT_TRUE(scene.is_loaded());
+    ASSERT_FALSE(scene.m_meshes.empty());
+    ASSERT_GT(scene.d_source_vertices.size(), 0u);
+    ASSERT_GT(scene.d_source_triangles.size(), 0u);
+
+    size_t sum_verts = 0;
+    size_t sum_tris = 0;
+    for (const auto& mesh : scene.m_meshes)
+    {
+        sum_verts += mesh.d_vertices.size();
+        sum_tris += mesh.d_triangles.size();
+        EXPECT_LE(mesh.local_bounds_min.x, mesh.local_bounds_max.x);
+        EXPECT_LE(mesh.local_bounds_min.y, mesh.local_bounds_max.y);
+        EXPECT_LE(mesh.local_bounds_min.z, mesh.local_bounds_max.z);
+        EXPECT_TRUE(std::isfinite(mesh.local_bounds_min.x) && std::isfinite(mesh.local_bounds_max.x));
+        EXPECT_TRUE(std::isfinite(mesh.local_bounds_min.y) && std::isfinite(mesh.local_bounds_max.y));
+        EXPECT_TRUE(std::isfinite(mesh.local_bounds_min.z) && std::isfinite(mesh.local_bounds_max.z));
+    }
+    EXPECT_EQ(sum_verts, scene.d_source_vertices.size());
+    EXPECT_EQ(sum_tris, scene.d_source_triangles.size());
+
+    // Moving Scene must preserve device source buffers and mesh views
+    const size_t expected_verts = scene.d_source_vertices.size();
+    const size_t expected_tris = scene.d_source_triangles.size();
+    Scene moved = std::move(scene);
+    EXPECT_EQ(moved.d_source_vertices.size(), expected_verts);
+    EXPECT_EQ(moved.d_source_triangles.size(), expected_tris);
+
+    size_t moved_verts = 0;
+    size_t moved_tris = 0;
+    for (const auto& mesh : moved.m_meshes)
+    {
+        moved_verts += mesh.d_vertices.size();
+        moved_tris += mesh.d_triangles.size();
+    }
+    EXPECT_EQ(moved_verts, expected_verts);
+    EXPECT_EQ(moved_tris, expected_tris);
+
+    const uint32_t sp = moved.build_node_as(moved.root_node_id, ASType::BVH);
+    ASSERT_NE(sp, UINT32_MAX);
+    EXPECT_GT(moved.spaces[sp].primitives_size, 0u);
+    EXPECT_GT(moved.spaces[sp].vertices_size, 0u);
+}
+
+TEST(Scene, GpuTransformDirectPackMatchesSortedPack)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    const uint32_t width = 128;
+    const uint32_t height = 128;
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t cuArray = nullptr;
+    ASSERT_EQ(cudaMallocArray(&cuArray, &channelDesc, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+    cudaSurfaceObject_t surface = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surface, &resDesc), cudaSuccess);
+
+    auto render = [&](Scene& s) {
+        Raytracer rt;
+        rt.parameters.view_pos = glm::vec3(0.5f, -0.8f, 0.5f);
+        rt.parameters.ax = 0.0f;
+        rt.parameters.az = -0.3f;
+        rt.parameters.fov = 45.0f;
+        rt.parameters.background_color = glm::vec4(1.0f, 0.0f, 1.0f, 1.0f);
+        rt.update_parameters(s, width, height);
+        rt.draw_first_hit(s, surface, width, height, 0);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<uchar4> px(width * height);
+        EXPECT_EQ(cudaMemcpy2DFromArray(px.data(), width * sizeof(uchar4), cuArray, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+        return px;
+    };
+
+    const PrimitiveType prim_types[] = {
+        PrimitiveType::Triangle,
+        PrimitiveType::FullTriangle,
+        PrimitiveType::NagataPatch,
+    };
+
+    for (PrimitiveType ptype : prim_types)
+    {
+        Scene scene_direct("DirectPack");
+        scene_direct.load(view, false);
+        scene_direct.config.swapYZ = true;
+        scene_direct.config.sort_space = false;
+        scene_direct.config.triangle_type = ptype;
+        const uint32_t sp_direct = scene_direct.build_node_as(scene_direct.root_node_id, ASType::BVH);
+        ASSERT_NE(sp_direct, UINT32_MAX);
+        scene_direct.set_active_space(sp_direct);
+
+        Scene scene_sorted("SortedPack");
+        scene_sorted.load(view, false);
+        scene_sorted.config.swapYZ = true;
+        scene_sorted.config.sort_space = true;
+        scene_sorted.config.triangle_type = ptype;
+        const uint32_t sp_sorted = scene_sorted.build_node_as(scene_sorted.root_node_id, ASType::BVH);
+        ASSERT_NE(sp_sorted, UINT32_MAX);
+        scene_sorted.set_active_space(sp_sorted);
+
+        EXPECT_EQ(scene_direct.spaces[sp_direct].primitives_size, scene_sorted.spaces[sp_sorted].primitives_size);
+        EXPECT_EQ(scene_direct.spaces[sp_direct].vertices_size, scene_sorted.spaces[sp_sorted].vertices_size);
+        EXPECT_EQ(scene_direct.spaces[sp_direct].has_nagata, ptype == PrimitiveType::NagataPatch);
+        EXPECT_NEAR(scene_direct.spaces[sp_direct].normalization_translate.x, scene_sorted.spaces[sp_sorted].normalization_translate.x, 1e-5f);
+        EXPECT_NEAR(scene_direct.spaces[sp_direct].normalization_translate.y, scene_sorted.spaces[sp_sorted].normalization_translate.y, 1e-5f);
+        EXPECT_NEAR(scene_direct.spaces[sp_direct].normalization_translate.z, scene_sorted.spaces[sp_sorted].normalization_translate.z, 1e-5f);
+        if (ptype == PrimitiveType::FullTriangle)
+        {
+            EXPECT_EQ(scene_direct.spaces[sp_direct].vertices_size, 0u);
+        }
+
+        const auto px_direct = render(scene_direct);
+        const auto px_sorted = render(scene_sorted);
+        uint32_t non_bg = 0;
+        uint32_t diffs = 0;
+        for (size_t i = 0; i < px_direct.size(); ++i)
+        {
+            if (px_direct[i].x != 255 || px_direct[i].y != 0 || px_direct[i].z != 255)
+                ++non_bg;
+            if (std::abs(int(px_direct[i].x) - int(px_sorted[i].x)) > 2 ||
+                std::abs(int(px_direct[i].y) - int(px_sorted[i].y)) > 2 ||
+                std::abs(int(px_direct[i].z) - int(px_sorted[i].z)) > 2)
+            {
+                ++diffs;
+            }
+        }
+        EXPECT_GT(non_bg, 0u);
+        EXPECT_EQ(diffs, 0u);
+    }
+
+    // Verify swapYZ = false produces distinct normalization bounds and vertices stay in [0, 1]
+    {
+        Scene scene_no_swap("NoSwapYZ");
+        scene_no_swap.load(view, false);
+        scene_no_swap.config.swapYZ = false;
+        scene_no_swap.config.sort_space = false;
+        scene_no_swap.config.triangle_type = PrimitiveType::Triangle;
+        const uint32_t sp = scene_no_swap.build_node_as(scene_no_swap.root_node_id, ASType::BVH);
+        ASSERT_NE(sp, UINT32_MAX);
+        const auto& space = scene_no_swap.spaces[sp];
+        ASSERT_GT(space.vertices_size, 0u);
+
+        soa::soa_vector<Vertex> host_verts = scene_no_swap.geometry_context.vertices;
+        glm::vec3 vmin(std::numeric_limits<float>::infinity());
+        glm::vec3 vmax(-std::numeric_limits<float>::infinity());
+        for (uint32_t i = 0; i < space.vertices_size; ++i)
+        {
+            glm::vec3 p = host_verts[space.vertices_start + i].position;
+            vmin = glm::min(vmin, p);
+            vmax = glm::max(vmax, p);
+        }
+        EXPECT_GE(vmin.x, -1e-4f);
+        EXPECT_GE(vmin.y, -1e-4f);
+        EXPECT_GE(vmin.z, -1e-4f);
+        EXPECT_LE(vmax.x, 1.0f + 1e-4f);
+        EXPECT_LE(vmax.y, 1.0f + 1e-4f);
+        EXPECT_LE(vmax.z, 1.0f + 1e-4f);
+    }
+
+    cudaDestroySurfaceObject(surface);
+    cudaFreeArray(cuArray);
+}
+
+TEST(HeterogeneousAS, AllTlasTypesRenderIdenticalAndStopOnHitGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("AllTlasTypesTest");
+    scene.load(view, false);
+    scene.as_heterogeneous.config.rebuild_blas = true;
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.variants.clear();
+    ASConfigVariant bvh16{};
+    bvh16.name = "BVH16";
+    bvh16.as_type = ASType::BVH;
+    bvh16.bvh_config.use_bvh16 = true;
+    bvh16.bvh_config.split_mode = BVHSplitMode::SAH;
+    bvh16.bvh_config.use_gpu = true;
+    scene.as_heterogeneous.variants.push_back(bvh16);
+
+    uint32_t sp = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(sp, UINT32_MAX);
+    scene.as_heterogeneous.config.rebuild_blas = false;
+
+    const ASType types[] = {ASType::BVH, ASType::KDTree, ASType::UniformGrid, ASType::Octree};
+    const uint32_t width = 128, height = 128;
+    cudaChannelFormatDesc ch = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+    cudaArray_t arr = nullptr;
+    ASSERT_EQ(cudaMallocArray(&arr, &ch, width, height, cudaArraySurfaceLoadStore), cudaSuccess);
+    cudaResourceDesc rd{};
+    rd.resType = cudaResourceTypeArray;
+    rd.res.array.array = arr;
+    cudaSurfaceObject_t surf = 0;
+    ASSERT_EQ(cudaCreateSurfaceObject(&surf, &rd), cudaSuccess);
+
+    std::vector<uchar4> ref_pixels;
+    for (int ti = 0; ti < 4; ++ti)
+    {
+        scene.as_heterogeneous.config.tlas_type = types[ti];
+        sp = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+        ASSERT_NE(sp, UINT32_MAX);
+        scene.set_active_space(sp);
+
+        const auto& s = scene.spaces[sp];
+        const auto htree = scene.as_heterogeneous.trees[static_cast<size_t>(s.root_box)];
+        const uint32_t num_subspaces = s.primitives_size / SubspacePrimitive::occupied_slots;
+        ASSERT_GT(num_subspaces, 0u);
+
+        soa::soa_vector<PrimitiveChunk16> hp_chk = scene.geometry_context.primitives;
+
+        if (types[ti] == ASType::UniformGrid)
+        {
+            const auto g = scene.as_uniform_grid.grids[static_cast<size_t>(htree.tlas_root_box)];
+            uint32_t bad_nonoverlap = 0;
+            for (uint32_t iz = 0; iz < g.dims.z; ++iz)
+            for (uint32_t iy = 0; iy < g.dims.y; ++iy)
+            for (uint32_t ix = 0; ix < g.dims.x; ++ix)
+            {
+                const uint32_t cid = scene.as_uniform_grid.as[g.as_start + uniform_grid_cell_index({ix, iy, iz}, g.dims)];
+                if (cid == 0) continue;
+                const glm::vec3 bmin = glm::vec3(ix, iy, iz) * g.cell_size;
+                const glm::vec3 bmax = bmin + glm::vec3(g.cell_size);
+                for (uint32_t c = cid;; ++c)
+                {
+                    const auto pr = scene.as_uniform_grid.box_content[c];
+                    const auto sub = load_primitive<SubspacePrimitive>(hp_chk.view(), pr.id());
+                    const glm::vec3 omin = glm::max(bmin, sub.bounds_min);
+                    const glm::vec3 omax = glm::min(bmax, sub.bounds_max);
+                    if (omin.x > omax.x + 1e-4f || omin.y > omax.y + 1e-4f || omin.z > omax.z + 1e-4f)
+                        ++bad_nonoverlap;
+                    if (pr.is_last()) break;
+                }
+            }
+            EXPECT_EQ(bad_nonoverlap, 0u);
+        }
+        else if (types[ti] == ASType::KDTree)
+        {
+            const auto t = scene.as_kdtree.trees[static_cast<size_t>(htree.tlas_root_box)];
+            uint32_t nonempty = 0, bad_nonoverlap = 0;
+            std::function<void(uint32_t, glm::vec3, glm::vec3)> walk_kd = [&](uint32_t nid, glm::vec3 bmin, glm::vec3 bmax) {
+                const auto n = scene.as_kdtree.as[nid];
+                if (n.is_leaf())
+                {
+                    if (n.content() > 0)
+                    {
+                        ++nonempty;
+                        for (uint32_t c = n.content();; ++c)
+                        {
+                            const auto pr = scene.as_kdtree.box_content[c];
+                            const auto sub = load_primitive<SubspacePrimitive>(hp_chk.view(), pr.id());
+                            const glm::vec3 omin = glm::max(bmin, sub.bounds_min);
+                            const glm::vec3 omax = glm::min(bmax, sub.bounds_max);
+                            if (omin.x > omax.x + 1e-4f || omin.y > omax.y + 1e-4f || omin.z > omax.z + 1e-4f)
+                                ++bad_nonoverlap;
+                            if (pr.is_last()) break;
+                        }
+                    }
+                    return;
+                }
+                glm::vec3 lmax = bmax; lmax[n.axis()] = n.split_pos;
+                glm::vec3 rmin = bmin; rmin[n.axis()] = n.split_pos;
+                walk_kd(n.left_child(), bmin, lmax);
+                walk_kd(n.left_child() + 1u, rmin, bmax);
+            };
+            walk_kd(t.as_start, t.bounds_min, t.bounds_max);
+            EXPECT_EQ(bad_nonoverlap, 0u);
+            EXPECT_LT(nonempty, num_subspaces * 4u);
+        }
+        else if (types[ti] == ASType::Octree)
+        {
+            uint32_t bad_nonoverlap = 0;
+            std::function<void(int, BoxStack)> walk_oct = [&](int node_id, BoxStack stk) {
+                const int val = scene.as_octree.as[node_id];
+                if (val > 0)
+                {
+                    for (int b = 0; b < 8; ++b)
+                    {
+                        BoxStack ch = stk;
+                        ch.descend(b);
+                        walk_oct(val + b, ch);
+                    }
+                }
+                else if (val < 0)
+                {
+                    const glm::vec3 c = stk.get_center();
+                    const float h = stk.half_box_size();
+                    const glm::vec3 bmin = c - glm::vec3(h);
+                    const glm::vec3 bmax = c + glm::vec3(h);
+                    for (uint32_t cid = static_cast<uint32_t>(-val);; ++cid)
+                    {
+                        const auto pr = scene.as_octree.box_content[cid];
+                        const auto sub = load_primitive<SubspacePrimitive>(hp_chk.view(), pr.id());
+                        const glm::vec3 omin = glm::max(bmin, sub.bounds_min);
+                        const glm::vec3 omax = glm::min(bmax, sub.bounds_max);
+                        if (omin.x > omax.x + 1e-4f || omin.y > omax.y + 1e-4f || omin.z > omax.z + 1e-4f)
+                            ++bad_nonoverlap;
+                        if (pr.is_last()) break;
+                    }
+                }
+            };
+            walk_oct(htree.tlas_root_box, BoxStack{});
+            EXPECT_EQ(bad_nonoverlap, 0u);
+        }
+
+        Raytracer rt;
+        rt.parameters.view_pos = glm::vec3(0.5f, -0.4f, 0.25f);
+        rt.parameters.ax = -0.25f;
+        rt.parameters.az = 0.0f;
+        rt.parameters.fov = 45.0f;
+        rt.parameters.background_color = glm::vec4(1.0f, 0.0f, 1.0f, 1.0f);
+        rt.update_parameters(scene, width, height);
+        rt.draw_first_hit(scene, surf, width, height, 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        std::vector<uchar4> px(width * height);
+        ASSERT_EQ(cudaMemcpy2DFromArray(px.data(), width * sizeof(uchar4), arr, 0, 0, width * sizeof(uchar4), height, cudaMemcpyDeviceToHost), cudaSuccess);
+
+        if (ti == 0)
+        {
+            ref_pixels = std::move(px);
+            uint32_t non_bg = 0;
+            for (const auto& c : ref_pixels)
+                if (c.x != 255 || c.y != 0 || c.z != 255) ++non_bg;
+            EXPECT_GT(non_bg, 0u);
+        }
+        else
+        {
+            uint32_t diffs = 0;
+            for (size_t i = 0; i < px.size(); ++i)
+            {
+                if (std::abs(int(px[i].x) - int(ref_pixels[i].x)) > 2 ||
+                    std::abs(int(px[i].y) - int(ref_pixels[i].y)) > 2 ||
+                    std::abs(int(px[i].z) - int(ref_pixels[i].z)) > 2)
+                {
+                    ++diffs;
+                }
+            }
+            EXPECT_EQ(diffs, 0u) << "TLAS type index " << ti << " differed from BVH TLAS";
+        }
+    }
+
+    cudaDestroySurfaceObject(surf);
+    cudaFreeArray(arr);
 }

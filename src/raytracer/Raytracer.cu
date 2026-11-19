@@ -51,12 +51,12 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
         dim3 block_dim{RENDER_BLOCK_THREADS, 1, 1};
 
         const bool has_nagata = scene.spaces[active_space].has_nagata;
-        auto launch = [&]<ASType Type, bool UseBVH16 = false>()
+        auto launch = [&]<ASType Type, bool UseBVH16 = false, ASType TlasType = ASType::None>()
         {
             if (has_nagata)
-                draw_first_hit_kernel<Type, true, UseBVH16><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
+                draw_first_hit_kernel<Type, true, UseBVH16, TlasType><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
             else
-                draw_first_hit_kernel<Type, false, UseBVH16><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
+                draw_first_hit_kernel<Type, false, UseBVH16, TlasType><<<grid_dim, block_dim, 0, stream>>>(surface, parameters);
         };
 
         switch (active_type)
@@ -81,8 +81,29 @@ void Raytracer::draw_first_hit(Scene& scene, cudaSurfaceObject_t surface, uint32
             break;
         }
         case ASType::Heterogeneous:
-            launch.template operator()<ASType::Heterogeneous>();
+        {
+            const int root_box = scene.spaces[active_space].root_box;
+            const ASType tlas_type = (root_box >= 0 && scene.as_heterogeneous.trees.is_allocated(static_cast<size_t>(root_box)))
+                ? static_cast<ASType>(scene.as_heterogeneous.trees[static_cast<size_t>(root_box)].tlas_as_type)
+                : ASType::BVH;
+            switch (tlas_type)
+            {
+            case ASType::KDTree:
+                launch.template operator()<ASType::Heterogeneous, false, ASType::KDTree>();
+                break;
+            case ASType::UniformGrid:
+                launch.template operator()<ASType::Heterogeneous, false, ASType::UniformGrid>();
+                break;
+            case ASType::Octree:
+                launch.template operator()<ASType::Heterogeneous, false, ASType::Octree>();
+                break;
+            case ASType::BVH:
+            default:
+                launch.template operator()<ASType::Heterogeneous, false, ASType::BVH>();
+                break;
+            }
             break;
+        }
         default:
             break;
         }

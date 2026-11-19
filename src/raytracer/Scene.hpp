@@ -97,34 +97,30 @@ public:
 	int get_root_box() const;
 	uint32_t get_active_space() const;
 
-	uint32_t create_space();
-	void release_space_resources(uint32_t space_id);
 	void free_space(uint32_t space_id);
-	void normalize_space(uint32_t space_id, bool stretch, bool margin = true);
-	void sort_space(uint32_t space_id, soa::cuda_device_vector<Triangle>& d_temp_triangles);
-	void pack_primitives(uint32_t space_id, const soa::cuda_device_vector<Triangle>& d_temp_triangles, uint32_t triangles_count, PrimitiveType triangle_type);
 
-	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-	uint32_t build_as_into_space(uint32_t space_id, Range&& meshes, ASType type);
-
-	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-	uint32_t build_as(Range&& meshes, ASType type);
-
-	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-	uint32_t build_heterogeneous_as(Range&& meshes);
-
-	uint32_t build_heterogeneous_instances(const std::vector<MeshInstanceDesc>& instances);
 	uint32_t build_node_as(uint32_t node_id, ASType type);
 	void free_node_as(uint32_t node_id);
 
 	bool is_mesh_node_shared(uint32_t node_id) const;
-	void collect_subtree_instances(uint32_t node_id, glm::mat4 current_transform, std::vector<MeshInstanceDesc>& out) const;
 	std::vector<std::pair<glm::mat4, Mesh&>> get_mesh_transform(const Node* node = nullptr);
 
 	Node& get_root_node() { return m_nodes[root_node_id]; }
 	const Node& get_root_node() const { return m_nodes[root_node_id]; }
 
+	struct Config
+	{
+		bool swapYZ = true;
+		bool sort_space = false;
+		PrimitiveType triangle_type = PrimitiveType::Triangle;
+	};
+
+	Config config;
+	void config_ui();
+
 	std::vector<Mesh> m_meshes;
+	soa::cuda_device_vector<Vertex> d_source_vertices;
+	soa::cuda_device_vector<Triangle> d_source_triangles;
 	std::vector<Texture> m_textures;
 	soa::soa_vector<Material> m_materials;
 	soa::cuda_device_vector<Material> d_materials;
@@ -151,7 +147,22 @@ public:
 private:
 	uint32_t m_active_space = 0;
 	int m_root_box = -1;
+	int32_t* m_d_aabb_scratch = nullptr;
 
+	uint32_t create_space();
+	void release_space_resources(uint32_t space_id);
+	void normalize_space(uint32_t space_id, glm::vec3 aabb_min, glm::vec3 aabb_max, bool stretch, bool margin = false);
+	void sort_space(uint32_t space_id, soa::cuda_device_vector<Triangle>& d_temp_triangles);
+	void pack_primitives(uint32_t space_id, const soa::cuda_device_vector<Triangle>& d_temp_triangles, uint32_t triangles_count, PrimitiveType triangle_type);
+
+	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
+	void prepare_and_pack_space(uint32_t space_id, Range&& meshes, ASType type, bool swap_yz, bool stretch, bool do_sort, PrimitiveType triangle_type);
+
+	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
+	uint32_t build_as_into_space(uint32_t space_id, Range&& meshes, ASType type);
+
+	uint32_t build_heterogeneous_instances(const std::vector<MeshInstanceDesc>& instances);
+	void collect_subtree_instances(uint32_t node_id, glm::mat4 current_transform, std::vector<MeshInstanceDesc>& out) const;
 	void free_tlas_space_only(uint32_t space_id);
 
 	std::vector<uint32_t> loadTextures(const tg3_model& model);
@@ -159,233 +170,4 @@ private:
 	std::vector<uint32_t> loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds);
 	uint32_t importNode(const tg3_model& model, uint32_t nodeIndex, const std::vector<uint32_t>& meshIds, std::vector<uint32_t>& importedGltfNodes);
 	void load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds);
-
-	template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-	void prepare_space_geometry(uint32_t space_id, Range&& meshes, ASType type, bool swap_yz, soa::cuda_device_vector<Triangle>& out_d_triangles, size_t& out_triangles_size);
 };
-
-template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-inline void Scene::prepare_space_geometry(uint32_t space_id, Range&& meshes, ASType type, bool swap_yz, soa::cuda_device_vector<Triangle>& out_d_triangles, size_t& out_triangles_size)
-{
-	size_t triangles_size = 0;
-	size_t vertices_size = 0;
-
-	for (auto& mesh : meshes)
-	{
-		triangles_size += mesh.second.triangles.size();
-		vertices_size += mesh.second.vertices.size();
-	}
-
-	auto vertices_start = static_cast<uint32_t>(geometry_context.vertices.alloc(vertices_size));
-
-	spaces[space_id].vertices_start = vertices_start;
-	spaces[space_id].vertices_size = static_cast<uint32_t>(vertices_size);
-	spaces[space_id].as_type = type;
-
-	soa::soa_vector<Triangle> temp_triangles(triangles_size);
-	soa::soa_vector<Vertex> temp_vertices(vertices_size);
-	size_t tri_offset = 0;
-	size_t vert_offset = 0;
-
-	for (auto& [transform, mesh] : meshes)
-	{
-		for (size_t i = 0; i < mesh.triangles.size(); ++i)
-		{
-			const auto& src_triangle = mesh.triangles[i];
-			auto&& dst_triangle = temp_triangles[tri_offset + i];
-
-			dst_triangle.type = PrimitiveType::Triangle;
-			dst_triangle.material_id = src_triangle.material_id;
-			dst_triangle.v0 = static_cast<uint32_t>(src_triangle.v0 + vert_offset + vertices_start);
-			dst_triangle.v1 = static_cast<uint32_t>(src_triangle.v1 + vert_offset + vertices_start);
-			dst_triangle.v2 = static_cast<uint32_t>(src_triangle.v2 + vert_offset + vertices_start);
-		}
-
-		for (size_t i = 0; i < mesh.vertices.size(); ++i)
-		{
-			const auto& src_vertex = mesh.vertices[i];
-			auto&& dst_vertex = temp_vertices[vert_offset + i];
-
-			dst_vertex = src_vertex;
-
-			dst_vertex.position = transform * glm::vec4(dst_vertex.position, 1);
-			dst_vertex.normal = glm::normalize(transform * glm::vec4(dst_vertex.normal, 0));
-			if (swap_yz)
-			{
-				std::swap(dst_vertex.position.y, dst_vertex.position.z);
-				dst_vertex.position.y = -dst_vertex.position.y;
-				std::swap(dst_vertex.normal.y, dst_vertex.normal.z);
-				dst_vertex.normal.y = -dst_vertex.normal.y;
-			}
-		}
-
-		tri_offset += mesh.triangles.size();
-		vert_offset += mesh.vertices.size();
-	}
-
-	geometry_context.vertices.range(vertices_start, vertices_size) = temp_vertices;
-	out_d_triangles = temp_triangles;
-	out_triangles_size = triangles_size;
-}
-
-template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-inline uint32_t Scene::build_as_into_space(uint32_t space_id, Range&& meshes, ASType type)
-{
-	if (type == ASType::Octree)
-	{
-		size_t triangles_size = 0;
-		soa::cuda_device_vector<Triangle> d_temp_triangles;
-		prepare_space_geometry(space_id, meshes, type, as_octree.config.swapYZ, d_temp_triangles, triangles_size);
-
-		normalize_space(space_id, as_octree.config.stretch, false);
-		if (as_octree.config.sort_space)
-		{
-			sort_space(space_id, d_temp_triangles);
-		}
-
-		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_octree.config.triangle_type);
-
-		as_octree.build(space_id, spaces[space_id]);
-		geometry_context.d_spaces = spaces;
-		return space_id;
-	}
-	else if (type == ASType::Optix)
-	{
-		size_t triangles_size = 0;
-		soa::cuda_device_vector<Triangle> d_temp_triangles;
-		prepare_space_geometry(space_id, meshes, type, as_octree.config.swapYZ, d_temp_triangles, triangles_size);
-
-		normalize_space(space_id, as_octree.config.stretch);
-
-		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), PrimitiveType::Triangle);
-
-		as_optix.build(space_id, spaces[space_id]);
-		geometry_context.d_spaces = spaces;
-		return space_id;
-	}
-	else if (type == ASType::UniformGrid)
-	{
-		size_t triangles_size = 0;
-		soa::cuda_device_vector<Triangle> d_temp_triangles;
-		prepare_space_geometry(space_id, meshes, type, as_uniform_grid.config.swapYZ, d_temp_triangles, triangles_size);
-
-		normalize_space(space_id, false, false);
-		if (as_uniform_grid.config.sort_space)
-		{
-			sort_space(space_id, d_temp_triangles);
-		}
-
-		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_uniform_grid.config.triangle_type);
-
-		as_uniform_grid.build(space_id, spaces[space_id]);
-		geometry_context.d_spaces = spaces;
-		return space_id;
-	}
-	else if (type == ASType::KDTree)
-	{
-		size_t triangles_size = 0;
-		soa::cuda_device_vector<Triangle> d_temp_triangles;
-		prepare_space_geometry(space_id, meshes, type, as_kdtree.config.swapYZ, d_temp_triangles, triangles_size);
-
-		normalize_space(space_id, false, false);
-		if (as_kdtree.config.sort_space)
-		{
-			sort_space(space_id, d_temp_triangles);
-		}
-
-		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_kdtree.config.triangle_type);
-
-		as_kdtree.build(space_id, spaces[space_id]);
-		geometry_context.d_spaces = spaces;
-		return space_id;
-	}
-	else if (type == ASType::BVH)
-	{
-		size_t triangles_size = 0;
-		soa::cuda_device_vector<Triangle> d_temp_triangles;
-		prepare_space_geometry(space_id, meshes, type, as_bvh.config.swapYZ, d_temp_triangles, triangles_size);
-
-		normalize_space(space_id, false, false);
-		if (as_bvh.config.sort_space)
-		{
-			sort_space(space_id, d_temp_triangles);
-		}
-
-		pack_primitives(space_id, d_temp_triangles, static_cast<uint32_t>(triangles_size), as_bvh.config.triangle_type);
-
-		as_bvh.build(space_id, spaces[space_id]);
-		geometry_context.d_spaces = spaces;
-		return space_id;
-	}
-	return space_id;
-}
-
-template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-inline uint32_t Scene::build_as(Range&& meshes, ASType type)
-{
-	if (type == ASType::Heterogeneous)
-	{
-		return build_heterogeneous_as(std::forward<Range>(meshes));
-	}
-	const uint32_t space_id = create_space();
-	return build_as_into_space(space_id, std::forward<Range>(meshes), type);
-}
-
-template<range_of<std::pair<glm::mat4, Mesh&>> Range>
-inline uint32_t Scene::build_heterogeneous_as(Range&& meshes)
-{
-	std::vector<MeshInstanceDesc> all_scene_instances;
-	if (!m_nodes.empty() && root_node_id < m_nodes.size())
-	{
-		collect_subtree_instances(root_node_id, glm::mat4(1.0f), all_scene_instances);
-	}
-	std::vector<bool> used_scene_inst(all_scene_instances.size(), false);
-
-	std::vector<MeshInstanceDesc> instances;
-	for (auto& [transform, mesh] : meshes)
-	{
-		if (mesh.triangles.empty() || mesh.vertices.empty())
-			continue;
-
-		MeshInstanceDesc desc{};
-		desc.transform = transform;
-		desc.mesh = &mesh;
-		desc.instance_name = mesh.name;
-
-		if (!m_meshes.empty() && &mesh >= m_meshes.data() && &mesh < m_meshes.data() + m_meshes.size())
-		{
-			const size_t mesh_idx = static_cast<size_t>(&mesh - m_meshes.data());
-			if (mesh_idx < m_mesh_node_ids.size())
-			{
-				desc.mesh_node_id = m_mesh_node_ids[mesh_idx];
-			}
-		}
-
-		for (size_t s = 0; s < all_scene_instances.size(); ++s)
-		{
-			if (!used_scene_inst[s] && all_scene_instances[s].mesh == &mesh)
-			{
-				const glm::mat4 diff = all_scene_instances[s].transform - transform;
-				float max_abs = 0.0f;
-				for (int c = 0; c < 4; ++c)
-				{
-					for (int r = 0; r < 4; ++r)
-					{
-						max_abs = glm::max(max_abs, fabsf(diff[c][r]));
-					}
-				}
-				if (max_abs < 1e-4f)
-				{
-					used_scene_inst[s] = true;
-					desc.instance_node_id = all_scene_instances[s].instance_node_id;
-					desc.instance_name = all_scene_instances[s].instance_name;
-					break;
-				}
-			}
-		}
-
-		instances.push_back(std::move(desc));
-	}
-
-	return build_heterogeneous_instances(instances);
-}

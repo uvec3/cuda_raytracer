@@ -69,9 +69,11 @@ namespace heterogeneous_host_detail
     {
         constexpr uint32_t block_threads = HeterogeneousASDeviceView::PROBE_BLOCK_THREADS;
         constexpr uint32_t blas_stack_size = HeterogeneousASDeviceView::BLAS_STACK_SIZE;
+        constexpr bool needs_stack = (CandidateType == ASType::BVH || CandidateType == ASType::KDTree);
+        constexpr uint32_t active_stack_size = needs_stack ? blas_stack_size : 1u;
 
-        __shared__ BVHStackEntry shared_stack[blas_stack_size][block_threads];
-        BVHStackEntry* stack_base = &shared_stack[0][threadIdx.x];
+        __shared__ BVHStackEntry shared_stack[active_stack_size][block_threads];
+        void* stack_base = needs_stack ? static_cast<void*>(&shared_stack[0][threadIdx.x]) : nullptr;
 
         const uint32_t ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (ray_idx >= ray_count || root_box < 0)
@@ -84,131 +86,29 @@ namespace heterogeneous_host_detail
         glm::vec3 closest_tuv{INFINITY, 0.0f, 0.0f};
         int it = 0;
 
-        if constexpr (CandidateType == ASType::BVH)
-        {
-            CurrentBVHNode state{.t_min = 0.0f};
-            while (!state.exited && it < 500)
-            {
-                const uint32_t container_id = traverse_bvh16<block_threads, blas_stack_size>(
-                    bvh_view,
-                    root_box,
-                    state,
-                    stack_base,
-                    orig,
-                    dir,
-                    it,
-                    closest_tuv.x,
-                    0.0f);
+        const auto& as_view = [&]() -> const auto& {
+            if constexpr (CandidateType == ASType::BVH)
+                return bvh_view;
+            else if constexpr (CandidateType == ASType::KDTree)
+                return kdtree_view;
+            else if constexpr (CandidateType == ASType::UniformGrid)
+                return grid_view;
+            else
+                return octree_view;
+        }();
 
-                if (container_id > 0)
-                {
-                    intersect_box_primitives<HasNagata, false>(
-                        bvh_view.box_content,
-                        container_id,
-                        params,
-                        orig,
-                        dir,
-                        0.0f,
-                        fminf(closest_tuv.x, 1e30f),
-                        closest_tri,
-                        closest_tuv);
-                }
-            }
-        }
-        else if constexpr (CandidateType == ASType::KDTree)
-        {
-            CurrentKDNode state{};
-            while (!state.exited && it < 500)
-            {
-                const uint32_t container_id = traverse_kdtree<block_threads, blas_stack_size>(
-                    kdtree_view,
-                    root_box,
-                    state,
-                    reinterpret_cast<KDStackEntry*>(stack_base),
-                    orig,
-                    dir,
-                    it);
-
-                if (container_id > 0)
-                {
-                    if (state.t_min > closest_tuv.x)
-                        break;
-
-                    intersect_box_primitives<HasNagata>(
-                        kdtree_view.box_content,
-                        container_id,
-                        params,
-                        orig,
-                        dir,
-                        state.t_min,
-                        fminf(state.t_max, closest_tuv.x),
-                        closest_tri,
-                        closest_tuv);
-                }
-            }
-        }
-        else if constexpr (CandidateType == ASType::UniformGrid)
-        {
-            CurrentGridCell state{};
-            while (!state.exited && it < 2000)
-            {
-                const uint32_t container_id = traverse_uniform_grid(
-                    grid_view,
-                    root_box,
-                    state,
-                    orig,
-                    dir,
-                    it);
-
-                if (container_id > 0)
-                {
-                    if (state.t_min > closest_tuv.x)
-                        break;
-
-                    intersect_box_primitives<HasNagata>(
-                        grid_view.box_content,
-                        container_id,
-                        params,
-                        orig,
-                        dir,
-                        state.t_min,
-                        fminf(state.t_max, closest_tuv.x),
-                        closest_tri,
-                        closest_tuv);
-                }
-            }
-        }
-        else if constexpr (CandidateType == ASType::Octree)
-        {
-            CurrentBox state{.id = root_box};
-            while (it < 500)
-            {
-                const TraversalResult res = traverse_stackless(&octree_view.as[0], state, orig, dir, it);
-                const uint32_t container_id = res.content;
-
-                if (container_id > 0)
-                {
-                    if (state.t_min > closest_tuv.x)
-                        break;
-
-                    const float cell_tmin = state.t_min;
-                    const float cell_tmax = (state.t_max > state.t_min) ? fminf(state.t_max, closest_tuv.x) : closest_tuv.x;
-                    intersect_box_primitives<HasNagata>(
-                        octree_view.box_content,
-                        container_id,
-                        params,
-                        orig,
-                        dir,
-                        cell_tmin,
-                        cell_tmax,
-                        closest_tri,
-                        closest_tuv);
-                }
-
-                if (state.stack.depth() == 0)
-                    break;
-            }
-        }
+        heterogeneous_detail::traverse_as_primitives<CandidateType, HasNagata, block_threads, blas_stack_size, true, false>(
+            as_view,
+            root_box,
+            stack_base,
+            params,
+            orig,
+            dir,
+            0.0f,
+            closest_tuv,
+            closest_tri,
+            it,
+            nullptr);
 
         if (closest_tri != UINT32_MAX && out_checksum != nullptr)
         {
@@ -352,26 +252,22 @@ void HeterogeneousAS::apply_variant_config(const ASConfigVariant& variant)
     {
         m_bvh->config = variant.bvh_config;
         m_bvh->config.use_bvh16 = true; // Strictly enforce BVH16 only
-        m_bvh->config.triangle_type = config.triangle_type;
     }
     else if (variant.as_type == ASType::KDTree && m_kdtree)
     {
         m_kdtree->config = variant.kdtree_config;
-        m_kdtree->config.triangle_type = config.triangle_type;
     }
     else if (variant.as_type == ASType::UniformGrid && m_uniform_grid)
     {
         m_uniform_grid->config = variant.grid_config;
-        m_uniform_grid->config.triangle_type = config.triangle_type;
     }
     else if (variant.as_type == ASType::Octree && m_octree)
     {
         m_octree->config = variant.octree_config;
-        m_octree->config.triangle_type = config.triangle_type;
     }
 }
 
-void HeterogeneousAS::build_single_as(ASType as_type, uint32_t space_id, Space space)
+void HeterogeneousAS::build_single_as(ASType as_type, uint32_t space_id, Space space, PrimitiveType primitive_type)
 {
     space.as_type = as_type;
     space.root_box = -1;
@@ -381,13 +277,13 @@ void HeterogeneousAS::build_single_as(ASType as_type, uint32_t space_id, Space s
     space.box_content_size = 0;
 
     if (as_type == ASType::BVH && m_bvh)
-        m_bvh->build(space_id, space);
+        m_bvh->build(space_id, space, primitive_type);
     else if (as_type == ASType::KDTree && m_kdtree)
-        m_kdtree->build(space_id, space);
+        m_kdtree->build(space_id, space, primitive_type);
     else if (as_type == ASType::UniformGrid && m_uniform_grid)
-        m_uniform_grid->build(space_id, space);
+        m_uniform_grid->build(space_id, space, primitive_type);
     else if (as_type == ASType::Octree && m_octree)
-        m_octree->build(space_id, space);
+        m_octree->build(space_id, space, primitive_type);
 }
 
 void HeterogeneousAS::free_single_as_only(ASType as_type, uint32_t space_id, Space space)
@@ -546,7 +442,8 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
     uint32_t mesh_node_id,
     uint32_t instance_count,
     glm::vec3 local_bounds_min,
-    glm::vec3 local_bounds_max)
+    glm::vec3 local_bounds_max,
+    PrimitiveType primitive_type)
 {
     assert(m_geometry_context != nullptr);
 
@@ -578,7 +475,7 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
         apply_variant_config(variants[i]);
 
         const auto t0 = std::chrono::high_resolution_clock::now();
-        build_single_as(variants[i].as_type, blas_space_id, blas_space);
+        build_single_as(variants[i].as_type, blas_space_id, blas_space, primitive_type);
         const auto t1 = std::chrono::high_resolution_clock::now();
         const double build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -620,11 +517,10 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
         fallback.name = "BVH16 Fallback";
         fallback.as_type = ASType::BVH;
         fallback.bvh_config.use_bvh16 = true;
-        fallback.bvh_config.triangle_type = config.triangle_type;
 
         apply_variant_config(fallback);
         const auto final_t0 = std::chrono::high_resolution_clock::now();
-        build_single_as(ASType::BVH, blas_space_id, blas_space);
+        build_single_as(ASType::BVH, blas_space_id, blas_space, primitive_type);
         const auto final_t1 = std::chrono::high_resolution_clock::now();
         const double final_ms = std::chrono::duration<double, std::milli>(final_t1 - final_t0).count();
 
@@ -685,7 +581,7 @@ MeshBuildRecord HeterogeneousAS::evaluate_and_build_blas(
 
     apply_variant_config(variants[winning_variant_idx]);
     const auto final_t0 = std::chrono::high_resolution_clock::now();
-    build_single_as(variants[winning_variant_idx].as_type, blas_space_id, blas_space);
+    build_single_as(variants[winning_variant_idx].as_type, blas_space_id, blas_space, primitive_type);
     const auto final_t1 = std::chrono::high_resolution_clock::now();
     record.selected_build_ms = std::chrono::duration<double, std::milli>(final_t1 - final_t0).count();
     compute_as_memory_bytes(
@@ -790,30 +686,26 @@ ASType HeterogeneousAS::configure_tlas_builder(ASType requested_type)
     {
         m_bvh->config.use_bvh16 = true;
         m_bvh->config.split_mode = BVHSplitMode::SAH;
-        m_bvh->config.max_leaf_primitives = 2;
+        m_bvh->config.max_leaf_primitives = 1;
         m_bvh->config.use_gpu = true;
-        m_bvh->config.triangle_type = PrimitiveType::Subspace;
     }
     else if (tlas_as_type == ASType::KDTree && m_kdtree)
     {
         m_kdtree->config.split_mode = KDSplitMode::SAH;
         m_kdtree->config.max_leaf_primitives = 2;
         m_kdtree->config.use_gpu = true;
-        m_kdtree->config.triangle_type = PrimitiveType::Subspace;
     }
     else if (tlas_as_type == ASType::UniformGrid && m_uniform_grid)
     {
-        m_uniform_grid->config.voxels_per_triangle = 16.0f;
-        m_uniform_grid->config.triangle_type = PrimitiveType::Subspace;
+        m_uniform_grid->config.voxels_per_triangle = 12.0f;
     }
     else if (tlas_as_type == ASType::Octree && m_octree)
     {
         m_octree->config.min_depth = 1;
-        m_octree->config.max_depth = 6;
-        m_octree->config.triangle_to_box_stop_ratio = 1.1f;
+        m_octree->config.max_depth = 19;
+        m_octree->config.triangle_to_box_stop_ratio = 2.f;
         m_octree->config.stretch = false;
         m_octree->config.use_gpu = true;
-        m_octree->config.triangle_type = PrimitiveType::Subspace;
     }
 
     return tlas_as_type;
@@ -832,7 +724,7 @@ void HeterogeneousAS::finalize_tlas(
     const auto tlas_t0 = std::chrono::high_resolution_clock::now();
     const SavedASConfigs saved_configs = save_standalone_configs();
     const ASType tlas_as_type = configure_tlas_builder(config.tlas_type);
-    build_single_as(tlas_as_type, tlas_space_id, tlas_space);
+    build_single_as(tlas_as_type, tlas_space_id, tlas_space, PrimitiveType::Subspace);
     restore_standalone_configs(saved_configs);
 
     const auto tlas_t1 = std::chrono::high_resolution_clock::now();
@@ -1122,19 +1014,6 @@ void HeterogeneousAS::config_ui()
 
     ImGui::DragFloat("Max AS Bytes / Tri", &config.max_memory_bytes_per_triangle, 1.0f, 4.0f, 512.0f, "%.1f B");
     ImGui::DragInt("Probe Rays / Candidate", &config.num_probe_rays, 256.0f, 1024, 262144);
-    ImGui::Checkbox("Swap y and z", &config.swapYZ);
-    ImGui::Checkbox("Sort space", &config.sort_space);
-
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
-    int tri_type_idx = 0;
-    if (config.triangle_type == PrimitiveType::FullTriangle) tri_type_idx = 1;
-    else if (config.triangle_type == PrimitiveType::NagataPatch) tri_type_idx = 2;
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
-    {
-        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
-        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
-        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
-    }
 
     if (ImGui::TreeNode("Candidate Presets (BVH uses BVH16 only)"))
     {

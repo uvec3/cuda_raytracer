@@ -7,16 +7,17 @@
 #include <glm/gtx/matrix_decompose.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <bit>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <utility>
-#include <thrust/reduce.h>
-#include <thrust/transform.h>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/iterator/zip_iterator.h>
+#include "imgui.h"
 #include "../device_algorithms.cuh"
 #include "../types/NagataPatch.cuh"
 
@@ -81,7 +82,7 @@ size_t Node::count_subtree_meshes(const std::vector<Node>& nodes) const
 
 size_t Node::count_subtree_triangles(const std::vector<Node>& nodes, const std::vector<Mesh>& meshes) const
 {
-    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].triangles.size() : 0;
+    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].d_triangles.size() : 0;
     for (uint32_t child_id : children)
     {
         if (child_id < nodes.size())
@@ -94,7 +95,7 @@ size_t Node::count_subtree_triangles(const std::vector<Node>& nodes, const std::
 
 size_t Node::count_subtree_vertices(const std::vector<Node>& nodes, const std::vector<Mesh>& meshes) const
 {
-    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].vertices.size() : 0;
+    size_t count = (meshId > 0 && meshId - 1 < meshes.size()) ? meshes[meshId - 1].d_vertices.size() : 0;
     for (uint32_t child_id : children)
     {
         if (child_id < nodes.size())
@@ -123,11 +124,19 @@ Scene::Scene(std::string_view name)
 
 Scene::~Scene()
 {
+    if (m_d_aabb_scratch != nullptr)
+    {
+        cudaFree(m_d_aabb_scratch);
+        m_d_aabb_scratch = nullptr;
+    }
     destroy_textures();
 }
 
 Scene::Scene(Scene&& other) noexcept
-    : m_meshes(std::move(other.m_meshes))
+    : config(other.config)
+    , m_meshes(std::move(other.m_meshes))
+    , d_source_vertices(std::move(other.d_source_vertices))
+    , d_source_triangles(std::move(other.d_source_triangles))
     , m_textures(std::move(other.m_textures))
     , m_materials(std::move(other.m_materials))
     , d_materials(std::move(other.d_materials))
@@ -148,6 +157,7 @@ Scene::Scene(Scene&& other) noexcept
     , m_name(std::move(other.m_name))
     , m_active_space(other.m_active_space)
     , m_root_box(other.m_root_box)
+    , m_d_aabb_scratch(other.m_d_aabb_scratch)
 {
     as_octree.bind_geometry_context(&geometry_context);
     as_uniform_grid.bind_geometry_context(&geometry_context);
@@ -157,14 +167,23 @@ Scene::Scene(Scene&& other) noexcept
     as_optix.bind_geometry_context(&geometry_context);
     other.m_textures.clear();
     other.m_is_loaded = false;
+    other.m_d_aabb_scratch = nullptr;
 }
 
 Scene& Scene::operator=(Scene&& other) noexcept
 {
     if (this != &other)
     {
+        if (m_d_aabb_scratch != nullptr)
+        {
+            cudaFree(m_d_aabb_scratch);
+            m_d_aabb_scratch = nullptr;
+        }
         destroy_textures();
+        config = other.config;
         m_meshes = std::move(other.m_meshes);
+        d_source_vertices = std::move(other.d_source_vertices);
+        d_source_triangles = std::move(other.d_source_triangles);
         m_textures = std::move(other.m_textures);
         m_materials = std::move(other.m_materials);
         d_materials = std::move(other.d_materials);
@@ -185,6 +204,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         m_name = std::move(other.m_name);
         m_active_space = other.m_active_space;
         m_root_box = other.m_root_box;
+        m_d_aabb_scratch = other.m_d_aabb_scratch;
 
         as_octree.bind_geometry_context(&geometry_context);
         as_uniform_grid.bind_geometry_context(&geometry_context);
@@ -194,8 +214,25 @@ Scene& Scene::operator=(Scene&& other) noexcept
         as_optix.bind_geometry_context(&geometry_context);
         other.m_textures.clear();
         other.m_is_loaded = false;
+        other.m_d_aabb_scratch = nullptr;
     }
     return *this;
+}
+
+void Scene::config_ui()
+{
+    ImGui::Checkbox("Swap y and z", &config.swapYZ);
+    ImGui::Checkbox("Sort space", &config.sort_space);
+    const char* items[] = { "Triangle", "FullTriangle", "NagataPatch" };
+    int current_item = 0;
+    if (config.triangle_type == PrimitiveType::FullTriangle) current_item = 1;
+    else if (config.triangle_type == PrimitiveType::NagataPatch) current_item = 2;
+    if (ImGui::Combo("Triangle storage type", &current_item, items, IM_ARRAYSIZE(items)))
+    {
+        if (current_item == 0) config.triangle_type = PrimitiveType::Triangle;
+        else if (current_item == 1) config.triangle_type = PrimitiveType::FullTriangle;
+        else if (current_item == 2) config.triangle_type = PrimitiveType::NagataPatch;
+    }
 }
 
 void Scene::destroy_textures()
@@ -401,28 +438,26 @@ void Scene::free_space(uint32_t space_id)
     }
 }
 
-struct MinVec3 {
-    __device__ glm::vec3 operator()(const glm::vec3& a, const glm::vec3& b) const {
-        return glm::min(a, b);
-    }
-};
+__global__ void scene_normalize_positions_kernel(
+    soa::soa_view<Vertex> vertices,
+    uint32_t vertices_start,
+    uint32_t vertices_size,
+    glm::vec3 translate,
+    glm::vec3 scale,
+    float offset)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= vertices_size) return;
+    glm::vec3 p = vertices[vertices_start + i].position;
+    vertices[vertices_start + i].position = (p + translate) * scale + offset;
+}
 
-struct MaxVec3 {
-    __device__ glm::vec3 operator()(const glm::vec3& a, const glm::vec3& b) const {
-        return glm::max(a, b);
-    }
-};
-
-void Scene::normalize_space(uint32_t space_id, bool stretch, bool margin)
+void Scene::normalize_space(uint32_t space_id, glm::vec3 aabb_min, glm::vec3 aabb_max, bool stretch, bool margin)
 {
     auto vertices_size = spaces[space_id].vertices_size;
     if (vertices_size == 0)
         return;
-    auto vertices_start = &geometry_context.vertices[spaces[space_id].vertices_start].position;
 
-    constexpr float inf = std::numeric_limits<float>::infinity();
-    auto aabb_min = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(inf), MinVec3{});
-    auto aabb_max = thrust::reduce(thrust::device, vertices_start, vertices_start + vertices_size, glm::vec3(-inf), MaxVec3{});
     auto aabb_size = aabb_max - aabb_min;
 
     const float scale_factor = margin ? 0.98f : 1.0f;
@@ -441,10 +476,15 @@ void Scene::normalize_space(uint32_t space_id, bool stretch, bool margin)
         normalization_scale = (max_axis > 0.0f) ? glm::vec3(scale_factor / max_axis) : glm::vec3(1.0f);
     }
 
-    thrust::transform(thrust::device, vertices_start, vertices_start + vertices_size, vertices_start, [=] __device__(const glm::vec3& v)
-    {
-        return (v + normalization_translate) * normalization_scale + offset;
-    });
+    uint32_t blocks = (vertices_size + 255u) / 256u;
+    scene_normalize_positions_kernel<<<blocks, 256>>>(
+        geometry_context.vertices.view(),
+        spaces[space_id].vertices_start,
+        vertices_size,
+        normalization_translate,
+        normalization_scale,
+        offset);
+    CUDA_CHECK(cudaGetLastError());
 
     spaces[space_id].normalization_translate = normalization_translate;
     spaces[space_id].normalization_scale = normalization_scale;
@@ -1110,9 +1150,24 @@ std::vector<uint32_t> Scene::loadTextures(const tg3_model& model)
 std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds)
 {
     std::vector<uint32_t> meshIds(model.meshes_count);
-    m_meshes.reserve(m_meshes.size() + model.meshes_count);
+    const size_t prev_mesh_count = m_meshes.size();
+    const size_t prev_vert_count = d_source_vertices.size();
+    const size_t prev_tri_count = d_source_triangles.size();
+    m_meshes.reserve(prev_mesh_count + model.meshes_count);
 
-    // load all gltf mesh and primitive data
+    struct MeshSpan
+    {
+        size_t vert_offset = 0;
+        size_t vert_count = 0;
+        size_t tri_offset = 0;
+        size_t tri_count = 0;
+    };
+    std::vector<MeshSpan> mesh_spans(model.meshes_count);
+
+    soa::soa_vector<Vertex> host_vertices;
+    soa::soa_vector<Triangle> host_triangles;
+
+    // load all gltf mesh and primitive data into temporary host staging buffers
     for (uint32_t i = 0; i < model.meshes_count; ++i)
     {
         Mesh mesh;
@@ -1122,7 +1177,7 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
             : "No Name";
 
         // lambda to perform attribute data copy
-        auto writeAttribute = [&model]<typename T>(T* dst, const tg3_str_int_pair* attr, uint32_t start)
+        auto writeAttribute = [&model]<typename T>(T* dst, const tg3_str_int_pair* attr, size_t start)
         {
             const tg3_accessor* accessor = &model.accessors[attr->value];
             const tg3_buffer_view* bufferView = &model.buffer_views[accessor->buffer_view];
@@ -1267,62 +1322,171 @@ std::vector<uint32_t> Scene::loadMeshes(const tg3_model& model, const std::vecto
             }
         }
 
-        uint32_t total_number_of_vertices = 0;
+        size_t total_number_of_vertices = 0;
         for (const auto& m : subMeshes)
         {
             total_number_of_vertices += m.vertexCount;
         }
-        mesh.vertices.reserve(total_number_of_vertices);
 
+        const size_t mesh_vert_offset = host_vertices.size();
+        const size_t mesh_tri_offset = host_triangles.size();
+        if (total_number_of_vertices > 0)
+        {
+            host_vertices.reserve(mesh_vert_offset + total_number_of_vertices);
+        }
 
         for (uint32_t s = 0; s < tg3mesh->primitives_count; ++s)
         {
             if (subMeshes[s].vertexCount == 0)
                 continue;
 
-            subMeshes[s].vertexStart = mesh.vertices.allocate(subMeshes[s].vertexCount);
+            const size_t global_vert_start = host_vertices.allocate(subMeshes[s].vertexCount);
+            subMeshes[s].vertexStart = global_vert_start - mesh_vert_offset;
 
             if (subMeshes[s].attribute_position)
             {
-                writeAttribute(&mesh.vertices[0].position, subMeshes[s].attribute_position, subMeshes[s].vertexStart);
+                writeAttribute(&host_vertices[0].position, subMeshes[s].attribute_position, global_vert_start);
+            }
+            else
+            {
+                std::fill_n(&host_vertices[0].position + global_vert_start, subMeshes[s].vertexCount, glm::vec3(0.0f));
             }
 
             if (subMeshes[s].attribute_normal)
             {
-                writeAttribute(&mesh.vertices[0].normal, subMeshes[s].attribute_normal, subMeshes[s].vertexStart);
+                writeAttribute(&host_vertices[0].normal, subMeshes[s].attribute_normal, global_vert_start);
+            }
+            else
+            {
+                std::fill_n(&host_vertices[0].normal + global_vert_start, subMeshes[s].vertexCount, glm::vec3(0.0f));
             }
 
             if (subMeshes[s].attribute_color)
             {
-                writeAttribute(&mesh.vertices[0].color, subMeshes[s].attribute_color, subMeshes[s].vertexStart);
+                writeAttribute(&host_vertices[0].color, subMeshes[s].attribute_color, global_vert_start);
+            }
+            else
+            {
+                std::fill_n(&host_vertices[0].color + global_vert_start, subMeshes[s].vertexCount, glm::vec4(0.0f));
             }
 
             if (subMeshes[s].attribute_texcoord)
             {
-                writeAttribute(&mesh.vertices[0].uv, subMeshes[s].attribute_texcoord, subMeshes[s].vertexStart);
+                writeAttribute(&host_vertices[0].uv, subMeshes[s].attribute_texcoord, global_vert_start);
+            }
+            else
+            {
+                std::fill_n(&host_vertices[0].uv + global_vert_start, subMeshes[s].vertexCount, glm::vec2(0.0f));
             }
         }
 
-        mesh.triangles.reserve(indices.size() / 3);
+        const size_t mesh_vert_count = host_vertices.size() - mesh_vert_offset;
+        if (mesh_vert_count > 0)
+        {
+            glm::vec3 bmin(std::numeric_limits<float>::infinity());
+            glm::vec3 bmax(-std::numeric_limits<float>::infinity());
+            const glm::vec3* pos_ptr = &host_vertices[0].position + mesh_vert_offset;
+            for (size_t v = 0; v < mesh_vert_count; ++v)
+            {
+                bmin = glm::min(bmin, pos_ptr[v]);
+                bmax = glm::max(bmax, pos_ptr[v]);
+            }
+            mesh.local_bounds_min = bmin;
+            mesh.local_bounds_max = bmax;
+        }
+        else
+        {
+            mesh.local_bounds_min = glm::vec3(0.0f);
+            mesh.local_bounds_max = glm::vec3(0.0f);
+        }
+
+        if (indices.size() >= 3)
+        {
+            host_triangles.reserve(mesh_tri_offset + indices.size() / 3);
+        }
         for (const auto& submesh : subMeshes)
         {
             auto number_of_triangles = submesh.indexCount / 3;
             if (number_of_triangles == 0)
                 continue;
 
-            auto start = mesh.triangles.allocate(number_of_triangles);
+            auto start = host_triangles.allocate(number_of_triangles);
             for (size_t t = 0; t < number_of_triangles; ++t)
             {
-                mesh.triangles[start + t].v0 = submesh.vertexStart + indices[submesh.indexStart + t * 3];
-                mesh.triangles[start + t].v1 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 1];
-                mesh.triangles[start + t].v2 = submesh.vertexStart + indices[submesh.indexStart + t * 3 + 2];
-                mesh.triangles[start + t].material_id = submesh.materialId;
+                host_triangles[start + t].type = PrimitiveType::Triangle;
+                host_triangles[start + t].v0 = static_cast<uint32_t>(submesh.vertexStart + indices[submesh.indexStart + t * 3]);
+                host_triangles[start + t].v1 = static_cast<uint32_t>(submesh.vertexStart + indices[submesh.indexStart + t * 3 + 1]);
+                host_triangles[start + t].v2 = static_cast<uint32_t>(submesh.vertexStart + indices[submesh.indexStart + t * 3 + 2]);
+                host_triangles[start + t].material_id = static_cast<uint16_t>(submesh.materialId);
             }
         }
 
+        mesh_spans[i] = MeshSpan{
+            mesh_vert_offset,
+            mesh_vert_count,
+            mesh_tri_offset,
+            host_triangles.size() - mesh_tri_offset
+        };
+
         m_meshes.push_back(std::move(mesh));
-        meshIds[i] = m_meshes.size();
+        meshIds[i] = static_cast<uint32_t>(m_meshes.size());
     }
+
+    // Upload all source vertices and triangles once to device storage and assign per-mesh device views
+    if (prev_vert_count == 0)
+    {
+        if (!host_vertices.empty())
+        {
+            d_source_vertices = host_vertices;
+        }
+    }
+    else if (!host_vertices.empty())
+    {
+        d_source_vertices.resize(prev_vert_count + host_vertices.size());
+        d_source_vertices.range(prev_vert_count, host_vertices.size()) = host_vertices;
+    }
+
+    if (prev_tri_count == 0)
+    {
+        if (!host_triangles.empty())
+        {
+            d_source_triangles = host_triangles;
+        }
+    }
+    else if (!host_triangles.empty())
+    {
+        d_source_triangles.resize(prev_tri_count + host_triangles.size());
+        d_source_triangles.range(prev_tri_count, host_triangles.size()) = host_triangles;
+    }
+
+    // Refresh existing mesh views if appending reallocated d_source_*
+    if (prev_mesh_count > 0 && (!host_vertices.empty() || !host_triangles.empty()))
+    {
+        size_t v_off = 0;
+        size_t t_off = 0;
+        for (size_t k = 0; k < prev_mesh_count; ++k)
+        {
+            const size_t v_cnt = m_meshes[k].d_vertices.size();
+            const size_t t_cnt = m_meshes[k].d_triangles.size();
+            m_meshes[k].d_vertices = (v_cnt > 0) ? d_source_vertices.view(v_off, v_cnt) : soa::soa_view<Vertex>{};
+            m_meshes[k].d_triangles = (t_cnt > 0) ? d_source_triangles.view(t_off, t_cnt) : soa::soa_view<Triangle>{};
+            v_off += v_cnt;
+            t_off += t_cnt;
+        }
+    }
+
+    for (uint32_t i = 0; i < model.meshes_count; ++i)
+    {
+        const auto& span = mesh_spans[i];
+        Mesh& dst_mesh = m_meshes[prev_mesh_count + i];
+        dst_mesh.d_vertices = (span.vert_count > 0)
+            ? d_source_vertices.view(prev_vert_count + span.vert_offset, span.vert_count)
+            : soa::soa_view<Vertex>{};
+        dst_mesh.d_triangles = (span.tri_count > 0)
+            ? d_source_triangles.view(prev_tri_count + span.tri_offset, span.tri_count)
+            : soa::soa_view<Triangle>{};
+    }
+
     return meshIds;
 }
 
@@ -1731,13 +1895,624 @@ void Scene::collect_subtree_instances(uint32_t node_id, glm::mat4 current_transf
     collect_subtree_instances_impl(m_nodes, m_meshes, node_id, UINT32_MAX, current_transform, out);
 }
 
+namespace
+{
+    struct MeshTransformTask
+    {
+        soa::soa_view<Vertex> src_vertices;
+        soa::soa_view<Triangle> src_triangles;
+        glm::mat4 transform;
+        glm::mat3 normal_matrix;
+        uint32_t dst_vert_offset;
+        uint32_t dst_tri_offset;
+        uint32_t vert_count;
+        uint32_t tri_count;
+    };
+
+    __device__ __forceinline__ int32_t scene_float_to_ordered_int(float f)
+    {
+        int32_t bits = __float_as_int(f);
+        return (bits < 0) ? (bits ^ 0x7FFFFFFF) : bits;
+    }
+
+    inline float scene_ordered_int_to_float(int32_t ordered)
+    {
+        int32_t bits = (ordered < 0) ? (ordered ^ 0x7FFFFFFF) : ordered;
+        return std::bit_cast<float>(bits);
+    }
+
+    __device__ __forceinline__ uint32_t scene_find_vert_task(
+        const MeshTransformTask* tasks,
+        uint32_t num_tasks,
+        uint32_t global_idx)
+    {
+        uint32_t lo = 0;
+        uint32_t hi = num_tasks;
+        while (lo < hi)
+        {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (tasks[mid].dst_vert_offset <= global_idx)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo - 1;
+    }
+
+    __device__ __forceinline__ uint32_t scene_find_tri_task(
+        const MeshTransformTask* tasks,
+        uint32_t num_tasks,
+        uint32_t global_idx)
+    {
+        uint32_t lo = 0;
+        uint32_t hi = num_tasks;
+        while (lo < hi)
+        {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (tasks[mid].dst_tri_offset <= global_idx)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo - 1;
+    }
+
+    __device__ __forceinline__ glm::vec3 scene_transform_one_vertex(
+        const MeshTransformTask& task,
+        uint32_t local_idx,
+        soa::soa_view<Vertex> dst_vertices,
+        uint32_t dst_idx)
+    {
+        glm::vec3 pos = glm::vec3(task.transform * glm::vec4(glm::vec3(task.src_vertices[local_idx].position), 1.0f));
+        glm::vec3 n = task.normal_matrix * glm::vec3(task.src_vertices[local_idx].normal);
+        float nlen2 = glm::dot(n, n);
+        if (nlen2 > 1e-20f)
+        {
+            n *= rsqrtf(nlen2);
+        }
+
+        dst_vertices[dst_idx].position = pos;
+        dst_vertices[dst_idx].normal = n;
+        dst_vertices[dst_idx].color = glm::vec4(task.src_vertices[local_idx].color);
+        dst_vertices[dst_idx].uv = glm::vec2(task.src_vertices[local_idx].uv);
+        return pos;
+    }
+
+    __device__ __forceinline__ void scene_reduce_block_aabb(
+        glm::vec3 local_min,
+        glm::vec3 local_max,
+        int32_t* d_aabb_i)
+    {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            local_min.x = fminf(local_min.x, __shfl_down_sync(0xFFFFFFFFu, local_min.x, offset));
+            local_min.y = fminf(local_min.y, __shfl_down_sync(0xFFFFFFFFu, local_min.y, offset));
+            local_min.z = fminf(local_min.z, __shfl_down_sync(0xFFFFFFFFu, local_min.z, offset));
+            local_max.x = fmaxf(local_max.x, __shfl_down_sync(0xFFFFFFFFu, local_max.x, offset));
+            local_max.y = fmaxf(local_max.y, __shfl_down_sync(0xFFFFFFFFu, local_max.y, offset));
+            local_max.z = fmaxf(local_max.z, __shfl_down_sync(0xFFFFFFFFu, local_max.z, offset));
+        }
+
+        __shared__ float s_min_x[8], s_min_y[8], s_min_z[8];
+        __shared__ float s_max_x[8], s_max_y[8], s_max_z[8];
+
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t warp = threadIdx.x >> 5;
+        if (lane == 0)
+        {
+            s_min_x[warp] = local_min.x;
+            s_min_y[warp] = local_min.y;
+            s_min_z[warp] = local_min.z;
+            s_max_x[warp] = local_max.x;
+            s_max_y[warp] = local_max.y;
+            s_max_z[warp] = local_max.z;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            const uint32_t num_warps = (blockDim.x + 31u) >> 5;
+            glm::vec3 bmin = (lane < num_warps)
+                ? glm::vec3(s_min_x[lane], s_min_y[lane], s_min_z[lane])
+                : glm::vec3(FLT_MAX);
+            glm::vec3 bmax = (lane < num_warps)
+                ? glm::vec3(s_max_x[lane], s_max_y[lane], s_max_z[lane])
+                : glm::vec3(-FLT_MAX);
+
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1)
+            {
+                bmin.x = fminf(bmin.x, __shfl_down_sync(0xFFFFFFFFu, bmin.x, offset));
+                bmin.y = fminf(bmin.y, __shfl_down_sync(0xFFFFFFFFu, bmin.y, offset));
+                bmin.z = fminf(bmin.z, __shfl_down_sync(0xFFFFFFFFu, bmin.z, offset));
+                bmax.x = fmaxf(bmax.x, __shfl_down_sync(0xFFFFFFFFu, bmax.x, offset));
+                bmax.y = fmaxf(bmax.y, __shfl_down_sync(0xFFFFFFFFu, bmax.y, offset));
+                bmax.z = fmaxf(bmax.z, __shfl_down_sync(0xFFFFFFFFu, bmax.z, offset));
+            }
+
+            if (lane == 0 && bmin.x <= bmax.x)
+            {
+                atomicMin(&d_aabb_i[0], scene_float_to_ordered_int(bmin.x));
+                atomicMin(&d_aabb_i[1], scene_float_to_ordered_int(bmin.y));
+                atomicMin(&d_aabb_i[2], scene_float_to_ordered_int(bmin.z));
+                atomicMax(&d_aabb_i[3], scene_float_to_ordered_int(bmax.x));
+                atomicMax(&d_aabb_i[4], scene_float_to_ordered_int(bmax.y));
+                atomicMax(&d_aabb_i[5], scene_float_to_ordered_int(bmax.z));
+            }
+        }
+    }
+
+    template <PrimitiveType PType>
+    __device__ __forceinline__ void scene_store_packed_primitive(
+        const Triangle& src_tri,
+        uint32_t vert_base,
+        uint32_t dst_tri_idx,
+        soa::soa_view<Vertex> vertices,
+        soa::soa_view<PrimitiveChunk16> dst_primitives,
+        uint32_t primitives_start)
+    {
+        const uint32_t v0_idx = src_tri.v0 + vert_base;
+        const uint32_t v1_idx = src_tri.v1 + vert_base;
+        const uint32_t v2_idx = src_tri.v2 + vert_base;
+
+        if constexpr (PType == PrimitiveType::FullTriangle)
+        {
+            InlinedTriangle ftri{};
+            ftri.type = PrimitiveType::FullTriangle;
+            ftri.material_id = src_tri.material_id;
+
+            glm::vec2 uv0 = vertices[v0_idx].uv;
+            glm::vec2 uv1 = vertices[v1_idx].uv;
+            glm::vec2 uv2 = vertices[v2_idx].uv;
+            ftri.uv_0 = glm::packHalf2x16(uv0);
+            ftri.uv_1 = glm::packHalf2x16(uv1);
+            ftri.uv_2 = glm::packHalf2x16(uv2);
+
+            ftri.v0 = glm::vec3(vertices[v0_idx].position);
+            ftri.n0_compressed.pack(glm::vec3(vertices[v0_idx].normal));
+            ftri.v1 = glm::vec3(vertices[v1_idx].position);
+            ftri.n1_compressed.pack(glm::vec3(vertices[v1_idx].normal));
+            ftri.v2 = glm::vec3(vertices[v2_idx].position);
+            ftri.n2_compressed.pack(glm::vec3(vertices[v2_idx].normal));
+
+            uint32_t dst_slot = primitives_start + dst_tri_idx * InlinedTriangle::occupied_slots;
+            store_primitive(dst_primitives, dst_slot, ftri);
+        }
+        else if constexpr (PType == PrimitiveType::NagataPatch)
+        {
+            glm::vec3 p0 = glm::vec3(vertices[v0_idx].position);
+            glm::vec3 p1 = glm::vec3(vertices[v1_idx].position);
+            glm::vec3 p2 = glm::vec3(vertices[v2_idx].position);
+            glm::vec3 n0 = glm::vec3(vertices[v0_idx].normal);
+            glm::vec3 n1 = glm::vec3(vertices[v1_idx].normal);
+            glm::vec3 n2 = glm::vec3(vertices[v2_idx].normal);
+
+            NagataPatch patch = NagataPatch::fromTriangle(p0, p1, p2, n0, n1, n2);
+
+            NagataPatchPrimitive prim{};
+            prim.type = PrimitiveType::NagataPatch;
+            prim.material_id = src_tri.material_id;
+            prim.v0 = v0_idx;
+            prim.v1 = v1_idx;
+            prim.v2 = v2_idx;
+            prim.C12 = patch.C12;
+            prim.C23 = patch.C23;
+            prim.C31 = patch.C31;
+
+            uint32_t dst_slot = primitives_start + dst_tri_idx * NagataPatchPrimitive::occupied_slots;
+            store_primitive(dst_primitives, dst_slot, prim);
+        }
+        else
+        {
+            Triangle tri{};
+            tri.type = PrimitiveType::Triangle;
+            tri.material_id = src_tri.material_id;
+            tri.v0 = v0_idx;
+            tri.v1 = v1_idx;
+            tri.v2 = v2_idx;
+
+            uint32_t dst_slot = primitives_start + dst_tri_idx * Triangle::occupied_slots;
+            store_primitive(dst_primitives, dst_slot, tri);
+        }
+    }
+
+    inline void transform_aabb(
+        const glm::vec3& bmin,
+        const glm::vec3& bmax,
+        const glm::mat4& M,
+        glm::vec3& out_min,
+        glm::vec3& out_max)
+    {
+        out_min = glm::vec3(std::numeric_limits<float>::infinity());
+        out_max = glm::vec3(-std::numeric_limits<float>::infinity());
+        for (int c = 0; c < 8; ++c)
+        {
+            glm::vec3 corner(
+                (c & 1) ? bmax.x : bmin.x,
+                (c & 2) ? bmax.y : bmin.y,
+                (c & 4) ? bmax.z : bmin.z);
+            glm::vec3 tp = glm::vec3(M * glm::vec4(corner, 1.0f));
+            out_min = glm::min(out_min, tp);
+            out_max = glm::max(out_max, tp);
+        }
+    }
+} // namespace
+
+__global__ void scene_transform_vertices_single_kernel(
+    MeshTransformTask task,
+    soa::soa_view<Vertex> dst_vertices,
+    uint32_t vertices_start,
+    int32_t* d_aabb_i)
+{
+    glm::vec3 local_min(FLT_MAX);
+    glm::vec3 local_max(-FLT_MAX);
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < task.vert_count; i += stride)
+    {
+        glm::vec3 pos = scene_transform_one_vertex(task, i, dst_vertices, vertices_start + i);
+        local_min = glm::min(local_min, pos);
+        local_max = glm::max(local_max, pos);
+    }
+    scene_reduce_block_aabb(local_min, local_max, d_aabb_i);
+}
+
+__global__ void scene_transform_vertices_batched_kernel(
+    const MeshTransformTask* tasks,
+    uint32_t num_tasks,
+    uint32_t total_vertices,
+    soa::soa_view<Vertex> dst_vertices,
+    uint32_t vertices_start,
+    int32_t* d_aabb_i)
+{
+    glm::vec3 local_min(FLT_MAX);
+    glm::vec3 local_max(-FLT_MAX);
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total_vertices; i += stride)
+    {
+        uint32_t t = scene_find_vert_task(tasks, num_tasks, i);
+        const MeshTransformTask& task = tasks[t];
+        uint32_t local_idx = i - task.dst_vert_offset;
+        glm::vec3 pos = scene_transform_one_vertex(task, local_idx, dst_vertices, vertices_start + i);
+        local_min = glm::min(local_min, pos);
+        local_max = glm::max(local_max, pos);
+    }
+    scene_reduce_block_aabb(local_min, local_max, d_aabb_i);
+}
+
+__global__ void scene_offset_triangles_single_kernel(
+    MeshTransformTask task,
+    uint32_t vertices_start,
+    soa::soa_view<Triangle> dst_triangles)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= task.tri_count) return;
+    Triangle src = task.src_triangles[i];
+    Triangle dst{};
+    dst.type = PrimitiveType::Triangle;
+    dst.material_id = src.material_id;
+    dst.v0 = src.v0 + vertices_start;
+    dst.v1 = src.v1 + vertices_start;
+    dst.v2 = src.v2 + vertices_start;
+    dst_triangles[i] = dst;
+}
+
+__global__ void scene_offset_triangles_batched_kernel(
+    const MeshTransformTask* tasks,
+    uint32_t num_tasks,
+    uint32_t total_triangles,
+    uint32_t vertices_start,
+    soa::soa_view<Triangle> dst_triangles)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_triangles) return;
+    uint32_t t = scene_find_tri_task(tasks, num_tasks, i);
+    const MeshTransformTask& task = tasks[t];
+    uint32_t local_idx = i - task.dst_tri_offset;
+    uint32_t vert_base = vertices_start + task.dst_vert_offset;
+    Triangle src = task.src_triangles[local_idx];
+    Triangle dst{};
+    dst.type = PrimitiveType::Triangle;
+    dst.material_id = src.material_id;
+    dst.v0 = src.v0 + vert_base;
+    dst.v1 = src.v1 + vert_base;
+    dst.v2 = src.v2 + vert_base;
+    dst_triangles[i] = dst;
+}
+
+template <PrimitiveType PType>
+__global__ void scene_direct_pack_single_kernel(
+    MeshTransformTask task,
+    uint32_t vertices_start,
+    soa::soa_view<Vertex> vertices,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= task.tri_count) return;
+    Triangle src = task.src_triangles[i];
+    scene_store_packed_primitive<PType>(src, vertices_start, i, vertices, dst_primitives, primitives_start);
+}
+
+template <PrimitiveType PType>
+__global__ void scene_direct_pack_batched_kernel(
+    const MeshTransformTask* tasks,
+    uint32_t num_tasks,
+    uint32_t total_triangles,
+    uint32_t vertices_start,
+    soa::soa_view<Vertex> vertices,
+    soa::soa_view<PrimitiveChunk16> dst_primitives,
+    uint32_t primitives_start)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_triangles) return;
+    uint32_t t = scene_find_tri_task(tasks, num_tasks, i);
+    const MeshTransformTask& task = tasks[t];
+    uint32_t local_idx = i - task.dst_tri_offset;
+    Triangle src = task.src_triangles[local_idx];
+    scene_store_packed_primitive<PType>(
+        src,
+        vertices_start + task.dst_vert_offset,
+        i,
+        vertices,
+        dst_primitives,
+        primitives_start);
+}
+
+template<range_of<std::pair<glm::mat4, Mesh&>> Range>
+void Scene::prepare_and_pack_space(
+    uint32_t space_id,
+    Range&& meshes,
+    ASType type,
+    bool swap_yz,
+    bool stretch,
+    bool do_sort,
+    PrimitiveType triangle_type)
+{
+    glm::mat4 S_yz(1.0f);
+    S_yz[1][1] = 0.0f;  S_yz[1][2] = 1.0f;
+    S_yz[2][1] = -1.0f; S_yz[2][2] = 0.0f;
+
+    std::vector<MeshTransformTask> tasks;
+    uint32_t total_vertices = 0;
+    uint32_t total_triangles = 0;
+
+    for (auto& [transform, mesh] : meshes)
+    {
+        const uint32_t v_cnt = static_cast<uint32_t>(mesh.d_vertices.size());
+        const uint32_t t_cnt = static_cast<uint32_t>(mesh.d_triangles.size());
+        if (v_cnt == 0)
+            continue;
+
+        const glm::mat4 M = swap_yz ? (S_yz * transform) : transform;
+        const glm::mat3 upper(M);
+        const float det = glm::determinant(upper);
+        const glm::mat3 normal_matrix = (std::fabs(det) > 1e-18f)
+            ? glm::transpose(glm::inverse(upper))
+            : upper;
+
+        MeshTransformTask task{};
+        task.src_vertices = mesh.d_vertices;
+        task.src_triangles = mesh.d_triangles;
+        task.transform = M;
+        task.normal_matrix = normal_matrix;
+        task.dst_vert_offset = total_vertices;
+        task.dst_tri_offset = total_triangles;
+        task.vert_count = v_cnt;
+        task.tri_count = t_cnt;
+        tasks.push_back(task);
+
+        total_vertices += v_cnt;
+        total_triangles += t_cnt;
+    }
+
+    spaces[space_id].as_type = type;
+    if (total_vertices == 0)
+    {
+        spaces[space_id].vertices_start = 0;
+        spaces[space_id].vertices_size = 0;
+        spaces[space_id].primitives_start = 0;
+        spaces[space_id].primitives_size = 0;
+        spaces[space_id].has_nagata = false;
+        return;
+    }
+
+    const uint32_t vertices_start = static_cast<uint32_t>(geometry_context.vertices.alloc(total_vertices));
+    spaces[space_id].vertices_start = vertices_start;
+    spaces[space_id].vertices_size = total_vertices;
+
+    if (m_d_aabb_scratch == nullptr)
+    {
+        CUDA_CHECK(cudaMalloc(&m_d_aabb_scratch, 6 * sizeof(int32_t)));
+    }
+    const int32_t init_aabb_i[6] = { INT32_MAX, INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN, INT32_MIN };
+    CUDA_CHECK(cudaMemcpy(m_d_aabb_scratch, init_aabb_i, sizeof(init_aabb_i), cudaMemcpyHostToDevice));
+
+    thrust::device_vector<MeshTransformTask> d_tasks;
+    const uint32_t vert_blocks = std::min((total_vertices + 255u) / 256u, 2048u);
+    if (tasks.size() == 1)
+    {
+        scene_transform_vertices_single_kernel<<<vert_blocks, 256>>>(
+            tasks[0],
+            geometry_context.vertices.view(),
+            vertices_start,
+            m_d_aabb_scratch);
+    }
+    else
+    {
+        d_tasks = tasks;
+        scene_transform_vertices_batched_kernel<<<vert_blocks, 256>>>(
+            thrust::raw_pointer_cast(d_tasks.data()),
+            static_cast<uint32_t>(tasks.size()),
+            total_vertices,
+            geometry_context.vertices.view(),
+            vertices_start,
+            m_d_aabb_scratch);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    int32_t h_aabb_i[6];
+    CUDA_CHECK(cudaMemcpy(h_aabb_i, m_d_aabb_scratch, sizeof(h_aabb_i), cudaMemcpyDeviceToHost));
+    const glm::vec3 aabb_min(
+        scene_ordered_int_to_float(h_aabb_i[0]),
+        scene_ordered_int_to_float(h_aabb_i[1]),
+        scene_ordered_int_to_float(h_aabb_i[2]));
+    const glm::vec3 aabb_max(
+        scene_ordered_int_to_float(h_aabb_i[3]),
+        scene_ordered_int_to_float(h_aabb_i[4]),
+        scene_ordered_int_to_float(h_aabb_i[5]));
+
+    normalize_space(space_id, aabb_min, aabb_max, stretch);
+
+    if (total_triangles == 0)
+    {
+        spaces[space_id].primitives_start = 0;
+        spaces[space_id].primitives_size = 0;
+        spaces[space_id].has_nagata = false;
+        return;
+    }
+
+    const uint32_t tri_blocks = (total_triangles + 255u) / 256u;
+    if (!do_sort)
+    {
+        spaces[space_id].has_nagata = (triangle_type == PrimitiveType::NagataPatch);
+
+        uint32_t slots_per_prim = Triangle::occupied_slots;
+        if (triangle_type == PrimitiveType::FullTriangle)
+            slots_per_prim = InlinedTriangle::occupied_slots;
+        else if (triangle_type == PrimitiveType::NagataPatch)
+            slots_per_prim = NagataPatchPrimitive::occupied_slots;
+
+        const uint32_t primitives_size = total_triangles * slots_per_prim;
+        const uint32_t primitives_start = static_cast<uint32_t>(geometry_context.primitives.alloc(primitives_size));
+        spaces[space_id].primitives_start = primitives_start;
+        spaces[space_id].primitives_size = primitives_size;
+
+        auto launch_direct_pack = [&]<PrimitiveType PType>()
+        {
+            if (tasks.size() == 1)
+            {
+                scene_direct_pack_single_kernel<PType><<<tri_blocks, 256>>>(
+                    tasks[0],
+                    vertices_start,
+                    geometry_context.vertices.view(),
+                    geometry_context.primitives.view(),
+                    primitives_start);
+            }
+            else
+            {
+                scene_direct_pack_batched_kernel<PType><<<tri_blocks, 256>>>(
+                    thrust::raw_pointer_cast(d_tasks.data()),
+                    static_cast<uint32_t>(tasks.size()),
+                    total_triangles,
+                    vertices_start,
+                    geometry_context.vertices.view(),
+                    geometry_context.primitives.view(),
+                    primitives_start);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        };
+
+        if (triangle_type == PrimitiveType::FullTriangle)
+        {
+            launch_direct_pack.template operator()<PrimitiveType::FullTriangle>();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            if (spaces[space_id].vertices_size > 0)
+            {
+                geometry_context.vertices.free(spaces[space_id].vertices_start);
+                spaces[space_id].vertices_start = 0;
+                spaces[space_id].vertices_size = 0;
+            }
+        }
+        else if (triangle_type == PrimitiveType::NagataPatch)
+        {
+            launch_direct_pack.template operator()<PrimitiveType::NagataPatch>();
+            if (tasks.size() > 1)
+                CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        else
+        {
+            launch_direct_pack.template operator()<PrimitiveType::Triangle>();
+            if (tasks.size() > 1)
+                CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+    else
+    {
+        soa::cuda_device_vector<Triangle> d_temp_triangles(total_triangles);
+        if (tasks.size() == 1)
+        {
+            scene_offset_triangles_single_kernel<<<tri_blocks, 256>>>(
+                tasks[0],
+                vertices_start,
+                d_temp_triangles.view());
+        }
+        else
+        {
+            scene_offset_triangles_batched_kernel<<<tri_blocks, 256>>>(
+                thrust::raw_pointer_cast(d_tasks.data()),
+                static_cast<uint32_t>(tasks.size()),
+                total_triangles,
+                vertices_start,
+                d_temp_triangles.view());
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        sort_space(space_id, d_temp_triangles);
+        pack_primitives(space_id, d_temp_triangles, total_triangles, triangle_type);
+    }
+}
+
+template<range_of<std::pair<glm::mat4, Mesh&>> Range>
+uint32_t Scene::build_as_into_space(uint32_t space_id, Range&& meshes, ASType type)
+{
+    if (type != ASType::Octree &&
+        type != ASType::Optix &&
+        type != ASType::UniformGrid &&
+        type != ASType::KDTree &&
+        type != ASType::BVH)
+    {
+        return space_id;
+    }
+
+    const bool stretch = (type == ASType::Octree) ? as_octree.config.stretch : false;
+    const bool do_sort = (type == ASType::Optix) ? false : config.sort_space;
+    const PrimitiveType prim_type = (type == ASType::Optix) ? PrimitiveType::Triangle : config.triangle_type;
+
+    prepare_and_pack_space(space_id, meshes, type, config.swapYZ, stretch, do_sort, prim_type);
+
+    switch (type)
+    {
+    case ASType::Octree:
+        as_octree.build(space_id, spaces[space_id], prim_type);
+        break;
+    case ASType::Optix:
+        as_optix.build(space_id, spaces[space_id]);
+        break;
+    case ASType::UniformGrid:
+        as_uniform_grid.build(space_id, spaces[space_id], prim_type);
+        break;
+    case ASType::KDTree:
+        as_kdtree.build(space_id, spaces[space_id], prim_type);
+        break;
+    case ASType::BVH:
+        as_bvh.build(space_id, spaces[space_id], prim_type);
+        break;
+    default:
+        break;
+    }
+
+    geometry_context.d_spaces = spaces;
+    return space_id;
+}
+
 uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc>& instances)
 {
     std::vector<MeshInstanceDesc> valid_instances;
     valid_instances.reserve(instances.size());
     for (const auto& desc : instances)
     {
-        if (desc.mesh != nullptr && !desc.mesh->triangles.empty() && !desc.mesh->vertices.empty())
+        if (desc.mesh != nullptr && !desc.mesh->d_triangles.empty() && !desc.mesh->d_vertices.empty())
         {
             valid_instances.push_back(desc);
         }
@@ -1747,7 +2522,7 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
         return UINT32_MAX;
 
     const bool rebuild_blas = as_heterogeneous.config.rebuild_blas;
-    const bool swap_yz = as_heterogeneous.config.swapYZ;
+    const bool swap_yz = config.swapYZ;
 
     glm::mat4 S_yz(1.0f);
     S_yz[1][1] = 0.0f;  S_yz[1][2] = 1.0f;
@@ -1785,16 +2560,19 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
                 ? desc.mesh_node_id
                 : find_mesh_node_id(m_meshes, m_mesh_node_ids, desc.mesh);
 
-            for (const auto& v : desc.mesh->vertices)
+            if (swap_yz)
             {
-                glm::vec3 lv = v.position;
-                if (swap_yz)
-                {
-                    std::swap(lv.y, lv.z);
-                    lv.y = -lv.y;
-                }
-                entry.local_bounds_min = glm::min(entry.local_bounds_min, lv);
-                entry.local_bounds_max = glm::max(entry.local_bounds_max, lv);
+                transform_aabb(
+                    desc.mesh->local_bounds_min,
+                    desc.mesh->local_bounds_max,
+                    S_yz,
+                    entry.local_bounds_min,
+                    entry.local_bounds_max);
+            }
+            else
+            {
+                entry.local_bounds_min = desc.mesh->local_bounds_min;
+                entry.local_bounds_max = desc.mesh->local_bounds_max;
             }
             unique_meshes.push_back(std::move(entry));
         }
@@ -1807,19 +2585,10 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
         inst_unique_idx[i] = u_idx;
         unique_meshes[u_idx].instance_count += 1;
 
-        glm::vec3 inst_min(std::numeric_limits<float>::infinity());
-        glm::vec3 inst_max(-std::numeric_limits<float>::infinity());
-        for (const auto& v : desc.mesh->vertices)
-        {
-            glm::vec3 p = glm::vec3(desc.transform * glm::vec4(v.position, 1.0f));
-            if (swap_yz)
-            {
-                std::swap(p.y, p.z);
-                p.y = -p.y;
-            }
-            inst_min = glm::min(inst_min, p);
-            inst_max = glm::max(inst_max, p);
-        }
+        const glm::mat4 inst_M = swap_yz ? (S_yz * desc.transform) : desc.transform;
+        glm::vec3 inst_min;
+        glm::vec3 inst_max;
+        transform_aabb(desc.mesh->local_bounds_min, desc.mesh->local_bounds_max, inst_M, inst_min, inst_max);
         inst_swapped_mins[i] = inst_min;
         inst_swapped_maxs[i] = inst_max;
         scene_aabb_min = glm::min(scene_aabb_min, inst_min);
@@ -1859,8 +2628,8 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
             MeshBuildRecord rec = as_heterogeneous.make_existing_blas_record(
                 reused_blas_space_id,
                 spaces[reused_blas_space_id],
-                static_cast<uint32_t>(u.mesh->triangles.size()),
-                static_cast<uint32_t>(u.mesh->vertices.size()),
+                static_cast<uint32_t>(u.mesh->d_triangles.size()),
+                static_cast<uint32_t>(u.mesh->d_vertices.size()),
                 u.mesh->name,
                 u.mesh_node_id,
                 u.instance_count,
@@ -1876,27 +2645,27 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
         u.blas_space_id = blas_space_id;
 
         std::pair<glm::mat4, Mesh&> single_mesh[1] = {{glm::mat4(1.0f), *u.mesh}};
-        size_t tris = 0;
-        soa::cuda_device_vector<Triangle> d_temp_triangles;
-        prepare_space_geometry(blas_space_id, single_mesh, ASType::None, swap_yz, d_temp_triangles, tris);
-        normalize_space(blas_space_id, false, false);
-        if (as_heterogeneous.config.sort_space)
-        {
-            sort_space(blas_space_id, d_temp_triangles);
-        }
-        pack_primitives(blas_space_id, d_temp_triangles, static_cast<uint32_t>(tris), as_heterogeneous.config.triangle_type);
+        prepare_and_pack_space(
+            blas_space_id,
+            single_mesh,
+            ASType::None,
+            swap_yz,
+            false,
+            config.sort_space,
+            config.triangle_type);
         geometry_context.d_spaces = spaces;
 
         MeshBuildRecord rec = as_heterogeneous.evaluate_and_build_blas(
             blas_space_id,
             spaces[blas_space_id],
-            static_cast<uint32_t>(u.mesh->triangles.size()),
-            static_cast<uint32_t>(u.mesh->vertices.size()),
+            static_cast<uint32_t>(u.mesh->d_triangles.size()),
+            static_cast<uint32_t>(u.mesh->d_vertices.size()),
             u.mesh->name,
             u.mesh_node_id,
             u.instance_count,
             u.local_bounds_min,
-            u.local_bounds_max);
+            u.local_bounds_max,
+            config.triangle_type);
         geometry_context.d_spaces = spaces;
         const auto mesh_t1 = std::chrono::high_resolution_clock::now();
         const double mesh_total_ms = std::chrono::duration<double, std::milli>(mesh_t1 - mesh_t0).count();

@@ -300,7 +300,7 @@ glm::vec4 KDTreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
     if (p.root_box < 0)
         return miss_shader(source, direction, p);
 
-    constexpr int max_iterations = 500;
+    constexpr int max_iterations = 2000;
 
     int box_hits = 0;
     glm::vec4 hit_primitive_color{0};

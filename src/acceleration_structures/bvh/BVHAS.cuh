@@ -61,7 +61,7 @@ public:
     void info_ui(uint32_t space_id, Space space);
     void register_containers(ContainerExplorer& explorer);
 
-    void build(uint32_t space_id, Space space);
+    void build(uint32_t space_id, Space space, PrimitiveType primitive_type = PrimitiveType::Triangle);
     void free_space(uint32_t space_id, Space space);
 
     void build_gpu(uint32_t space_id, Space space, uint32_t number_of_triangles, uint32_t occupied_slots);
@@ -75,10 +75,7 @@ public:
         float traversal_cost = 1.0f;
         float intersection_cost = 1.5f;
         bool use_gpu = true;
-        bool swapYZ = true;
-        bool sort_space = false;
         bool use_bvh16 = true;
-        PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 
     Config config;

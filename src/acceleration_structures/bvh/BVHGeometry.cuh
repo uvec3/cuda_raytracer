@@ -641,7 +641,7 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
     if (p.root_box < 0)
         return miss_shader(source, direction, p);
 
-    int max_iterations = p.max_iterations;
+    int max_iterations = 2000;
 
     int box_hits = 0;
     glm::vec4 hit_primitive_color{0};

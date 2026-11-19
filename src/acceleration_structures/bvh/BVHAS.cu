@@ -841,23 +841,7 @@ void BVHAS::config_ui()
     }
 
     ImGui::Checkbox("Build on GPU", &config.use_gpu);
-    ImGui::Checkbox("Swap y and z", &config.swapYZ);
-    ImGui::Checkbox("Sort space", &config.sort_space);
     ImGui::Checkbox("Use 16B quantized nodes (BVH16)", &config.use_bvh16);
-
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
-    int tri_type_idx = 0;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
-        tri_type_idx = 1;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
-        tri_type_idx = 2;
-
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
-    {
-        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
-        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
-        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
-    }
 }
 
 void BVHAS::info_ui(uint32_t space_id, Space space)
@@ -1462,17 +1446,17 @@ void BVHAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_tri
     finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
 }
 
-void BVHAS::build(uint32_t space_id, Space space)
+void BVHAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)
 {
     assert(m_geometry_context != nullptr);
     auto t0 = std::chrono::high_resolution_clock::now();
 
     uint32_t occupied_slots = Triangle::occupied_slots;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
+    if (primitive_type == PrimitiveType::FullTriangle)
         occupied_slots = InlinedTriangle::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
+    else if (primitive_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
         occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;

@@ -194,11 +194,6 @@ bool RaytracerController::ensure_scene_loaded(int scene_index)
 
     s.explorer->register_container("scene.textures", s.scene->m_textures);
     s.explorer->register_container("scene.meshes", s.scene->m_meshes);
-    for (auto& mesh : s.scene->m_meshes)
-    {
-        s.explorer->register_container(mesh.name + ".triangles", mesh.triangles);
-        s.explorer->register_container(mesh.name + ".vertices", mesh.vertices);
-    }
 
     return true;
 }
@@ -843,8 +838,8 @@ void RaytracerController::ui_node_inspector()
     {
         auto& mesh = active_scene.m_meshes[node.meshId - 1];
         ImGui::Text("Direct Mesh: %s", mesh.name.c_str());
-        ImGui::Text("  Triangles: %u", (uint32_t)mesh.triangles.size());
-        ImGui::Text("  Vertices:  %u", (uint32_t)mesh.vertices.size());
+        ImGui::Text("  Triangles: %u", (uint32_t)mesh.d_triangles.size());
+        ImGui::Text("  Vertices:  %u", (uint32_t)mesh.d_vertices.size());
     }
     else
     {
@@ -925,6 +920,8 @@ void RaytracerController::ui_node_inspector()
         build_as();
     }
     ImGui::EndDisabled();
+
+    active_scene.config_ui();
 
     if (selected_as_type == 0)
     {

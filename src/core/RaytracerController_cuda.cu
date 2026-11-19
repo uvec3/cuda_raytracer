@@ -48,6 +48,7 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::Checkbox("Show time",&p.measure_time);
         ImGui::Checkbox("Show iterations",&p.show_iterations);
         ImGui::Checkbox("Show triangles",&p.show_triangles);
+        ImGui::Checkbox("Show BLAS",&p.show_blas_bounding_box);
         ImGui::Checkbox("Show boxes",&p.show_boxes);
         ImGui::InputInt("Time max",&p.time_max);
         ImGui::DragFloat("Iterations max",&p.iterations_max,1.0f,1.0f,10000.0f);

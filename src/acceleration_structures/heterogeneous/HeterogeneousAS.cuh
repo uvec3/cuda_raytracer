@@ -93,9 +93,6 @@ public:
         float max_memory_bytes_per_triangle = 64.0f;
         int num_probe_rays = 16384;
         uint32_t random_seed = 1337u;
-        bool swapYZ = true;
-        bool sort_space = false;
-        PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 
     Config config;
@@ -147,7 +144,8 @@ public:
         uint32_t mesh_node_id,
         uint32_t instance_count,
         glm::vec3 local_bounds_min,
-        glm::vec3 local_bounds_max);
+        glm::vec3 local_bounds_max,
+        PrimitiveType primitive_type = PrimitiveType::Triangle);
 
     MeshBuildRecord make_existing_blas_record(
         uint32_t blas_space_id,
@@ -231,7 +229,7 @@ private:
 
     void apply_variant_config(const ASConfigVariant& variant);
     ASType configure_tlas_builder(ASType requested_type);
-    void build_single_as(ASType as_type, uint32_t space_id, Space space);
+    void build_single_as(ASType as_type, uint32_t space_id, Space space, PrimitiveType primitive_type);
     void free_single_as_only(ASType as_type, uint32_t space_id, Space space);
     void free_tlas_inner_as(uint32_t space_id, Space space, ASType tlas_as_type, int32_t tlas_root_box);
     float benchmark_candidate_gpu(

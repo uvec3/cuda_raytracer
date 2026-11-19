@@ -32,6 +32,7 @@ struct RenderParameters
     bool measure_time = false;
     bool show_triangles = true;
     bool show_boxes = false;
+    bool show_blas_bounding_box;
     int time_max = 50000;
     float iterations_max = 100.0f;
     float boxes_max = 10.0f;

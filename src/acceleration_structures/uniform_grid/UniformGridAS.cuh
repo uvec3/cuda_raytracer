@@ -48,11 +48,12 @@ public:
     void info_ui(uint32_t space_id, Space space);
     void register_containers(ContainerExplorer& explorer);
 
-    void build(uint32_t space_id, Space space);
+    void build(uint32_t space_id, Space space, PrimitiveType primitive_type = PrimitiveType::Triangle);
     void free_space(uint32_t space_id, Space space);
 
     void insert_triangles(uint32_t space_id, Space space, glm::uvec3 dims, float cell_size,
-                          uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots);
+                          uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
+                          PrimitiveType primitive_type);
     void insert_triangles_gpu(uint32_t space_id, Space space, glm::uvec3 dims, float cell_size,
                               uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
                               auto find_triangle_cube_relation);
@@ -78,9 +79,6 @@ public:
     struct Config
     {
         float voxels_per_triangle = 4.0f;
-        bool swapYZ = true;
-        bool sort_space = false;
-        PrimitiveType triangle_type = PrimitiveType::Triangle;
     };
 
     Config config;

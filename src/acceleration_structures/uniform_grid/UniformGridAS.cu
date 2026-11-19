@@ -233,23 +233,6 @@ void UniformGridAS::config_ui()
     ImGui::DragFloat("Voxels per triangle", &config.voxels_per_triangle, 0.05f, 0.01f, 64.0f, "%.2f");
     if (config.voxels_per_triangle < 0.01f)
         config.voxels_per_triangle = 0.01f;
-
-    ImGui::Checkbox("Swap y and z", &config.swapYZ);
-    ImGui::Checkbox("Sort space", &config.sort_space);
-
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
-    int tri_type_idx = 0;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
-        tri_type_idx = 1;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
-        tri_type_idx = 2;
-
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
-    {
-        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
-        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
-        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
-    }
 }
 
 void UniformGridAS::info_ui(uint32_t space_id, Space space)
@@ -424,15 +407,16 @@ void UniformGridAS::insert_triangles(
     float cell_size,
     uint32_t primitives_start,
     uint32_t number_of_triangles,
-    uint32_t occupied_slots)
+    uint32_t occupied_slots,
+    PrimitiveType primitive_type)
 {
-    if (config.triangle_type == PrimitiveType::NagataPatch)
+    if (primitive_type == PrimitiveType::NagataPatch)
     {
         insert_triangles_gpu(
             space_id, space, dims, cell_size, primitives_start, number_of_triangles, occupied_slots,
             FindCubeIntersection<PrimitiveApproximation::Nagata>{});
     }
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
     {
         insert_triangles_gpu(
             space_id, space, dims, cell_size, primitives_start, number_of_triangles, occupied_slots,
@@ -564,17 +548,17 @@ UniformGridAS::AdaptiveGridLayout UniformGridAS::compute_grid_dimensions(
     return AdaptiveGridLayout{.dims = dims, .cell_size = cell_size};
 }
 
-void UniformGridAS::build(uint32_t space_id, Space space)
+void UniformGridAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)
 {
     assert(m_geometry_context != nullptr);
     auto t0 = std::chrono::high_resolution_clock::now();
 
     uint32_t occupied_slots = Triangle::occupied_slots;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
+    if (primitive_type == PrimitiveType::FullTriangle)
         occupied_slots = InlinedTriangle::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
+    else if (primitive_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
         occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;
@@ -601,7 +585,7 @@ void UniformGridAS::build(uint32_t space_id, Space space)
 
     const AdaptiveGridLayout layout = compute_grid_dimensions(aabb_max, number_of_triangles, config.voxels_per_triangle);
 
-    insert_triangles(space_id, space, layout.dims, layout.cell_size, space.primitives_start, number_of_triangles, occupied_slots);
+    insert_triangles(space_id, space, layout.dims, layout.cell_size, space.primitives_start, number_of_triangles, occupied_slots, primitive_type);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();

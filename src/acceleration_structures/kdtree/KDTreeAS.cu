@@ -388,6 +388,7 @@ namespace kdtree_detail
         float intersection_cost,
         const uint32_t* entry_bins, // [3 * SAH_BINS]
         const uint32_t* exit_bins,  // [3 * SAH_BINS]
+        bool is_subspace,
         uint32_t& out_axis,
         float& out_split_pos)
     {
@@ -407,6 +408,7 @@ namespace kdtree_detail
         if (node_pmin.x <= node_pmax.x)
         {
             const float min_margin = fmaxf(0.004f * root_max_ext, 1e-4f);
+            const float empty_frac = is_subspace ? 0.02f : 0.15f;
             for (int a = 0; a < 3; ++a)
             {
                 if (ext[a] < 1e-5f)
@@ -415,7 +417,7 @@ namespace kdtree_detail
                 const float cut_eps = ext[a] * 5e-4f + 2e-5f;
                 const float margin_lo = node_pmin[a] - bmin[a];
                 const float pos_lo = node_pmin[a] - cut_eps;
-                if (margin_lo > 0.15f * ext[a] && margin_lo > min_margin &&
+                if (margin_lo > empty_frac * ext[a] && margin_lo > min_margin &&
                     pos_lo > bmin[a] + 1e-6f && pos_lo < bmax[a] - 1e-6f &&
                     margin_lo > best_empty_margin)
                 {
@@ -426,7 +428,7 @@ namespace kdtree_detail
 
                 const float margin_hi = bmax[a] - node_pmax[a];
                 const float pos_hi = node_pmax[a] + cut_eps;
-                if (margin_hi > 0.15f * ext[a] && margin_hi > min_margin &&
+                if (margin_hi > empty_frac * ext[a] && margin_hi > min_margin &&
                     pos_hi > bmin[a] + 1e-6f && pos_hi < bmax[a] - 1e-6f &&
                     margin_hi > best_empty_margin)
                 {
@@ -445,7 +447,9 @@ namespace kdtree_detail
             }
         }
 
-        const bool is_thick_3d_box = (min_ext > 0.035f * root_max_ext);
+        // Only split thick 3D leaves for 2D triangles (where splitting exposes empty half-spaces);
+        // solid 3D SubspacePrimitive AABBs already fill their trimmed leaf box.
+        const bool is_thick_3d_box = !is_subspace && (min_ext > 0.035f * root_max_ext);
         if (N <= static_cast<uint32_t>(max_leaf_primitives) && !is_thick_3d_box)
             return false;
 
@@ -581,6 +585,7 @@ namespace kdtree_detail
         int max_leaf_primitives = 8;
         float traversal_cost = 1.0f;
         float intersection_cost = 1.5f;
+        bool is_subspace = false;
         std::vector<KDNode>* nodes = nullptr;
         std::vector<std::pair<uint32_t, uint32_t>>* leaf_pairs = nullptr;
         uint32_t total_leaves = 0;
@@ -643,6 +648,7 @@ namespace kdtree_detail
             ctx.split_mode, ctx.max_depth, ctx.max_leaf_primitives,
             ctx.traversal_cost, ctx.intersection_cost,
             entry_bins, exit_bins,
+            ctx.is_subspace,
             split_axis, split_pos);
 
         if (!should_split)
@@ -800,6 +806,7 @@ __global__ void decide_kdtree_splits_kernel(
     const uint32_t* node_counts,
     const uint32_t* entry_bins,
     const uint32_t* exit_bins,
+    bool is_subspace,
     uint8_t* is_split,
     uint32_t* split_axis,
     float* split_pos)
@@ -828,6 +835,7 @@ __global__ void decide_kdtree_splits_kernel(
         intersection_cost,
         node_entry,
         node_exit,
+        is_subspace,
         axis,
         pos);
 
@@ -1064,22 +1072,6 @@ void KDTreeAS::config_ui()
     }
 
     ImGui::Checkbox("Build on GPU", &config.use_gpu);
-    ImGui::Checkbox("Swap y and z", &config.swapYZ);
-    ImGui::Checkbox("Sort space", &config.sort_space);
-
-    const char* tri_type_names[] = {"Triangle (16B Indexed)", "FullTriangle (64B Inline)", "NagataPatch (96B Inline Curved)"};
-    int tri_type_idx = 0;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
-        tri_type_idx = 1;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
-        tri_type_idx = 2;
-
-    if (ImGui::Combo("Triangle storage type", &tri_type_idx, tri_type_names, 3))
-    {
-        if (tri_type_idx == 0) config.triangle_type = PrimitiveType::Triangle;
-        else if (tri_type_idx == 1) config.triangle_type = PrimitiveType::FullTriangle;
-        else if (tri_type_idx == 2) config.triangle_type = PrimitiveType::NagataPatch;
-    }
 }
 
 void KDTreeAS::info_ui(uint32_t space_id, Space space)
@@ -1199,7 +1191,7 @@ void KDTreeAS::finalize_tree_pools(
     sync_to_device();
 }
 
-void KDTreeAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots)
+void KDTreeAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots, bool is_subspace)
 {
     if (number_of_triangles == 0)
         return;
@@ -1319,6 +1311,7 @@ void KDTreeAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_
             d_node_counts.data().get(),
             d_entry_bins.empty() ? nullptr : d_entry_bins.data().get(),
             d_exit_bins.empty() ? nullptr : d_exit_bins.data().get(),
+            is_subspace,
             d_is_split.data().get(),
             d_split_axis.data().get(),
             d_split_pos.data().get());
@@ -1515,7 +1508,7 @@ void KDTreeAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_
     finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, total_leaves);
 }
 
-void KDTreeAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots)
+void KDTreeAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots, bool is_subspace)
 {
     if (number_of_triangles == 0)
         return;
@@ -1570,6 +1563,7 @@ void KDTreeAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_
         .max_leaf_primitives = std::max(config.max_leaf_primitives, 1),
         .traversal_cost = config.traversal_cost,
         .intersection_cost = config.intersection_cost,
+        .is_subspace = is_subspace,
         .nodes = &host_nodes,
         .leaf_pairs = &leaf_pairs,
         .total_leaves = 0
@@ -1579,30 +1573,31 @@ void KDTreeAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_
     finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
 }
 
-void KDTreeAS::build(uint32_t space_id, Space space)
+void KDTreeAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)
 {
     assert(m_geometry_context != nullptr);
     auto t0 = std::chrono::high_resolution_clock::now();
 
     uint32_t occupied_slots = Triangle::occupied_slots;
-    if (config.triangle_type == PrimitiveType::FullTriangle)
+    if (primitive_type == PrimitiveType::FullTriangle)
         occupied_slots = InlinedTriangle::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::NagataPatch)
+    else if (primitive_type == PrimitiveType::NagataPatch)
         occupied_slots = NagataPatchPrimitive::occupied_slots;
-    else if (config.triangle_type == PrimitiveType::Subspace)
+    else if (primitive_type == PrimitiveType::Subspace)
         occupied_slots = SubspacePrimitive::occupied_slots;
 
     const uint32_t number_of_triangles = space.primitives_size / occupied_slots;
     if (number_of_triangles == 0)
         return;
 
+    const bool is_subspace = (primitive_type == PrimitiveType::Subspace);
     if (config.use_gpu)
     {
-        build_gpu(space_id, space, number_of_triangles, occupied_slots);
+        build_gpu(space_id, space, number_of_triangles, occupied_slots, is_subspace);
     }
     else
     {
-        build_cpu(space_id, space, number_of_triangles, occupied_slots);
+        build_cpu(space_id, space, number_of_triangles, occupied_slots, is_subspace);
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();

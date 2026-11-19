@@ -106,12 +106,6 @@ inline glm::vec3 side(glm::vec3 p, glm::vec3 dir,glm::vec3 boxCenter, float boxS
 }
 
 
-__device__ __host__ inline
-void slab(glm::vec3 ray_src, glm::vec3 ray_dir, glm::vec3 b_min, glm::vec3 b_max)
-{
-
-}
-
 __device__ __host__
 inline glm::vec3 ray_triangle_intersection(glm::vec3 pos, glm::vec3 dir, glm::vec3 triangle[3])
 {

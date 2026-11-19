@@ -268,7 +268,7 @@ template <bool HasNagata, typename RenderParams>
 __host__ __device__ inline
 glm::vec4 OctreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, glm::vec3 direction) const
 {
-    static constexpr int max_iterations=500;
+    static constexpr int max_iterations=2000;
     //counts how many boxes were hit on the way
     int box_hits=0;
     //records triangles
