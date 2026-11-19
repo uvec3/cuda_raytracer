@@ -285,7 +285,6 @@ void UniformGridAS::free_space(uint32_t space_id, Space space)
     {
         box_content.free(space.box_content_start);
     }
-    sync_to_device();
 }
 
 void UniformGridAS::insert_triangles_gpu(
@@ -389,10 +388,11 @@ void UniformGridAS::insert_triangles_gpu(
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+    if (d_grids.size() < grids.size()) d_grids.resize(grids.size());
     if (d_as.size() < as.size()) d_as.resize(as.size());
     if (d_box_content.size() < box_content.size()) d_box_content.resize(box_content.size());
 
-    d_grids = grids;
+    d_grids.range(grid_id, 1) = grids.range(grid_id, 1);
     d_as.range(as_start) = d_local_as;
     d_box_content.range(bc_start) = d_local_bc;
 
@@ -588,5 +588,105 @@ void UniformGridAS::build(uint32_t space_id, Space space, PrimitiveType primitiv
     insert_triangles(space_id, space, layout.dims, layout.cell_size, space.primitives_start, number_of_triangles, occupied_slots, primitive_type);
 
     auto t1 = std::chrono::high_resolution_clock::now();
+    m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+void UniformGridAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces)
+{
+    if (subspaces.empty())
+        return;
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const uint32_t count = static_cast<uint32_t>(subspaces.size());
+
+    glm::vec3 aabb_max(0.0f);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        aabb_max = glm::max(aabb_max, glm::max(subspaces[i].bounds_min, subspaces[i].bounds_max));
+    }
+
+    const AdaptiveGridLayout layout = compute_grid_dimensions(aabb_max, count, config.voxels_per_triangle);
+    const glm::uvec3 dims = layout.dims;
+    const float cell_size = layout.cell_size;
+    const float half_size = 0.5f * cell_size;
+    const float eps = 0.5f * cell_size * 1e-4f + 1e-6f;
+    const glm::ivec3 max_cell = glm::ivec3(dims) - 1;
+    const uint32_t total_cells = dims.x * dims.y * dims.z;
+
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    pairs.reserve(count * 8u);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const glm::vec3 v0 = subspaces[i].bounds_min;
+        const glm::vec3 v1 = subspaces[i].bounds_max;
+        const glm::vec3 v2 = 0.5f * (v0 + v1);
+        const glm::vec3 tri_min = glm::min(v0, v1);
+        const glm::vec3 tri_max = glm::max(v0, v1);
+        const uint32_t slot_id = space.primitives_start + i * SubspacePrimitive::occupied_slots;
+
+        const glm::ivec3 c_min = glm::clamp(glm::ivec3(glm::floor((tri_min - eps) / cell_size)), glm::ivec3(0), max_cell);
+        const glm::ivec3 c_max = glm::clamp(glm::ivec3(glm::floor((tri_max + eps) / cell_size)), glm::ivec3(0), max_cell);
+
+        for (int iz = c_min.z; iz <= c_max.z; ++iz)
+        {
+            for (int iy = c_min.y; iy <= c_max.y; ++iy)
+            {
+                for (int ix = c_min.x; ix <= c_max.x; ++ix)
+                {
+                    const glm::vec3 cell_center = (glm::vec3(ix, iy, iz) + 0.5f) * cell_size;
+                    if (find_triangle_cube_relation_approximate(cell_center, half_size, v0, v1, v2) != TriangleCubeRelation::Outside)
+                    {
+                        pairs.emplace_back(uniform_grid_cell_index(glm::uvec3(ix, iy, iz), dims), slot_id);
+                    }
+                }
+            }
+        }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    const uint32_t total_pairs = static_cast<uint32_t>(pairs.size());
+    const uint32_t grid_id = static_cast<uint32_t>(grids.alloc_element());
+    const uint32_t as_start = static_cast<uint32_t>(as.alloc(total_cells));
+    const uint32_t bc_start = static_cast<uint32_t>(box_content.alloc(total_pairs + 1u));
+
+    grids[grid_id].dims = dims;
+    grids[grid_id].cell_size = cell_size;
+    grids[grid_id].as_start = as_start;
+
+    space.root_box = static_cast<int>(grid_id);
+    space.as_start = as_start;
+    space.as_size = total_cells;
+    space.box_content_start = bc_start;
+    space.box_content_size = total_pairs + 1u;
+
+    for (uint32_t c = 0; c < total_cells; ++c)
+    {
+        as[as_start + c] = 0u;
+    }
+    box_content[bc_start] = BoxContent{};
+
+    for (uint32_t i = 0; i < total_pairs; ++i)
+    {
+        const uint32_t cell = pairs[i].first;
+        const uint32_t prim = pairs[i].second;
+        const bool is_first = (i == 0) || (pairs[i - 1].first != cell);
+        const bool is_last = (i + 1u == total_pairs) || (pairs[i + 1].first != cell);
+
+        box_content[bc_start + 1u + i] = BoxContent(prim, is_last);
+        if (is_first)
+        {
+            as[as_start + cell] = bc_start + 1u + i;
+        }
+    }
+
+    soa::upload_soa_range_async(d_grids, grids, grid_id, 1);
+    soa::upload_soa_range_async(d_as, as, as_start, total_cells);
+    soa::upload_soa_range_async(d_box_content, box_content, bc_start, total_pairs + 1u);
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
     m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }

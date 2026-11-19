@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -164,7 +165,8 @@ public:
         std::vector<MeshBuildRecord>&& mesh_records,
         std::vector<HeterogeneousInstanceRecord>&& instance_records,
         double blas_eval_prep_ms,
-        double tlas_prep_ms = 0.0);
+        double tlas_prep_ms = 0.0,
+        std::span<const SubspacePrimitive> subspaces = {});
 
     void pack_subspaces(
         uint32_t tlas_space_id,

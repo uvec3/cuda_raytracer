@@ -130,6 +130,11 @@ inline int __device__ block_scan_kogge_stone(int value)
         buff_s[warp_id()]=value;
     }
 
+    if (warp_id()==0 && threadIdx.x >= (blockDim.x + WARP_SIZE - 1) / WARP_SIZE)
+    {
+        buff_s[threadIdx.x] = 0;
+    }
+
     __syncthreads();
     if (warp_id()==0)
     {

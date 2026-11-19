@@ -16,6 +16,14 @@ add_executable(traversal_test traversal.cu)
 set_target_properties(traversal_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON )
 target_link_libraries(traversal_test PRIVATE gtest_main glm::glm)
 
+add_executable(device_queue_test device_queue_test.cu)
+set_target_properties(device_queue_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(device_queue_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+target_link_libraries(device_queue_test PRIVATE gtest_main)
+
 
 add_executable(scene_test scene_test.cpp
         ../src/raytracer/Raytracer.cu ../src/raytracer/Raytracer.cuh

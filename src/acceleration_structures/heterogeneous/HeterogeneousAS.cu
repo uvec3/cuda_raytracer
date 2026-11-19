@@ -626,23 +626,6 @@ MeshBuildRecord HeterogeneousAS::make_existing_blas_record(
     return record;
 }
 
-namespace
-{
-    __global__ void heterogeneous_pack_subspaces_kernel(
-        const SubspacePrimitive* src_subspaces,
-        uint32_t count,
-        soa::soa_view<PrimitiveChunk16> dst_primitives,
-        uint32_t primitives_start)
-    {
-        uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= count)
-            return;
-
-        uint32_t dst_slot = primitives_start + i * SubspacePrimitive::occupied_slots;
-        store_primitive(dst_primitives, dst_slot, src_subspaces[i]);
-    }
-} // namespace
-
 void HeterogeneousAS::pack_subspaces(
     uint32_t /*tlas_space_id*/,
     Space tlas_space,
@@ -657,18 +640,12 @@ void HeterogeneousAS::pack_subspaces(
     tlas_space.primitives_start = prim_start;
     tlas_space.primitives_size = slots;
 
-    SubspacePrimitive* d_subs = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_subs, sizeof(SubspacePrimitive) * count));
-    CUDA_CHECK(cudaMemcpy(d_subs, subspaces.data(), sizeof(SubspacePrimitive) * count, cudaMemcpyHostToDevice));
-
-    const uint32_t blocks = (count - 1u) / 128u + 1u;
-    heterogeneous_pack_subspaces_kernel<<<blocks, 128>>>(
-        d_subs,
-        count,
-        m_geometry_context->primitives.view(),
-        prim_start);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaFree(d_subs));
+    static_assert(sizeof(SubspacePrimitive) == SubspacePrimitive::occupied_slots * sizeof(PrimitiveChunk16));
+    CUDA_CHECK(cudaMemcpyAsync(
+        &m_geometry_context->primitives[prim_start],
+        subspaces.data(),
+        static_cast<size_t>(count) * sizeof(SubspacePrimitive),
+        cudaMemcpyHostToDevice));
 }
 
 ASType HeterogeneousAS::configure_tlas_builder(ASType requested_type)
@@ -717,14 +694,38 @@ void HeterogeneousAS::finalize_tlas(
     std::vector<MeshBuildRecord>&& mesh_records,
     std::vector<HeterogeneousInstanceRecord>&& instance_records,
     double blas_eval_prep_ms,
-    double tlas_prep_ms)
+    double tlas_prep_ms,
+    std::span<const SubspacePrimitive> subspaces)
 {
     assert(m_geometry_context != nullptr);
 
     const auto tlas_t0 = std::chrono::high_resolution_clock::now();
     const SavedASConfigs saved_configs = save_standalone_configs();
     const ASType tlas_as_type = configure_tlas_builder(config.tlas_type);
-    build_single_as(tlas_as_type, tlas_space_id, tlas_space, PrimitiveType::Subspace);
+
+    constexpr size_t kCpuSubspaceTlasThreshold = 512u;
+    if (!subspaces.empty() && subspaces.size() <= kCpuSubspaceTlasThreshold)
+    {
+        tlas_space.as_type = tlas_as_type;
+        tlas_space.root_box = -1;
+        tlas_space.as_start = 0;
+        tlas_space.as_size = 0;
+        tlas_space.box_content_start = 0;
+        tlas_space.box_content_size = 0;
+
+        if (tlas_as_type == ASType::BVH && m_bvh)
+            m_bvh->build_subspaces_cpu(tlas_space_id, tlas_space, subspaces);
+        else if (tlas_as_type == ASType::KDTree && m_kdtree)
+            m_kdtree->build_subspaces_cpu(tlas_space_id, tlas_space, subspaces);
+        else if (tlas_as_type == ASType::UniformGrid && m_uniform_grid)
+            m_uniform_grid->build_subspaces_cpu(tlas_space_id, tlas_space, subspaces);
+        else if (tlas_as_type == ASType::Octree && m_octree)
+            m_octree->build_subspaces_cpu(tlas_space_id, tlas_space, subspaces);
+    }
+    else
+    {
+        build_single_as(tlas_as_type, tlas_space_id, tlas_space, PrimitiveType::Subspace);
+    }
     restore_standalone_configs(saved_configs);
 
     const auto tlas_t1 = std::chrono::high_resolution_clock::now();
@@ -778,7 +779,11 @@ void HeterogeneousAS::finalize_tlas(
         .instance_records = std::move(instance_records)
     };
 
-    sync_to_device();
+    soa::upload_soa_range_async(d_trees, trees, tree_id, 1);
+    if (inst_count > 0)
+    {
+        soa::upload_soa_range_async(d_instances, instances, inst_offset, inst_count);
+    }
 }
 
 std::vector<uint32_t> HeterogeneousAS::get_owned_blas_spaces(uint32_t space_id) const
@@ -931,8 +936,6 @@ void HeterogeneousAS::free_space(uint32_t space_id, Space space)
     {
         trees.free(static_cast<size_t>(tree_id));
     }
-
-    sync_to_device();
 }
 
 const std::vector<MeshBuildRecord>* HeterogeneousAS::get_mesh_records(uint32_t space_id) const

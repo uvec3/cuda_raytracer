@@ -51,6 +51,7 @@ public:
     void register_containers(ContainerExplorer& explorer);
 
     void build(uint32_t space_id, Space space, PrimitiveType primitive_type = PrimitiveType::Triangle);
+    void build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces);
     void free_space(uint32_t space_id, Space space);
 
     void insert_triangles(uint32_t space_id, Space space, uint32_t primitives_start, uint32_t number_of_triangles, uint32_t occupied_slots,
@@ -78,8 +79,16 @@ public:
 
     Config config;
 
+    double last_create_as_ms() const { return m_last_create_as_ms; }
+    double build_time_ms(uint32_t space_id) const
+    {
+        auto it = m_build_times_ms.find(space_id);
+        return it != m_build_times_ms.end() ? it->second : 0.0;
+    }
+
 private:
     std::unordered_map<uint32_t, double> m_build_times_ms;
+    double m_last_create_as_ms = 0.0;
 };
 
 // static_assert(AS<OctreeAS>); // OctreeAS implements AS concept

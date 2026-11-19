@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <unordered_map>
 #include "../../types.hpp"
 #include "../../pool/soa_pool_cuda.hpp"
@@ -49,6 +50,7 @@ public:
     void register_containers(ContainerExplorer& explorer);
 
     void build(uint32_t space_id, Space space, PrimitiveType primitive_type = PrimitiveType::Triangle);
+    void build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces);
     void free_space(uint32_t space_id, Space space);
 
     void insert_triangles(uint32_t space_id, Space space, glm::uvec3 dims, float cell_size,

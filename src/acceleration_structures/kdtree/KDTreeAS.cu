@@ -609,10 +609,14 @@ namespace kdtree_detail
         {
             for (uint32_t p : prim_indices)
             {
-                const uint32_t slot_id = ctx.prim_slot_ids[p];
-                glm::vec3 v0, v1, v2, n0, n1, n2;
-                const PrimitiveType ptype = get_primitive_triangle_vertices(
-                    ctx.prim_view, ctx.vert_view, slot_id, v0, v1, v2, n0, n1, n2);
+                glm::vec3 v0{}, v1{}, v2{}, n0{}, n1{}, n2{};
+                PrimitiveType ptype = PrimitiveType::Subspace;
+                if (!ctx.is_subspace)
+                {
+                    const uint32_t slot_id = ctx.prim_slot_ids[p];
+                    ptype = get_primitive_triangle_vertices(
+                        ctx.prim_view, ctx.vert_view, slot_id, v0, v1, v2, n0, n1, n2);
+                }
 
                 glm::vec3 cmin, cmax;
                 get_clipped_primitive_aabb(
@@ -681,10 +685,14 @@ namespace kdtree_detail
 
         for (uint32_t p : prim_indices)
         {
-            const uint32_t slot_id = ctx.prim_slot_ids[p];
-            glm::vec3 v0, v1, v2, n0, n1, n2;
-            const PrimitiveType ptype = get_primitive_triangle_vertices(
-                ctx.prim_view, ctx.vert_view, slot_id, v0, v1, v2, n0, n1, n2);
+            glm::vec3 v0{}, v1{}, v2{}, n0{}, n1{}, n2{};
+            PrimitiveType ptype = PrimitiveType::Subspace;
+            if (!ctx.is_subspace)
+            {
+                const uint32_t slot_id = ctx.prim_slot_ids[p];
+                ptype = get_primitive_triangle_vertices(
+                    ctx.prim_view, ctx.vert_view, slot_id, v0, v1, v2, n0, n1, n2);
+            }
 
             if (primitive_overlaps_aabb(ptype, v0, v1, v2, n0, n1, n2, ctx.prim_min[p], ctx.prim_max[p], left_min, left_max))
             {
@@ -1127,7 +1135,6 @@ void KDTreeAS::free_space(uint32_t space_id, Space space)
     {
         box_content.free(space.box_content_start);
     }
-    sync_to_device();
 }
 
 void KDTreeAS::finalize_tree_pools(
@@ -1188,7 +1195,9 @@ void KDTreeAS::finalize_tree_pools(
     space.box_content_start = bc_start;
     space.box_content_size = total_pairs + 1u;
 
-    sync_to_device();
+    soa::upload_soa_range_async(d_trees, trees, tree_id, 1);
+    soa::upload_soa_range_async(d_as, as, as_start, total_nodes);
+    soa::upload_soa_range_async(d_box_content, box_content, bc_start, total_pairs + 1u);
 }
 
 void KDTreeAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots, bool is_subspace)
@@ -1571,6 +1580,69 @@ void KDTreeAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_
 
     kdtree_detail::build_cpu_recursive(ctx, 0u, root_min, root_max, 0, root_prims);
     finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
+}
+
+void KDTreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces)
+{
+    if (subspaces.empty())
+        return;
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const uint32_t count = static_cast<uint32_t>(subspaces.size());
+
+    std::vector<glm::vec3> prim_min(count);
+    std::vector<glm::vec3> prim_max(count);
+    std::vector<uint32_t> prim_slot_ids(count);
+
+    glm::vec3 root_min(FLT_MAX);
+    glm::vec3 root_max(-FLT_MAX);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        prim_slot_ids[i] = space.primitives_start + i * SubspacePrimitive::occupied_slots;
+        prim_min[i] = subspaces[i].bounds_min;
+        prim_max[i] = subspaces[i].bounds_max;
+        root_min = glm::min(root_min, prim_min[i]);
+        root_max = glm::max(root_max, prim_max[i]);
+    }
+
+    const glm::vec3 pad = glm::max((root_max - root_min) * 1e-4f, glm::vec3(1e-5f));
+    root_min -= pad;
+    root_max += pad;
+
+    const glm::vec3 root_ext = root_max - root_min;
+    const float root_max_ext = fmaxf(root_ext.x, fmaxf(root_ext.y, root_ext.z));
+
+    std::vector<uint32_t> root_prims(count);
+    std::iota(root_prims.begin(), root_prims.end(), 0u);
+
+    std::vector<KDNode> host_nodes(1);
+    host_nodes.reserve(count * 4u);
+    std::vector<std::pair<uint32_t, uint32_t>> leaf_pairs;
+    leaf_pairs.reserve(count * 2u);
+
+    kdtree_detail::CpuBuildContext ctx{
+        .prim_view = {},
+        .vert_view = {},
+        .prim_min = prim_min.data(),
+        .prim_max = prim_max.data(),
+        .prim_slot_ids = prim_slot_ids.data(),
+        .root_max_ext = root_max_ext,
+        .split_mode = config.split_mode,
+        .max_depth = config.max_depth < 1 ? 1 : (config.max_depth > 30 ? 30 : config.max_depth),
+        .max_leaf_primitives = std::max(config.max_leaf_primitives, 1),
+        .traversal_cost = config.traversal_cost,
+        .intersection_cost = config.intersection_cost,
+        .is_subspace = true,
+        .nodes = &host_nodes,
+        .leaf_pairs = &leaf_pairs,
+        .total_leaves = 0
+    };
+
+    kdtree_detail::build_cpu_recursive(ctx, 0u, root_min, root_max, 0, root_prims);
+    finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 void KDTreeAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)

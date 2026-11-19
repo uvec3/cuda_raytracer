@@ -3227,3 +3227,342 @@ TEST(HeterogeneousAS, AllTlasTypesRenderIdenticalAndStopOnHitGPU)
     cudaDestroySurfaceObject(surf);
     cudaFreeArray(arr);
 }
+
+TEST(OctreeAS, BenchmarkBuildScenes)
+{
+    // Warm up CUDA context/allocations using utah_teapot.glb so the first measured scene is not skewed.
+    {
+        auto warmup_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+        ASSERT_FALSE(warmup_view.empty());
+        Scene warmup("Warmup");
+        warmup.load(warmup_view);
+        warmup.as_octree.config.stretch = false;
+        warmup.config.swapYZ = true;
+        warmup.as_octree.config.min_depth = 1;
+        warmup.as_octree.config.max_depth = 10;
+        warmup.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+        warmup.as_octree.config.use_gpu = true;
+        uint32_t warmup_sp = warmup.build_node_as(warmup.root_node_id, ASType::Octree);
+        ASSERT_NE(warmup_sp, UINT32_MAX);
+    }
+
+    struct BenchCase
+    {
+        const char* label;
+        const char* asset;
+        int max_depth;
+    };
+
+    const BenchCase cases[] = {
+        {"Teapot", "Scenes/utah_teapot.glb", 10},
+        {"Hairball", "Scenes/hairball.glb", 8},
+        {"Sponza", "Scenes/Sponza.glb", 10},
+    };
+
+    for (const auto& c : cases)
+    {
+        auto view = vkbase::assets::get(c.asset);
+        ASSERT_FALSE(view.empty()) << "Missing asset: " << c.asset;
+
+        Scene scene(c.label);
+        scene.load(view);
+        scene.as_octree.config.stretch = false;
+        scene.config.swapYZ = true;
+        scene.as_octree.config.min_depth = 1;
+        scene.as_octree.config.max_depth = c.max_depth;
+        scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+        scene.as_octree.config.use_gpu = true;
+
+        const uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::Octree);
+        ASSERT_NE(space_id, UINT32_MAX);
+
+        const Space& sp = scene.spaces[space_id];
+        EXPECT_GT(sp.as_size, 0u);
+        EXPECT_GT(sp.box_content_size, 0u);
+        EXPECT_GT(sp.primitives_size, 0u);
+
+        // Verify valid parent/child linkage and leaf contents across the tree.
+        std::vector<std::pair<int, int>> stack;
+        stack.emplace_back(sp.root_box, 0);
+        while (!stack.empty())
+        {
+            const auto [node_id, depth] = stack.back();
+            stack.pop_back();
+            const int val = scene.as_octree.as[node_id];
+            if (val > 0)
+            {
+                const int expected_slot8 = (depth == 0) ? 0 : node_id;
+                EXPECT_EQ(scene.as_octree.as[val + 8], expected_slot8);
+                for (int b = 0; b < 8; ++b)
+                {
+                    stack.emplace_back(val + b, depth + 1);
+                }
+            }
+            else if (val < 0)
+            {
+                uint32_t cid = static_cast<uint32_t>(-val);
+                while (true)
+                {
+                    const auto bc = scene.as_octree.box_content[cid];
+                    EXPECT_LT(bc.id(), scene.geometry_context.primitives.size());
+                    if (bc.is_last()) break;
+                    ++cid;
+                }
+            }
+        }
+
+        std::cout << "[BENCH] " << c.label
+                  << " | as_size=" << sp.as_size
+                  << " | box_content_size=" << sp.box_content_size
+                  << " | create_as_ms=" << scene.as_octree.last_create_as_ms()
+                  << " | total_build_ms=" << scene.as_octree.build_time_ms(space_id)
+                  << std::endl;
+    }
+}
+
+TEST(OctreeAS, GPUvsCPUEquivalenceTeapot)
+{
+    auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+    ASSERT_FALSE(teapot_view.empty());
+
+    auto build_teapot = [&](bool use_gpu, Scene& scene) -> uint32_t {
+        scene.load(teapot_view);
+        scene.as_octree.config.stretch = false;
+        scene.config.swapYZ = true;
+        scene.as_octree.config.min_depth = 1;
+        scene.as_octree.config.max_depth = 10;
+        scene.as_octree.config.triangle_to_box_stop_ratio = 1.1f;
+        scene.as_octree.config.use_gpu = use_gpu;
+        return scene.build_node_as(scene.root_node_id, ASType::Octree);
+    };
+
+    Scene scene_gpu("TeapotGPU");
+    Scene scene_cpu("TeapotCPU");
+    const uint32_t sp_gpu_id = build_teapot(true, scene_gpu);
+    const uint32_t sp_cpu_id = build_teapot(false, scene_cpu);
+    ASSERT_NE(sp_gpu_id, UINT32_MAX);
+    ASSERT_NE(sp_cpu_id, UINT32_MAX);
+
+    const Space& sp_gpu = scene_gpu.spaces[sp_gpu_id];
+    const Space& sp_cpu = scene_cpu.spaces[sp_cpu_id];
+    EXPECT_EQ(sp_gpu.as_size, sp_cpu.as_size);
+    EXPECT_EQ(sp_gpu.box_content_size, sp_cpu.box_content_size);
+    EXPECT_EQ(sp_gpu.primitives_size, sp_cpu.primitives_size);
+
+    // Lockstep structural walk comparing node types, parent slot-8 links, and leaf primitive sets.
+    struct WalkEntry
+    {
+        int gpu_node;
+        int cpu_node;
+        BoxStack stack;
+    };
+    std::vector<WalkEntry> walk;
+    walk.push_back({sp_gpu.root_box, sp_cpu.root_box, BoxStack{}});
+
+    auto collect_leaf_prims = [](const OctreeAS& oct, int val) {
+        std::vector<uint32_t> prims;
+        uint32_t cid = static_cast<uint32_t>(-val);
+        while (true)
+        {
+            const auto bc = oct.box_content[cid];
+            prims.push_back(bc.id());
+            if (bc.is_last()) break;
+            ++cid;
+        }
+        std::sort(prims.begin(), prims.end());
+        return prims;
+    };
+
+    while (!walk.empty())
+    {
+        const WalkEntry cur = walk.back();
+        walk.pop_back();
+
+        const int gval = scene_gpu.as_octree.as[cur.gpu_node];
+        const int cval = scene_cpu.as_octree.as[cur.cpu_node];
+
+        ASSERT_EQ(gval > 0, cval > 0) << "Mismatch internal/leaf at depth " << cur.stack.depth();
+        ASSERT_EQ(gval == 0, cval == 0) << "Mismatch empty leaf at depth " << cur.stack.depth();
+        ASSERT_EQ(gval < 0, cval < 0) << "Mismatch non-empty leaf at depth " << cur.stack.depth();
+
+        if (gval > 0)
+        {
+            if (cur.stack.depth() == 0)
+            {
+                EXPECT_EQ(scene_gpu.as_octree.as[gval + 8], 0);
+                EXPECT_EQ(scene_cpu.as_octree.as[cval + 8], 0);
+            }
+            else
+            {
+                EXPECT_EQ(scene_gpu.as_octree.as[gval + 8], cur.gpu_node);
+                EXPECT_EQ(scene_cpu.as_octree.as[cval + 8], cur.cpu_node);
+            }
+
+            for (int b = 0; b < 8; ++b)
+            {
+                BoxStack child = cur.stack;
+                child.descend(b);
+                walk.push_back({gval + b, cval + b, child});
+            }
+        }
+        else if (gval < 0)
+        {
+            const auto g_prims = collect_leaf_prims(scene_gpu.as_octree, gval);
+            const auto c_prims = collect_leaf_prims(scene_cpu.as_octree, cval);
+            EXPECT_EQ(g_prims, c_prims);
+        }
+    }
+
+    // Raycast comparison on a 21x21 ray grid.
+    soa::soa_vector<PrimitiveChunk16> gpu_prims = scene_gpu.geometry_context.primitives;
+    soa::soa_vector<Vertex> gpu_verts = scene_gpu.geometry_context.vertices;
+    soa::soa_vector<PrimitiveChunk16> cpu_prims = scene_cpu.geometry_context.primitives;
+    soa::soa_vector<Vertex> cpu_verts = scene_cpu.geometry_context.vertices;
+
+    auto trace_ray = [](const OctreeAS& oct,
+                        int root_box,
+                        const soa::soa_vector<PrimitiveChunk16>& prims,
+                        const soa::soa_vector<Vertex>& verts,
+                        glm::vec3 origin,
+                        glm::vec3 dir,
+                        float& out_t) -> bool {
+        CurrentBox current_box{.id = root_box};
+        glm::vec3 current_source = origin;
+        int it = 0;
+        int32_t container_id = INT32_MAX;
+        float best_t = std::numeric_limits<float>::infinity();
+        bool hit = false;
+
+        while (container_id != 0 && !hit && it < 500)
+        {
+            auto result = traverse_stackless(&oct.as[0], current_box, origin, current_source, dir, it);
+            container_id = result.content;
+            if (container_id > 0)
+            {
+                for (;; ++container_id)
+                {
+                    auto bc = oct.box_content[container_id];
+                    PrimitiveChunk16 chunk0 = prims[bc.id()];
+                    if (chunk0.type() == PrimitiveType::Triangle)
+                    {
+                        const Triangle& tri = reinterpret_cast<const Triangle&>(chunk0);
+                        auto v1 = glm::vec3(verts[tri.v0].position);
+                        auto v2 = glm::vec3(verts[tri.v1].position);
+                        auto v3 = glm::vec3(verts[tri.v2].position);
+
+                        float t, u, v;
+                        if (intersectRayTriangle(origin, dir, current_box.t_min, current_box.t_max, v1, v2, v3, t, u, v))
+                        {
+                            if (t < best_t)
+                            {
+                                best_t = t;
+                            }
+                            hit = true;
+                        }
+                    }
+                    if (bc.is_last()) break;
+                }
+            }
+            if (current_box.stack.depth() == 0) break;
+        }
+        out_t = best_t;
+        return hit;
+    };
+
+    int hit_count = 0;
+    for (int ix = 0; ix <= 20; ++ix)
+    {
+        for (int iz = 0; iz <= 20; ++iz)
+        {
+            const float x = 0.25f + 0.5f * (static_cast<float>(ix) / 20.0f);
+            const float z = 0.25f + 0.5f * (static_cast<float>(iz) / 20.0f);
+            const glm::vec3 origin(x, -0.5f, z);
+            const glm::vec3 dir(0.0f, 1.0f, 0.0f);
+
+            float t_gpu = 0.0f, t_cpu = 0.0f;
+            const bool h_gpu = trace_ray(scene_gpu.as_octree, sp_gpu.root_box, gpu_prims, gpu_verts, origin, dir, t_gpu);
+            const bool h_cpu = trace_ray(scene_cpu.as_octree, sp_cpu.root_box, cpu_prims, cpu_verts, origin, dir, t_cpu);
+
+            EXPECT_EQ(h_gpu, h_cpu) << "Hit mismatch at ray (" << ix << ", " << iz << ")";
+            if (h_gpu && h_cpu)
+            {
+                EXPECT_NEAR(t_gpu, t_cpu, 1e-5f) << "Distance mismatch at ray (" << ix << ", " << iz << ")";
+                ++hit_count;
+            }
+        }
+    }
+    EXPECT_GT(hit_count, 50);
+}
+
+TEST(HeterogeneousAS, BenchmarkTlasRebuildChess)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    ASSERT_FALSE(view.empty());
+
+    Scene scene("ChessTlasBench");
+    scene.load(view);
+
+    // Initial full build to populate BLASes in the shared pools (realistic steady-state).
+    scene.as_heterogeneous.config.rebuild_blas = true;
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 2048;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    const auto* insts = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(insts, nullptr);
+    const size_t num_instances = insts->size();
+
+    struct TlasCase
+    {
+        const char* name;
+        ASType type;
+    };
+    const TlasCase cases[] = {
+        {"BVH16", ASType::BVH},
+        {"KDTree", ASType::KDTree},
+        {"UniformGrid", ASType::UniformGrid},
+        {"Octree", ASType::Octree},
+    };
+
+    scene.as_heterogeneous.config.rebuild_blas = false;
+    constexpr int kIters = 5;
+
+    for (const auto& c : cases)
+    {
+        scene.as_heterogeneous.config.tlas_type = c.type;
+        // Warmup
+        tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+        ASSERT_NE(tlas_space, UINT32_MAX);
+
+        double sum_tlas_ms = 0.0;
+        double min_tlas_ms = std::numeric_limits<double>::infinity();
+        double sum_wall_ms = 0.0;
+        double min_wall_ms = std::numeric_limits<double>::infinity();
+
+        for (int it = 0; it < kIters; ++it)
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            ASSERT_NE(tlas_space, UINT32_MAX);
+
+            const double wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
+            sum_tlas_ms += tlas_ms;
+            min_tlas_ms = std::min(min_tlas_ms, tlas_ms);
+            sum_wall_ms += wall_ms;
+            min_wall_ms = std::min(min_wall_ms, wall_ms);
+        }
+
+        std::cout << "[TLAS BENCH] Chess (" << num_instances << " instances) | " << c.name
+                  << " | tlas_ms avg=" << (sum_tlas_ms / kIters)
+                  << " min=" << min_tlas_ms
+                  << " | wall_ms avg=" << (sum_wall_ms / kIters)
+                  << " min=" << min_wall_ms
+                  << std::endl;
+    }
+
+    scene.free_node_as(scene.root_node_id);
+}

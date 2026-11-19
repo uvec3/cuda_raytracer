@@ -414,7 +414,7 @@ void Scene::free_tlas_space_only(uint32_t space_id)
     }
     reset_space_fields(spaces[space_id]);
     spaces.free(space_id);
-    geometry_context.d_spaces = spaces;
+    soa::upload_soa_range_async(geometry_context.d_spaces, spaces, space_id, 1);
 
     if (m_active_space == space_id)
     {
@@ -2756,7 +2756,6 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
     spaces[tlas_space_id].normalization_translate = scene_trans;
     spaces[tlas_space_id].normalization_scale = scene_scale;
     spaces[tlas_space_id].has_nagata = any_has_nagata;
-    geometry_context.d_spaces = spaces;
 
     as_heterogeneous.pack_subspaces(tlas_space_id, spaces[tlas_space_id], subspaces);
     const auto tlas_prep_t1 = std::chrono::high_resolution_clock::now();
@@ -2768,9 +2767,10 @@ uint32_t Scene::build_heterogeneous_instances(const std::vector<MeshInstanceDesc
         std::move(mesh_records),
         std::move(instance_records),
         blas_eval_prep_ms,
-        tlas_prep_ms);
+        tlas_prep_ms,
+        subspaces);
 
-    geometry_context.d_spaces = spaces;
+    soa::upload_soa_range_async(geometry_context.d_spaces, spaces, tlas_space_id, 1);
     return tlas_space_id;
 }
 

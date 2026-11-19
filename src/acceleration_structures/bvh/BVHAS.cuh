@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -66,6 +67,7 @@ public:
 
     void build_gpu(uint32_t space_id, Space space, uint32_t number_of_triangles, uint32_t occupied_slots);
     void build_cpu(uint32_t space_id, Space space, uint32_t number_of_triangles, uint32_t occupied_slots);
+    void build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces);
 
     struct Config
     {

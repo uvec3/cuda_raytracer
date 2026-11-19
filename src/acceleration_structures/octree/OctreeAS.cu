@@ -128,7 +128,6 @@ void OctreeAS::free_space(uint32_t space_id, Space space)
     {
         free_box(space.as_start);
     }
-    sync_to_device();
 }
 
 int OctreeAS::divide_box(InsertionContext& insertion_context, BoxInfo box_info)
@@ -332,133 +331,130 @@ CUDA_HOST_DEVICE uint32_t find_greater_or_equal_index(T value, const T* sorted_l
     return search_start;
 }
 
-struct ExecutionState
+__global__ void create_as(
+    const uint64_t* used_boxes,
+    uint32_t used_boxes_size,
+    int* as,
+    uint64_t* as_box,
+    uint32_t max_capacity,
+    uint32_t* as_alloc_counter,
+    DeviceQueueView<uint32_t> queue)
 {
-    uint32_t current_layer_begin=0;
-    uint32_t current_layer_pos=0;
-    uint32_t next_layer_begin=1;
-    uint32_t next_layer_pos=1;
-};
+    __shared__ uint32_t s_batch_start;
+    __shared__ uint32_t s_batch_count;
+    __shared__ uint32_t s_as_base_offset;
+    __shared__ uint32_t s_queue_base_offset;
+    __shared__ bool s_has_work;
 
-__global__ void create_as(const uint64_t* used_boxes, uint32_t used_boxes_size, int* as, uint64_t* as_box, uint32_t max_capacity, uint32_t* out_as_size)
-{
-    __shared__ ExecutionState state;
-    __shared__ uint32_t block_base_offset;
+    constexpr uint32_t MIN_BATCH = 32u;
 
-    // init
-    if (threadIdx.x == 0)
+    while (true)
     {
-        state.current_layer_begin = 0;
-        state.current_layer_pos = 0;
-        state.next_layer_begin = 1;
-        state.next_layer_pos = 1;
-        as[0] = 0;
-        as_box[0] = 0;
-    }
-    __syncthreads();
-
-    while (state.current_layer_begin != state.next_layer_begin) // while current layer not empty
-    {
-        while (state.current_layer_pos < state.next_layer_begin) // process all elements in current depth level
+        if (threadIdx.x == 0)
         {
-            uint32_t this_box_id = state.current_layer_pos + threadIdx.x;
-            bool in_range = (this_box_id < state.next_layer_begin);
+            s_has_work = queue.claim_batch_adaptive(
+                blockDim.x, MIN_BATCH, gridDim.x, s_batch_start, s_batch_count);
+        }
+        __syncthreads();
 
-            bool subdivides = false;
-            BoxStack box{};
+        if (!s_has_work)
+        {
+            return;
+        }
 
-            if (in_range)
+        const uint32_t batch_count = s_batch_count;
+        const bool in_range = (threadIdx.x < batch_count);
+
+        bool subdivides = false;
+        uint32_t this_box_id = 0u;
+        BoxStack box{};
+
+        if (in_range)
+        {
+            this_box_id = queue.load_wait(s_batch_start + threadIdx.x);
+            box = BoxStack{as_box[this_box_id]};
+
+            // Only actual boxes subdivide (slot 8 parent refs have is_invalid() == true)
+            if (!box.is_invalid())
             {
-                uint64_t box_data = as_box[this_box_id];
-                box = BoxStack{box_data};
-
-                // Only actual boxes subdivide (slot 8 parent refs have is_invalid() == true)
-                if (!box.is_invalid())
+                uint32_t begin_idx = 0;
+                uint32_t end_idx = 0;
+                if (box.depth() == 0)
                 {
-                    uint32_t begin_idx = 0;
-                    uint32_t end_idx = 0;
-                    if (box.depth() == 0)
-                    {
-                        begin_idx = 0;
-                        end_idx = used_boxes_size;
-                    }
-                    else
-                    {
-                        begin_idx = find_greater_or_equal_index(box.begin(), used_boxes, 0, used_boxes_size);
-                        end_idx = find_greater_or_equal_index(box.end(), used_boxes, 0, used_boxes_size);
-                    }
-
-                    if (begin_idx < end_idx && box.depth() < BoxStack::max_depth)
-                    {
-                        for (uint32_t k = begin_idx; k < end_idx; ++k)
-                        {
-                            if (BoxStack{used_boxes[k]}.depth() > box.depth())
-                            {
-                                subdivides = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            int my_alloc = subdivides ? 9 : 0;
-            int inc_scan = block_scan_kogge_stone(my_alloc);
-            int exc_scan = inc_scan - my_alloc;
-
-            if (threadIdx.x == blockDim.x - 1)
-            {
-                block_base_offset = state.next_layer_pos;
-                state.next_layer_pos += inc_scan;
-                assert(state.next_layer_pos < max_capacity);
-            }
-            __syncthreads();
-
-            if (in_range && !box.is_invalid())
-            {
-                if (subdivides)
-                {
-                    uint32_t child_start = block_base_offset + exc_scan;
-                    as[this_box_id] = static_cast<int>(child_start);
-
-                    for (int branch = 0; branch < 8; ++branch)
-                    {
-                        BoxStack child_stack = box;
-                        child_stack.descend(branch);
-                        as_box[child_start + branch] = child_stack.m_data;
-                        as[child_start + branch] = 0;
-                    }
-
-                    BoxStack invalid_stack;
-                    invalid_stack.set_invalid(true);
-                    as_box[child_start + 8] = invalid_stack.m_data;
-                    as[child_start + 8] = static_cast<int>(this_box_id);
+                    begin_idx = 0;
+                    end_idx = used_boxes_size;
                 }
                 else
                 {
-                    as[this_box_id] = 0;
+                    begin_idx = find_greater_or_equal_index(box.begin(), used_boxes, 0, used_boxes_size);
+                    end_idx = find_greater_or_equal_index(box.end(), used_boxes, begin_idx, used_boxes_size);
+                }
+
+                if (begin_idx < end_idx && box.depth() < BoxStack::max_depth)
+                {
+                    // Sorted used_boxes places any strict descendants at the tail of [begin_idx, end_idx).
+                    subdivides = (BoxStack{used_boxes[end_idx - 1]}.depth() > box.depth());
                 }
             }
-
-            if (threadIdx.x == 0)
-            {
-                state.current_layer_pos += blockDim.x;
-            }
-            __syncthreads();
         }
+
+        const int my_subdiv = subdivides ? 1 : 0;
+        const int inc_subdiv = block_scan_kogge_stone(my_subdiv);
+        const int exc_subdiv = inc_subdiv - my_subdiv;
+
+        if (threadIdx.x == blockDim.x - 1)
+        {
+            const uint32_t total_subdiv = static_cast<uint32_t>(inc_subdiv);
+            if (total_subdiv > 0u)
+            {
+                const uint32_t alloc_slots = total_subdiv * 9u;
+                s_as_base_offset = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*as_alloc_counter)
+                                       .fetch_add(alloc_slots, cuda::memory_order_relaxed);
+                assert(s_as_base_offset + alloc_slots <= max_capacity);
+                s_queue_base_offset = queue.reserve_push(total_subdiv * 8u);
+            }
+        }
+        __syncthreads();
+
+        if (in_range && !box.is_invalid())
+        {
+            if (subdivides)
+            {
+                const uint32_t child_start = s_as_base_offset + static_cast<uint32_t>(exc_subdiv) * 9u;
+                const uint32_t q_start = s_queue_base_offset + static_cast<uint32_t>(exc_subdiv) * 8u;
+                as[this_box_id] = static_cast<int>(child_start);
+
+                for (int branch = 0; branch < 8; ++branch)
+                {
+                    BoxStack child_stack = box;
+                    child_stack.descend(branch);
+                    as_box[child_start + branch] = child_stack.m_data;
+                    as[child_start + branch] = 0;
+                }
+
+                BoxStack invalid_stack;
+                invalid_stack.set_invalid(true);
+                as_box[child_start + 8] = invalid_stack.m_data;
+                as[child_start + 8] = static_cast<int>(this_box_id);
+
+                // Publish queue entries only after child as_box/as slots are written.
+                for (int branch = 0; branch < 8; ++branch)
+                {
+                    queue.publish(q_start + static_cast<uint32_t>(branch), child_start + static_cast<uint32_t>(branch));
+                }
+            }
+            else
+            {
+                as[this_box_id] = 0;
+            }
+        }
+
+        __syncthreads();
 
         if (threadIdx.x == 0)
         {
-            state.current_layer_begin = state.next_layer_begin;
-            state.next_layer_begin = state.next_layer_pos;
-            state.current_layer_pos = state.current_layer_begin;
+            queue.complete_batch(batch_count);
         }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0 && out_as_size != nullptr)
-    {
-        *out_as_size = state.next_layer_begin;
     }
 }
 
@@ -712,7 +708,7 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, Space space, uint32_t pri
 
     d_number_id.resize(result_size);
 
-    // Step 1: create_as (Single-Block Kernel, Layer-by-Layer)
+    // Step 1: create_as (Persistent Multi-Block Kernel using DeviceQueue)
     uint32_t max_as_capacity = std::max(2048u, result_size * 18 + 1024);
     soa::cuda_device_vector<int> d_local_as(max_as_capacity);
     thrust::fill_n(thrust::device, &d_local_as[0], max_as_capacity, 0);
@@ -720,13 +716,39 @@ void OctreeAS::insert_triangles_gpu(uint32_t space_id, Space space, uint32_t pri
 
     uint32_t* d_as_size = nullptr;
     CUDA_CHECK(cudaMalloc(&d_as_size, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_as_size, 0, sizeof(uint32_t)));
+    const uint32_t initial_as_size = 1u;
+    CUDA_CHECK(cudaMemcpy(d_as_size, &initial_as_size, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    create_as<<<1, 256>>>(
-        &d_number_id[0].number, result_size,
-        &d_local_as[0], d_as_box.data().get(),
-        max_as_capacity, d_as_size);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        DeviceQueue<uint32_t> work_queue(max_as_capacity, 0u);
+
+        constexpr uint32_t create_block_size = 256;
+        int device_id = 0, num_sms = 0, max_blocks_per_sm = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm, create_as, create_block_size, 0));
+        const uint32_t num_persistent_blocks = std::max(1u, static_cast<uint32_t>(num_sms * max_blocks_per_sm));
+
+        cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+        CUDA_CHECK(cudaEventCreate(&ev_start));
+        CUDA_CHECK(cudaEventCreate(&ev_stop));
+        CUDA_CHECK(cudaEventRecord(ev_start));
+
+        create_as<<<num_persistent_blocks, create_block_size>>>(
+            &d_number_id[0].number, result_size,
+            &d_local_as[0], d_as_box.data().get(),
+            max_as_capacity, d_as_size, work_queue.view());
+
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
+        float create_as_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&create_as_ms, ev_start, ev_stop));
+        m_last_create_as_ms = static_cast<double>(create_as_ms);
+        CUDA_CHECK(cudaEventDestroy(ev_start));
+        CUDA_CHECK(cudaEventDestroy(ev_stop));
+    }
 
     uint32_t as_size = 0;
     CUDA_CHECK(cudaMemcpy(&as_size, d_as_size, sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -947,9 +969,196 @@ void OctreeAS::build(uint32_t space_id, Space space, PrimitiveType primitive_typ
 
     insert_triangles(space_id, space, space.primitives_start, number_of_triangles, occupied_slots,
                      config.min_depth, config.max_depth, config.triangle_to_box_stop_ratio, primitive_type, config.use_gpu);
-    sync_to_device();
+    if (!config.use_gpu)
+    {
+        sync_to_device();
+    }
 
     auto t1 = std::chrono::high_resolution_clock::now();
+    m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces)
+{
+    if (subspaces.empty())
+        return;
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const uint32_t count = static_cast<uint32_t>(subspaces.size());
+    const int depth_min = config.min_depth;
+    const int depth_max = config.max_depth;
+    const float stop_ratio = config.triangle_to_box_stop_ratio;
+
+    struct SubPair
+    {
+        uint64_t number;
+        uint32_t local_idx;
+    };
+    std::vector<SubPair> pairs;
+    pairs.reserve(count * 8u);
+
+    std::vector<BoxStack> eval_stack;
+    eval_stack.reserve(64);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const glm::vec3 v0 = subspaces[i].bounds_min;
+        const glm::vec3 v1 = subspaces[i].bounds_max;
+        const glm::vec3 v2 = 0.5f * (v0 + v1);
+        const glm::vec3 dim = glm::max(v0, v1) - glm::min(v0, v1);
+        const float tri_size = glm::max(glm::max(dim.x, dim.y), dim.z);
+
+        BoxStack root{.m_data = 0};
+        if (find_triangle_cube_relation_approximate(root.get_center(), root.half_box_size(), v0, v1, v2) == TriangleCubeRelation::Outside)
+            continue;
+
+        eval_stack.clear();
+        eval_stack.push_back(root);
+        while (!eval_stack.empty())
+        {
+            BoxStack box = eval_stack.back();
+            eval_stack.pop_back();
+
+            bool descend = box.depth() < depth_max;
+            if (descend && box.depth() >= depth_min && tri_size > box.box_size() * stop_ratio)
+            {
+                descend = false;
+            }
+
+            if (descend)
+            {
+                box.descend(0);
+                for (int branch = 0; branch < 8; ++branch)
+                {
+                    box.move(branch);
+                    if (find_triangle_cube_relation_approximate(box.get_center(), box.half_box_size(), v0, v1, v2) != TriangleCubeRelation::Outside)
+                    {
+                        eval_stack.push_back(box);
+                    }
+                }
+            }
+            else
+            {
+                pairs.push_back({box.m_data, i});
+            }
+        }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [](const SubPair& a, const SubPair& b) {
+        return a.number < b.number;
+    });
+
+    std::vector<int> local_as(1, 0);
+    std::vector<BoxContent> local_bc(1, BoxContent{});
+
+    auto insert_rec = [&](auto&& self, int box_id, BoxStack stack, uint32_t start, uint32_t size,
+                          const std::vector<std::pair<uint32_t, uint32_t>>& parent_ranges) -> void
+    {
+        uint32_t exact_count = 0;
+        for (uint32_t i = 0; i < size && BoxStack{.m_data = pairs[start + i].number}.depth() == stack.depth(); ++i)
+        {
+            ++exact_count;
+        }
+
+        if (exact_count == size)
+        {
+            std::vector<uint32_t> leaf_prims;
+            leaf_prims.reserve(size);
+            for (uint32_t i = 0; i < size; ++i)
+            {
+                leaf_prims.push_back(space.primitives_start + pairs[start + i].local_idx * SubspacePrimitive::occupied_slots);
+            }
+            for (auto [p_start, p_size] : parent_ranges)
+            {
+                for (uint32_t i = p_start; i < p_start + p_size; ++i)
+                {
+                    const uint32_t li = pairs[i].local_idx;
+                    const glm::vec3 v0 = subspaces[li].bounds_min;
+                    const glm::vec3 v1 = subspaces[li].bounds_max;
+                    const glm::vec3 v2 = 0.5f * (v0 + v1);
+                    if (find_triangle_cube_relation_approximate(stack.get_center(), stack.half_box_size(), v0, v1, v2) != TriangleCubeRelation::Outside)
+                    {
+                        leaf_prims.push_back(space.primitives_start + li * SubspacePrimitive::occupied_slots);
+                    }
+                }
+            }
+            if (!leaf_prims.empty())
+            {
+                const uint32_t bc_off = static_cast<uint32_t>(local_bc.size());
+                local_as[box_id] = -static_cast<int>(bc_off);
+                for (size_t i = 0; i < leaf_prims.size(); ++i)
+                {
+                    local_bc.emplace_back(leaf_prims[i], i + 1 == leaf_prims.size());
+                }
+            }
+            return;
+        }
+
+        auto next_parents = parent_ranges;
+        if (exact_count > 0)
+            next_parents.emplace_back(start, exact_count);
+
+        start += exact_count;
+        size -= exact_count;
+
+        const int child_start = static_cast<int>(local_as.size());
+        local_as.resize(static_cast<size_t>(child_start) + 9u, 0);
+        local_as[child_start + 8] = box_id;
+        local_as[box_id] = child_start;
+
+        for (int branch = 0; branch < 8; ++branch)
+        {
+            stack.descend(branch);
+            const uint64_t end_val = stack.end();
+            uint32_t lo = start;
+            uint32_t hi = start + size;
+            while (lo < hi)
+            {
+                const uint32_t mid = (lo + hi) / 2u;
+                if (pairs[mid].number <= end_val)
+                    lo = mid + 1u;
+                else
+                    hi = mid;
+            }
+            if (hi > start || !next_parents.empty())
+            {
+                self(self, child_start + branch, stack, start, hi - start, next_parents);
+            }
+            size -= (hi - start);
+            start = hi;
+            stack.ascend();
+        }
+    };
+
+    insert_rec(insert_rec, 0, BoxStack{}, 0u, static_cast<uint32_t>(pairs.size()), {});
+
+    const uint32_t as_size = static_cast<uint32_t>(local_as.size());
+    const uint32_t bc_size = static_cast<uint32_t>(local_bc.size());
+    const uint32_t as_start = static_cast<uint32_t>(as.alloc(as_size));
+    const uint32_t bc_start = static_cast<uint32_t>(box_content.alloc(bc_size));
+
+    space.root_box = static_cast<int>(as_start);
+    space.as_start = as_start;
+    space.as_size = as_size;
+    space.box_content_start = bc_start;
+    space.box_content_size = bc_size;
+
+    for (uint32_t i = 0; i < as_size; ++i)
+    {
+        int v = local_as[i];
+        if (v > 0) v += static_cast<int>(as_start);
+        else if (v < 0) v -= static_cast<int>(bc_start);
+        as[as_start + i] = v;
+    }
+    for (uint32_t i = 0; i < bc_size; ++i)
+    {
+        box_content[bc_start + i] = local_bc[i];
+    }
+
+    soa::upload_soa_range_async(d_as, as, as_start, as_size);
+    soa::upload_soa_range_async(d_box_content, box_content, bc_start, bc_size);
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
     m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 

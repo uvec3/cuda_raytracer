@@ -910,7 +910,6 @@ void BVHAS::free_space(uint32_t space_id, Space space)
     {
         box_content.free(space.box_content_start);
     }
-    sync_to_device();
 }
 
 void BVHAS::finalize_tree_pools(
@@ -999,7 +998,18 @@ void BVHAS::finalize_tree_pools(
     space.box_content_start = bc_start;
     space.box_content_size = total_pairs + 1u;
 
-    sync_to_device();
+    soa::upload_soa_range_async(d_trees, trees, tree_id, 1);
+
+    if (use_16b)
+    {
+        soa::upload_soa_range_async(d_as16, as16, as_start, as16_alloc_count);
+    }
+    else
+    {
+        soa::upload_soa_range_async(d_as, as, as_start, total_nodes);
+    }
+
+    soa::upload_soa_range_async(d_box_content, box_content, bc_start, total_pairs + 1u);
 }
 
 void BVHAS::build_gpu(uint32_t /*space_id*/, Space space, uint32_t number_of_triangles, uint32_t occupied_slots)
@@ -1444,6 +1454,71 @@ void BVHAS::build_cpu(uint32_t /*space_id*/, Space space, uint32_t number_of_tri
 
     bvh_detail::build_cpu_recursive(ctx, 0u, 0u, number_of_triangles, 0);
     finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
+}
+
+void BVHAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<const SubspacePrimitive> subspaces)
+{
+    if (subspaces.empty())
+        return;
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const uint32_t count = static_cast<uint32_t>(subspaces.size());
+
+    std::vector<glm::vec3> prim_min(count);
+    std::vector<glm::vec3> prim_max(count);
+    std::vector<glm::vec3> prim_centroid(count);
+    std::vector<uint32_t> prim_slot_ids(count);
+
+    glm::vec3 root_min(FLT_MAX);
+    glm::vec3 root_max(-FLT_MAX);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        prim_slot_ids[i] = space.primitives_start + i * SubspacePrimitive::occupied_slots;
+        glm::vec3 bmin = subspaces[i].bounds_min;
+        glm::vec3 bmax = subspaces[i].bounds_max;
+        const glm::vec3 centroid = 0.5f * (bmin + bmax);
+        const glm::vec3 abs_max = glm::max(glm::abs(bmin), glm::abs(bmax));
+        const glm::vec3 pad = glm::max(glm::vec3(1e-5f), abs_max * 1e-5f);
+        bmin -= pad;
+        bmax += pad;
+
+        prim_min[i] = bmin;
+        prim_max[i] = bmax;
+        prim_centroid[i] = centroid;
+
+        root_min = glm::min(root_min, bmin);
+        root_max = glm::max(root_max, bmax);
+    }
+
+    std::vector<uint32_t> prim_indices(count);
+    std::iota(prim_indices.begin(), prim_indices.end(), 0u);
+
+    std::vector<BVHNode> host_nodes(1);
+    host_nodes.reserve(count * 2u);
+    std::vector<std::pair<uint32_t, uint32_t>> leaf_pairs;
+    leaf_pairs.reserve(count);
+
+    bvh_detail::CpuBuildContext ctx{
+        .prim_min = prim_min.data(),
+        .prim_max = prim_max.data(),
+        .prim_centroid = prim_centroid.data(),
+        .prim_slot_ids = prim_slot_ids.data(),
+        .prim_indices = &prim_indices,
+        .split_mode = config.split_mode,
+        .max_depth = config.max_depth < 1 ? 1 : (config.max_depth > 30 ? 30 : config.max_depth),
+        .max_leaf_primitives = std::max(config.max_leaf_primitives, 1),
+        .traversal_cost = config.traversal_cost,
+        .intersection_cost = config.intersection_cost,
+        .nodes = &host_nodes,
+        .leaf_pairs = &leaf_pairs,
+        .total_leaves = 0
+    };
+
+    bvh_detail::build_cpu_recursive(ctx, 0u, 0u, count, 0);
+    finalize_tree_pools(space, root_min, root_max, host_nodes, leaf_pairs, ctx.total_leaves);
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    m_build_times_ms[space_id] = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 void BVHAS::build(uint32_t space_id, Space space, PrimitiveType primitive_type)
