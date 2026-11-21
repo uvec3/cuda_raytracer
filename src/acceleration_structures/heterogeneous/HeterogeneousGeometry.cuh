@@ -31,7 +31,7 @@ struct HeterogeneousASDeviceView
     static constexpr uint32_t BLAS_STACK_SIZE = 20;
     static constexpr uint32_t TOTAL_STACK_SIZE = TLAS_STACK_SIZE + BLAS_STACK_SIZE; // 32
     static constexpr uint32_t BLOCK_THREADS = RENDER_BLOCK_THREADS; // up to 32 * 64 * 8B = 16 KB shared memory
-    static constexpr uint32_t PROBE_BLOCK_THREADS = 32;             // 20 * 32 * 8B = 5 KB shared memory
+    static constexpr uint32_t PROBE_BLOCK_THREADS = RENDER_BLOCK_THREADS; // 64 threads/block matching draw_first_hit_kernel and standalone first_hit shared-memory stacks
 
     soa::soa_view<HeterogeneousTreeInfo> trees;
     soa::soa_view<HeterogeneousInstanceInfo> instances;
@@ -682,8 +682,9 @@ __host__ __device__ inline glm::vec4 HeterogeneousASDeviceView::first_hit(
         int it = 0;
         bool continue_traversal = true;
         bool missed = false;
+        bool alpha_terminated = false;
 
-        for (int bounce = 0; bounce < 8 && continue_traversal && it < max_iterations; ++bounce)
+        for (int bounce = 0; continue_traversal && it < max_iterations; ++bounce)
         {
             const float ray_t_min = (bounce == 0) ? 0.0f : 1e-4f;
             uint32_t closest_triangle = UINT32_MAX;
@@ -747,6 +748,11 @@ __host__ __device__ inline glm::vec4 HeterogeneousASDeviceView::first_hit(
                     blas_scale,
                     continue_traversal);
                 hit_primitive_color = blend_colors(hit_primitive_color, res);
+                if (continue_traversal && hit_primitive_color.a > p.alpha_threshold)
+                {
+                    continue_traversal = false;
+                    alpha_terminated = true;
+                }
             }
             else
             {
@@ -760,7 +766,7 @@ __host__ __device__ inline glm::vec4 HeterogeneousASDeviceView::first_hit(
 
         if (!p.show_iterations && !p.show_boxes)
         {
-            if (missed)
+            if (missed || alpha_terminated)
                 hit_primitive_color = blend_colors(hit_primitive_color, miss_shader(source, direction, p));
             return hit_primitive_color;
         }

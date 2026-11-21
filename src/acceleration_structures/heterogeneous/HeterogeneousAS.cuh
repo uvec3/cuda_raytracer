@@ -14,6 +14,13 @@
 #include "../uniform_grid/UniformGridAS.cuh"
 #include "../kdtree/KDTreeAS.cuh"
 #include "../bvh/BVHAS.cuh"
+#include "../../raytracer/RenderParameters.hpp"
+
+enum class ProbeRayPattern : uint32_t
+{
+    CoherentTiles = 0,
+    RandomSphere = 1
+};
 
 struct ASConfigVariant
 {
@@ -91,9 +98,10 @@ public:
     {
         ASType tlas_type = ASType::BVH; // Supports BVH (BVH16), KDTree, UniformGrid, Octree
         bool rebuild_blas = true;
-        float max_memory_bytes_per_triangle = 64.0f;
-        int num_probe_rays = 16384;
-        uint32_t random_seed = 1337u;
+        float max_memory_bytes_per_triangle = 256.0f;
+        int num_probe_rays = 16384*16;
+        uint32_t random_seed = 1u;
+        ProbeRayPattern probe_ray_pattern = ProbeRayPattern::CoherentTiles;
     };
 
     Config config;
@@ -105,6 +113,9 @@ public:
         UniformGridAS* uniform_grid = nullptr,
         KDTreeAS* kdtree = nullptr,
         BVHAS* bvh = nullptr);
+
+    void set_probe_render_params(const RenderParameters& params) { m_probe_render_params = params; }
+    const RenderParameters& get_probe_render_params() const { return m_probe_render_params; }
 
     void bind_context(
         GeometryContext* geometry_context,
@@ -239,7 +250,27 @@ private:
         int32_t root_box,
         bool has_nagata,
         uint32_t ray_count,
-        uint32_t seed) const;
+        uint32_t seed);
 
+    struct ProbeResources
+    {
+        uchar4* d_pixels = nullptr;
+        uint32_t pixel_capacity = 0;
+        cudaEvent_t ev_start = nullptr;
+        cudaEvent_t ev_stop = nullptr;
+
+        ProbeResources() = default;
+        ~ProbeResources();
+        ProbeResources(const ProbeResources&) = delete;
+        ProbeResources& operator=(const ProbeResources&) = delete;
+        ProbeResources(ProbeResources&& other) noexcept;
+        ProbeResources& operator=(ProbeResources&& other) noexcept;
+
+        void ensure(uint32_t ray_count);
+        void release() noexcept;
+    };
+
+    RenderParameters m_probe_render_params{};
+    ProbeResources m_probe_resources{};
     std::unordered_map<uint32_t, SpaceMetadata> m_space_metadata;
 };

@@ -530,7 +530,7 @@ namespace kdtree_detail
         if (best_axis >= 0)
         {
             const float leaf_cost = intersection_cost * static_cast<float>(N);
-            if (best_cost < leaf_cost || N > static_cast<uint32_t>(max_leaf_primitives) || is_thick_3d_box)
+            if (best_cost < leaf_cost || (!is_subspace && (N > static_cast<uint32_t>(max_leaf_primitives) || is_thick_3d_box)))
             {
                 out_axis = static_cast<uint32_t>(best_axis);
                 out_split_pos = best_split_pos;
@@ -545,7 +545,7 @@ namespace kdtree_detail
             return true;
         }
 
-        if (is_thick_3d_box || N > static_cast<uint32_t>(max_leaf_primitives))
+        if (!is_subspace && (is_thick_3d_box || N > static_cast<uint32_t>(max_leaf_primitives)))
         {
             const uint32_t axis = longest_axis(ext);
             out_axis = axis;

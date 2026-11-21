@@ -5,6 +5,9 @@
 #include "Scene.hpp"
 #include "../cuda_common.hpp"
 #include "rt_kernels.cuh"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 
 Raytracer::Raytracer()
@@ -12,8 +15,113 @@ Raytracer::Raytracer()
     start_time = std::chrono::high_resolution_clock::now();
 }
 
+void Raytracer::reset_animations_state()
+{
+    active_animations.clear();
+    animation_playing = false;
+    animation_time = 0.0f;
+    animation_dirty = false;
+    has_last_animation_tick = false;
+}
+
+void Raytracer::step_animations(Scene& scene)
+{
+    float min_start = std::numeric_limits<float>::infinity();
+    float max_end = -std::numeric_limits<float>::infinity();
+    bool has_valid = false;
+    for (uint32_t idx : active_animations)
+    {
+        if (idx < scene.m_animations.size())
+        {
+            const Animation& anim = scene.m_animations[idx];
+            min_start = std::min(min_start, anim.start_time);
+            max_end = std::max(max_end, anim.end_time);
+            has_valid = true;
+        }
+    }
+
+    if (!has_valid)
+    {
+        has_last_animation_tick = false;
+        animation_dirty = false;
+        return;
+    }
+
+    if (animation_playing)
+    {
+        const auto now = std::chrono::high_resolution_clock::now();
+        const float dt = has_last_animation_tick
+            ? std::chrono::duration<float>(now - last_animation_tick).count()
+            : 0.0f;
+        last_animation_tick = now;
+        has_last_animation_tick = true;
+
+        animation_time += dt * animation_speed;
+        const float span = max_end - min_start;
+        if (span > 1e-6f)
+        {
+            if (animation_loop)
+            {
+                float offset = std::fmod(animation_time - min_start, span);
+                if (offset < 0.0f)
+                    offset += span;
+                animation_time = min_start + offset;
+            }
+            else
+            {
+                if (animation_speed >= 0.0f && animation_time >= max_end)
+                {
+                    animation_time = max_end;
+                    animation_playing = false;
+                    has_last_animation_tick = false;
+                }
+                else if (animation_speed < 0.0f && animation_time <= min_start)
+                {
+                    animation_time = min_start;
+                    animation_playing = false;
+                    has_last_animation_tick = false;
+                }
+                else
+                {
+                    animation_time = std::clamp(animation_time, min_start, max_end);
+                }
+            }
+        }
+        else
+        {
+            animation_time = min_start;
+            if (!animation_loop)
+            {
+                animation_playing = false;
+                has_last_animation_tick = false;
+            }
+        }
+
+        if (scene.apply_animations(active_animations, animation_time, animation_loop))
+        {
+            scene.rebuild_active_as();
+        }
+        animation_dirty = false;
+    }
+    else
+    {
+        has_last_animation_tick = false;
+        if (animation_dirty)
+        {
+            if (scene.apply_animations(active_animations, animation_time, animation_loop))
+            {
+                scene.rebuild_active_as();
+            }
+            animation_dirty = false;
+        }
+    }
+}
+
 void Raytracer::update_parameters(Scene& scene, uint32_t width, uint32_t height)
 {
+    scene.as_heterogeneous.set_probe_render_params(parameters);
+    step_animations(scene);
+
     parameters.t= (std::chrono::high_resolution_clock::now()-start_time).count() / 1000000000.0;
 
     parameters.root_box=scene.get_root_box();

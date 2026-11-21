@@ -39,6 +39,7 @@ struct RenderParameters
 
     //traversal
     int max_iterations=2000;
+    float alpha_threshold = 0.99f;
 
     //lighting
     float ambient_light = 0.1f;

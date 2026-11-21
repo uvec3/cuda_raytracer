@@ -320,8 +320,8 @@ glm::vec4 KDTreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
 #endif
 
     int it = 0;
-    int bounce = 0;
     bool continue_traversal = true;
+    bool alpha_terminated = false;
 
     while (container_id != 0 && continue_traversal && it < max_iterations)
     {
@@ -352,16 +352,14 @@ glm::vec4 KDTreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
             {
                 auto res = fragment_hit_shader<HasNagata>(closest_triangle, source, direction, closest_tuv, p, continue_traversal);
                 hit_primitive_color = blend_colors(hit_primitive_color, res);
+                if (continue_traversal && hit_primitive_color.a > p.alpha_threshold)
+                {
+                    continue_traversal = false;
+                    alpha_terminated = true;
+                }
                 if (continue_traversal)
                 {
-                    if (++bounce < 8)
-                    {
-                        current_node = CurrentKDNode{.t_min = 1e-4f, .t_max = 1e-4f};
-                    }
-                    else
-                    {
-                        continue_traversal = false;
-                    }
+                    current_node = CurrentKDNode{.t_min = 1e-4f, .t_max = 1e-4f};
                 }
             }
         }
@@ -377,7 +375,7 @@ glm::vec4 KDTreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
 
     if (!p.show_iterations && !p.show_boxes)
     {
-        if (current_node.exited)
+        if (current_node.exited || alpha_terminated)
             hit_primitive_color = blend_colors(hit_primitive_color, miss_shader(source, direction, p));
         return hit_primitive_color;
     }

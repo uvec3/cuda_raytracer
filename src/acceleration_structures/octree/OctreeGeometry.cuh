@@ -282,6 +282,7 @@ glm::vec4 OctreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
     //one iteration is a one horizontal step through octree
     int it=0;
     bool continue_traversal=true;
+    bool alpha_terminated=false;
     while (container_id!=0 && continue_traversal && it<max_iterations)
     {
         //AS TRAVERSAL STEP (returns after hitting non-empty leaf node)
@@ -312,6 +313,11 @@ glm::vec4 OctreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
             {
                 auto res=fragment_hit_shader<HasNagata>(closest_triangle,source,direction,closest_tuv,p,continue_traversal);
                 hit_primitive_color=blend_colors(hit_primitive_color,res);
+                if (continue_traversal && hit_primitive_color.a > p.alpha_threshold)
+                {
+                    continue_traversal = false;
+                    alpha_terminated = true;
+                }
                 if (continue_traversal)
                 {
                     current_box.t_min=1e-4f;
@@ -331,7 +337,7 @@ glm::vec4 OctreeASDeviceView::first_hit(const RenderParams& p, glm::vec3 source,
 
     if (!p.show_iterations && !p.show_boxes)
     {
-        if (current_box.stack.depth()==0)//call miss shader
+        if (current_box.stack.depth()==0 || alpha_terminated)//call miss shader
             hit_primitive_color=blend_colors(hit_primitive_color,miss_shader(source,direction,p));
         return hit_primitive_color;
     }

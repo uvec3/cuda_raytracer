@@ -13,12 +13,6 @@
 
 namespace heterogeneous_host_detail
 {
-    struct ProbeRenderParams
-    {
-        soa::soa_view<PrimitiveChunk16> primitives;
-        soa::soa_view<Vertex> vertices;
-    };
-
     __device__ __forceinline__ uint32_t pcg_hash(uint32_t input)
     {
         uint32_t state = input * 747796405u + 2891336453u;
@@ -55,65 +49,81 @@ namespace heterogeneous_host_detail
         out_dir = glm::normalize(target - out_orig);
     }
 
-    template <ASType CandidateType, bool HasNagata>
-    __global__ void probe_subspace_candidate_kernel(
-        BVHASDeviceView bvh_view,
-        KDTreeASDeviceView kdtree_view,
-        UniformGridASDeviceView grid_view,
-        OctreeASDeviceView octree_view,
-        ProbeRenderParams params,
-        int32_t root_box,
-        uint32_t ray_count,
-        uint32_t seed,
-        uint32_t* out_checksum)
+    __device__ __forceinline__ void make_coherent_tile_probe_ray(
+        uint32_t block_idx,
+        uint32_t thread_idx,
+        uint32_t tiles_per_side,
+        glm::vec3& out_orig,
+        glm::vec3& out_dir)
     {
-        constexpr uint32_t block_threads = HeterogeneousASDeviceView::PROBE_BLOCK_THREADS;
-        constexpr uint32_t blas_stack_size = HeterogeneousASDeviceView::BLAS_STACK_SIZE;
-        constexpr bool needs_stack = (CandidateType == ASType::BVH || CandidateType == ASType::KDTree);
-        constexpr uint32_t active_stack_size = needs_stack ? blas_stack_size : 1u;
+        const uint32_t tiles_per_view = tiles_per_side * tiles_per_side;
+        const uint32_t view_idx = block_idx / tiles_per_view;
+        const uint32_t tile_in_view = block_idx % tiles_per_view;
+        const uint32_t tile_x = tile_in_view % tiles_per_side;
+        const uint32_t tile_y = tile_in_view / tiles_per_side;
 
-        __shared__ BVHStackEntry shared_stack[active_stack_size][block_threads];
-        void* stack_base = needs_stack ? static_cast<void*>(&shared_stack[0][threadIdx.x]) : nullptr;
+        // Match threadPixelPos() 8x8 tile layout (RENDER_BLOCK_THREADS == 64)
+        const uint32_t px = tile_x * 8u + (thread_idx & 7u);
+        const uint32_t py = tile_y * 8u + (thread_idx >> 3);
+        const uint32_t img_dim = tiles_per_side * 8u;
 
+        const float ndc_x = ((static_cast<float>(px) + 0.5f) / static_cast<float>(img_dim)) * 2.0f - 1.0f;
+        const float ndc_y = 1.0f - ((static_cast<float>(py) + 0.5f) / static_cast<float>(img_dim)) * 2.0f;
+
+        const float sx = (view_idx & 1u) ? 1.0f : -1.0f;
+        const float sy = (view_idx & 2u) ? 1.0f : -1.0f;
+        const float sz = (view_idx & 4u) ? 1.0f : -1.0f;
+        const glm::vec3 from_center = glm::normalize(glm::vec3(sx * 1.0f, sy * 0.93f, sz * 0.87f));
+        const glm::vec3 center(0.5f, 0.5f, 0.5f);
+        constexpr float cam_dist = 1.65f;
+        constexpr float half_tan = 0.62f;
+
+        out_orig = center + from_center * cam_dist;
+        const glm::vec3 fwd = -from_center;
+        const glm::vec3 world_up = glm::normalize(glm::vec3(0.05f, 0.03f, 1.0f));
+        const glm::vec3 right = glm::normalize(glm::cross(fwd, world_up));
+        const glm::vec3 up = glm::cross(right, fwd);
+        out_dir = glm::normalize(fwd + right * (ndc_x * half_tan) + up * (ndc_y * half_tan));
+    }
+
+    template <ASType CandidateType, bool HasNagata, bool CoherentTiles>
+    __global__ void probe_subspace_candidate_kernel(
+        const __grid_constant__ RenderParameters params,
+        uint32_t total_rays,
+        uint32_t tiles_per_side,
+        uint32_t seed,
+        uchar4* out_pixels)
+    {
         const uint32_t ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (ray_idx >= ray_count || root_box < 0)
+        if (ray_idx >= total_rays || params.root_box < 0)
             return;
 
         glm::vec3 orig{}, dir{};
-        make_probe_ray(ray_idx, seed, orig, dir);
-
-        uint32_t closest_tri = UINT32_MAX;
-        glm::vec3 closest_tuv{INFINITY, 0.0f, 0.0f};
-        int it = 0;
-
-        const auto& as_view = [&]() -> const auto& {
-            if constexpr (CandidateType == ASType::BVH)
-                return bvh_view;
-            else if constexpr (CandidateType == ASType::KDTree)
-                return kdtree_view;
-            else if constexpr (CandidateType == ASType::UniformGrid)
-                return grid_view;
-            else
-                return octree_view;
-        }();
-
-        heterogeneous_detail::traverse_as_primitives<CandidateType, HasNagata, block_threads, blas_stack_size, true, false>(
-            as_view,
-            root_box,
-            stack_base,
-            params,
-            orig,
-            dir,
-            0.0f,
-            closest_tuv,
-            closest_tri,
-            it,
-            nullptr);
-
-        if (closest_tri != UINT32_MAX && out_checksum != nullptr)
+        if constexpr (CoherentTiles)
         {
-            atomicAdd(out_checksum, (closest_tri & 0xFFFFu) ^ static_cast<uint32_t>(it));
+            make_coherent_tile_probe_ray(blockIdx.x, threadIdx.x, tiles_per_side, orig, dir);
         }
+        else
+        {
+            make_probe_ray(ray_idx, seed, orig, dir);
+        }
+
+        glm::vec4 color{0.0f};
+        if constexpr (CandidateType == ASType::BVH)
+            color = params.as_bvh.template first_hit<HasNagata, true>(params, orig, dir);
+        else if constexpr (CandidateType == ASType::KDTree)
+            color = params.as_kdtree.template first_hit<HasNagata>(params, orig, dir);
+        else if constexpr (CandidateType == ASType::UniformGrid)
+            color = params.as_uniform_grid.template first_hit<HasNagata>(params, orig, dir);
+        else if constexpr (CandidateType == ASType::Octree)
+            color = params.as_octree.template first_hit<HasNagata>(params, orig, dir);
+
+        color = glm::clamp(color, 0.0f, 1.0f);
+        out_pixels[ray_idx] = make_uchar4(
+            static_cast<unsigned char>(color.r * 255.0f),
+            static_cast<unsigned char>(color.g * 255.0f),
+            static_cast<unsigned char>(color.b * 255.0f),
+            static_cast<unsigned char>(color.a * 255.0f));
     }
 
     inline const char* as_type_short_name(ASType t)
@@ -128,6 +138,79 @@ namespace heterogeneous_host_detail
         }
     }
 } // namespace heterogeneous_host_detail
+
+HeterogeneousAS::ProbeResources::~ProbeResources()
+{
+    release();
+}
+
+HeterogeneousAS::ProbeResources::ProbeResources(ProbeResources&& other) noexcept
+    : d_pixels(other.d_pixels)
+    , pixel_capacity(other.pixel_capacity)
+    , ev_start(other.ev_start)
+    , ev_stop(other.ev_stop)
+{
+    other.d_pixels = nullptr;
+    other.pixel_capacity = 0;
+    other.ev_start = nullptr;
+    other.ev_stop = nullptr;
+}
+
+HeterogeneousAS::ProbeResources& HeterogeneousAS::ProbeResources::operator=(ProbeResources&& other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        d_pixels = other.d_pixels;
+        pixel_capacity = other.pixel_capacity;
+        ev_start = other.ev_start;
+        ev_stop = other.ev_stop;
+        other.d_pixels = nullptr;
+        other.pixel_capacity = 0;
+        other.ev_start = nullptr;
+        other.ev_stop = nullptr;
+    }
+    return *this;
+}
+
+void HeterogeneousAS::ProbeResources::release() noexcept
+{
+    if (d_pixels != nullptr)
+    {
+        cudaFree(d_pixels);
+        d_pixels = nullptr;
+    }
+    pixel_capacity = 0;
+    if (ev_start != nullptr)
+    {
+        cudaEventDestroy(ev_start);
+        ev_start = nullptr;
+    }
+    if (ev_stop != nullptr)
+    {
+        cudaEventDestroy(ev_stop);
+        ev_stop = nullptr;
+    }
+}
+
+void HeterogeneousAS::ProbeResources::ensure(uint32_t ray_count)
+{
+    if (ev_start == nullptr)
+        CUDA_CHECK(cudaEventCreate(&ev_start));
+    if (ev_stop == nullptr)
+        CUDA_CHECK(cudaEventCreate(&ev_stop));
+    if (ray_count > pixel_capacity)
+    {
+        if (d_pixels != nullptr)
+        {
+            CUDA_CHECK(cudaFree(d_pixels));
+            d_pixels = nullptr;
+            pixel_capacity = 0;
+        }
+        CUDA_CHECK(cudaMalloc(&d_pixels, static_cast<size_t>(ray_count) * sizeof(uchar4)));
+        pixel_capacity = ray_count;
+    }
+}
 
 HeterogeneousAS::HeterogeneousAS(
     GeometryContext* geometry_context,
@@ -252,6 +335,7 @@ void HeterogeneousAS::apply_variant_config(const ASConfigVariant& variant)
     {
         m_bvh->config = variant.bvh_config;
         m_bvh->config.use_bvh16 = true; // Strictly enforce BVH16 only
+        // m_bvh->config.max_leaf_primitives=1;
     }
     else if (variant.as_type == ASType::KDTree && m_kdtree)
     {
@@ -357,79 +441,112 @@ float HeterogeneousAS::benchmark_candidate_gpu(
     int32_t root_box,
     bool has_nagata,
     uint32_t ray_count,
-    uint32_t seed) const
+    uint32_t seed)
 {
     if (root_box < 0 || ray_count == 0 || m_geometry_context == nullptr)
         return FLT_MAX;
 
-    uint32_t* d_checksum = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_checksum, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_checksum, 0, sizeof(uint32_t)));
-
-    cudaEvent_t ev_start = nullptr;
-    cudaEvent_t ev_stop = nullptr;
-    CUDA_CHECK(cudaEventCreate(&ev_start));
-    CUDA_CHECK(cudaEventCreate(&ev_stop));
-
-    const heterogeneous_host_detail::ProbeRenderParams params{
-        .primitives = m_geometry_context->primitives.view(),
-        .vertices = m_geometry_context->vertices.view()
-    };
-
-    const BVHASDeviceView bvh_view = m_bvh ? m_bvh->device_view() : BVHASDeviceView{};
-    const KDTreeASDeviceView kd_view = m_kdtree ? m_kdtree->device_view() : KDTreeASDeviceView{};
-    const UniformGridASDeviceView grid_view = m_uniform_grid ? m_uniform_grid->device_view() : UniformGridASDeviceView{};
-    const OctreeASDeviceView oct_view = m_octree ? m_octree->device_view() : OctreeASDeviceView{};
-
+    static_assert(
+        HeterogeneousASDeviceView::PROBE_BLOCK_THREADS == RENDER_BLOCK_THREADS,
+        "Probe block size must match RENDER_BLOCK_THREADS used by first_hit shared-memory stacks");
     constexpr uint32_t block_threads = HeterogeneousASDeviceView::PROBE_BLOCK_THREADS;
-    const uint32_t grid_blocks = (ray_count - 1u) / block_threads + 1u;
+    const bool coherent = (config.probe_ray_pattern == ProbeRayPattern::CoherentTiles);
 
-    auto launch_probe = [&]<ASType Type>()
+    uint32_t tiles_per_side = 0u;
+    uint32_t grid_blocks = 0u;
+    uint32_t total_rays = 0u;
+    if (coherent)
+    {
+        constexpr uint32_t kNumViews = 8u;
+        const uint32_t min_rays = kNumViews * block_threads;
+        const uint32_t target_rays = std::max(ray_count, min_rays);
+        tiles_per_side = std::max(
+            1u,
+            static_cast<uint32_t>(std::lround(std::sqrt(static_cast<double>(target_rays) / static_cast<double>(min_rays)))));
+        grid_blocks = kNumViews * tiles_per_side * tiles_per_side;
+        total_rays = grid_blocks * block_threads;
+    }
+    else
+    {
+        total_rays = ray_count;
+        grid_blocks = (total_rays - 1u) / block_threads + 1u;
+    }
+
+    m_probe_resources.ensure(total_rays);
+
+    RenderParameters params = m_probe_render_params;
+    params.root_box = root_box;
+    params.active_as_type = as_type;
+    params.as_bvh = m_bvh ? m_bvh->device_view() : BVHASDeviceView{};
+    params.as_kdtree = m_kdtree ? m_kdtree->device_view() : KDTreeASDeviceView{};
+    params.as_uniform_grid = m_uniform_grid ? m_uniform_grid->device_view() : UniformGridASDeviceView{};
+    params.as_octree = m_octree ? m_octree->device_view() : OctreeASDeviceView{};
+    params.as_heterogeneous = device_view();
+    params.primitives = m_geometry_context->primitives.view();
+    params.vertices = m_geometry_context->vertices.view();
+    params.materials = m_geometry_context->materials.view();
+    params.spaces = m_geometry_context->d_spaces.view();
+
+    // Sanitize debug/overlay flags so candidate timing reflects real rendering traversal.
+    params.show_triangles = true;
+    params.show_iterations = false;
+    params.show_boxes = false;
+    params.show_blas_bounding_box = false;
+    params.measure_time = false;
+    if (params.materials.size() == 0)
+    {
+        params.enableRefraction = false;
+    }
+
+    auto launch_probe = [&]<ASType Type, bool Coherent>()
     {
         if (has_nagata)
         {
-            heterogeneous_host_detail::probe_subspace_candidate_kernel<Type, true>
+            heterogeneous_host_detail::probe_subspace_candidate_kernel<Type, true, Coherent>
                 <<<grid_blocks, block_threads>>>(
-                    bvh_view, kd_view, grid_view, oct_view, params,
-                    root_box, ray_count, seed, d_checksum);
+                    params, total_rays, tiles_per_side, seed, m_probe_resources.d_pixels);
         }
         else
         {
-            heterogeneous_host_detail::probe_subspace_candidate_kernel<Type, false>
+            heterogeneous_host_detail::probe_subspace_candidate_kernel<Type, false, Coherent>
                 <<<grid_blocks, block_threads>>>(
-                    bvh_view, kd_view, grid_view, oct_view, params,
-                    root_box, ray_count, seed, d_checksum);
+                    params, total_rays, tiles_per_side, seed, m_probe_resources.d_pixels);
         }
+    };
+
+    auto dispatch_type = [&]<bool Coherent>()
+    {
+        if (as_type == ASType::BVH)
+            launch_probe.template operator()<ASType::BVH, Coherent>();
+        else if (as_type == ASType::KDTree)
+            launch_probe.template operator()<ASType::KDTree, Coherent>();
+        else if (as_type == ASType::UniformGrid)
+            launch_probe.template operator()<ASType::UniformGrid, Coherent>();
+        else if (as_type == ASType::Octree)
+            launch_probe.template operator()<ASType::Octree, Coherent>();
     };
 
     auto dispatch = [&]()
     {
-        if (as_type == ASType::BVH)
-            launch_probe.template operator()<ASType::BVH>();
-        else if (as_type == ASType::KDTree)
-            launch_probe.template operator()<ASType::KDTree>();
-        else if (as_type == ASType::UniformGrid)
-            launch_probe.template operator()<ASType::UniformGrid>();
-        else if (as_type == ASType::Octree)
-            launch_probe.template operator()<ASType::Octree>();
+        if (coherent)
+            dispatch_type.template operator()<true>();
+        else
+            dispatch_type.template operator()<false>();
     };
 
     // Warmup launch avoids cold JIT/L1I penalty on the first tested candidate
     dispatch();
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaEventRecord(ev_start, 0));
+    CUDA_CHECK(cudaEventRecord(m_probe_resources.ev_start, 0));
     dispatch();
-    CUDA_CHECK(cudaEventRecord(ev_stop, 0));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    CUDA_CHECK(cudaEventRecord(m_probe_resources.ev_stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(m_probe_resources.ev_stop));
     CUDA_CHECK(cudaGetLastError());
 
     float elapsed_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop));
-
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
-    cudaFree(d_checksum);
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, m_probe_resources.ev_start, m_probe_resources.ev_stop));
     return elapsed_ms;
 }
 
@@ -669,6 +786,7 @@ ASType HeterogeneousAS::configure_tlas_builder(ASType requested_type)
     else if (tlas_as_type == ASType::KDTree && m_kdtree)
     {
         m_kdtree->config.split_mode = KDSplitMode::SAH;
+        m_kdtree->config.max_depth = 20;
         m_kdtree->config.max_leaf_primitives = 2;
         m_kdtree->config.use_gpu = true;
     }
@@ -679,7 +797,7 @@ ASType HeterogeneousAS::configure_tlas_builder(ASType requested_type)
     else if (tlas_as_type == ASType::Octree && m_octree)
     {
         m_octree->config.min_depth = 1;
-        m_octree->config.max_depth = 19;
+        m_octree->config.max_depth = 8;
         m_octree->config.triangle_to_box_stop_ratio = 2.f;
         m_octree->config.stretch = false;
         m_octree->config.use_gpu = true;
@@ -703,7 +821,7 @@ void HeterogeneousAS::finalize_tlas(
     const SavedASConfigs saved_configs = save_standalone_configs();
     const ASType tlas_as_type = configure_tlas_builder(config.tlas_type);
 
-    constexpr size_t kCpuSubspaceTlasThreshold = 512u;
+    constexpr size_t kCpuSubspaceTlasThreshold = 16384u;
     if (!subspaces.empty() && subspaces.size() <= kCpuSubspaceTlasThreshold)
     {
         tlas_space.as_type = tlas_as_type;
@@ -1017,6 +1135,15 @@ void HeterogeneousAS::config_ui()
 
     ImGui::DragFloat("Max AS Bytes / Tri", &config.max_memory_bytes_per_triangle, 1.0f, 4.0f, 512.0f, "%.1f B");
     ImGui::DragInt("Probe Rays / Candidate", &config.num_probe_rays, 256.0f, 1024, 262144);
+
+    const char* probe_pattern_names[] = {"Coherent 8x8 Camera Tiles", "Random Sphere Rays"};
+    int pattern_idx = (config.probe_ray_pattern == ProbeRayPattern::RandomSphere) ? 1 : 0;
+    if (ImGui::Combo("Probe Ray Pattern", &pattern_idx, probe_pattern_names, 2))
+    {
+        config.probe_ray_pattern = (pattern_idx == 1)
+            ? ProbeRayPattern::RandomSphere
+            : ProbeRayPattern::CoherentTiles;
+    }
 
     if (ImGui::TreeNode("Candidate Presets (BVH uses BVH16 only)"))
     {

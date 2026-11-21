@@ -141,6 +141,7 @@ Scene::Scene(Scene&& other) noexcept
     , m_materials(std::move(other.m_materials))
     , d_materials(std::move(other.d_materials))
     , m_nodes(std::move(other.m_nodes))
+    , m_animations(std::move(other.m_animations))
     , root_node_id(other.root_node_id)
     , m_mesh_node_ids(std::move(other.m_mesh_node_ids))
     , default_scene(other.default_scene)
@@ -188,6 +189,7 @@ Scene& Scene::operator=(Scene&& other) noexcept
         m_materials = std::move(other.m_materials);
         d_materials = std::move(other.d_materials);
         m_nodes = std::move(other.m_nodes);
+        m_animations = std::move(other.m_animations);
         root_node_id = other.root_node_id;
         m_mesh_node_ids = std::move(other.m_mesh_node_ids);
         default_scene = other.default_scene;
@@ -290,7 +292,8 @@ void Scene::load(std::string_view data, bool load_textures)
     std::vector<uint32_t> materialIds = loadMaterials(model, textureIds);
     std::vector<uint32_t> meshIds = loadMeshes(model, materialIds);
 
-    load_nodes(model, meshIds);
+    std::vector<uint32_t> importedGltfNodes = load_nodes(model, meshIds);
+    load_animations(model, importedGltfNodes);
 
     sync_materials_to_device();
 
@@ -1632,7 +1635,7 @@ uint32_t Scene::importNode(const tg3_model& model, uint32_t nodeIndex, const std
     return my_id;
 }
 
-void Scene::load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds)
+std::vector<uint32_t> Scene::load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds)
 {
     default_scene = (model.default_scene >= 0 && static_cast<uint32_t>(model.default_scene) < model.scenes_count)
         ? static_cast<uint32_t>(model.default_scene)
@@ -1688,6 +1691,303 @@ void Scene::load_nodes(const tg3_model& model, const std::vector<uint32_t>& mesh
     }
 
     m_nodes[root_node_id].children = std::move(subscene_ids);
+    return importedGltfNodes;
+}
+
+namespace
+{
+    struct AccessorView
+    {
+        const uint8_t* base_ptr = nullptr;
+        uint64_t count = 0;
+        size_t stride = 0;
+        int32_t comp_size = 0;
+        int32_t num_comps = 0;
+        int32_t component_type = 0;
+        int32_t type = 0;
+        bool normalized = false;
+    };
+
+    bool resolve_accessor_view(const tg3_model& model, int32_t accessor_idx, AccessorView& out)
+    {
+        if (accessor_idx < 0 || static_cast<uint32_t>(accessor_idx) >= model.accessors_count || !model.accessors)
+            return false;
+
+        const tg3_accessor* accessor = &model.accessors[accessor_idx];
+        if (accessor->buffer_view < 0 ||
+            static_cast<uint32_t>(accessor->buffer_view) >= model.buffer_views_count ||
+            !model.buffer_views)
+            return false;
+
+        const tg3_buffer_view* bv = &model.buffer_views[accessor->buffer_view];
+        if (bv->buffer < 0 ||
+            static_cast<uint32_t>(bv->buffer) >= model.buffers_count ||
+            !model.buffers)
+            return false;
+
+        const tg3_buffer* buf = &model.buffers[bv->buffer];
+        const int32_t comp_size = tg3_component_size(accessor->component_type);
+        const int32_t num_comps = tg3_num_components(accessor->type);
+        if (comp_size <= 0 || num_comps <= 0)
+            return false;
+
+        const size_t elem_size = static_cast<size_t>(comp_size) * static_cast<size_t>(num_comps);
+        const size_t stride = (bv->byte_stride != 0) ? static_cast<size_t>(bv->byte_stride) : elem_size;
+        if (stride < elem_size)
+            return false;
+
+        if (accessor->count > 0)
+        {
+            if (buf->data.data == nullptr)
+                return false;
+
+            const uint64_t last_elem_offset = (accessor->count - 1u) * static_cast<uint64_t>(stride);
+            if (stride != 0 && last_elem_offset / static_cast<uint64_t>(stride) != (accessor->count - 1u))
+                return false;
+
+            const uint64_t span = last_elem_offset + static_cast<uint64_t>(elem_size);
+            if (span < last_elem_offset)
+                return false;
+
+            const uint64_t end_in_bv = accessor->byte_offset + span;
+            if (end_in_bv < accessor->byte_offset || end_in_bv > bv->byte_length)
+                return false;
+
+            const uint64_t buffer_offset = bv->byte_offset + accessor->byte_offset;
+            if (buffer_offset < bv->byte_offset)
+                return false;
+
+            const uint64_t end_in_buf = buffer_offset + span;
+            if (end_in_buf < buffer_offset || end_in_buf > buf->data.count)
+                return false;
+
+            out.base_ptr = buf->data.data + buffer_offset;
+        }
+
+        out.count = accessor->count;
+        out.stride = stride;
+        out.comp_size = comp_size;
+        out.num_comps = num_comps;
+        out.component_type = accessor->component_type;
+        out.type = accessor->type;
+        out.normalized = (accessor->normalized != 0);
+        return true;
+    }
+
+    bool readAccessorScalars(const tg3_model& model, int32_t accessor_idx, std::vector<float>& out)
+    {
+        AccessorView view{};
+        if (!resolve_accessor_view(model, accessor_idx, view) || view.type != TG3_TYPE_SCALAR)
+            return false;
+
+        out.resize(static_cast<size_t>(view.count));
+        if (view.count == 0)
+            return true;
+
+        if (view.component_type == TG3_COMPONENT_TYPE_FLOAT &&
+            view.stride == sizeof(float) &&
+            !view.normalized)
+        {
+            std::memcpy(out.data(), view.base_ptr, static_cast<size_t>(view.count) * sizeof(float));
+            return true;
+        }
+
+        for (uint64_t i = 0; i < view.count; ++i)
+        {
+            out[static_cast<size_t>(i)] = readComponentAsFloat(
+                view.base_ptr + i * view.stride,
+                view.component_type,
+                view.normalized);
+        }
+        return true;
+    }
+
+    bool readAccessorVec4s(const tg3_model& model, int32_t accessor_idx, std::vector<glm::vec4>& out, int32_t& out_type)
+    {
+        AccessorView view{};
+        if (!resolve_accessor_view(model, accessor_idx, view))
+            return false;
+        if (view.type != TG3_TYPE_VEC3 && view.type != TG3_TYPE_VEC4)
+            return false;
+
+        out_type = view.type;
+        out.resize(static_cast<size_t>(view.count));
+        if (view.count == 0)
+            return true;
+
+        if (sizeof(glm::vec4) == 4 * sizeof(float) &&
+            view.component_type == TG3_COMPONENT_TYPE_FLOAT &&
+            view.type == TG3_TYPE_VEC4 &&
+            view.stride == sizeof(glm::vec4) &&
+            !view.normalized)
+        {
+            std::memcpy(out.data(), view.base_ptr, static_cast<size_t>(view.count) * sizeof(glm::vec4));
+            return true;
+        }
+
+        for (uint64_t i = 0; i < view.count; ++i)
+        {
+            const uint8_t* elem_ptr = view.base_ptr + i * view.stride;
+            float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int32_t c = 0; c < view.num_comps; ++c)
+            {
+                values[c] = readComponentAsFloat(
+                    elem_ptr + static_cast<size_t>(c) * static_cast<size_t>(view.comp_size),
+                    view.component_type,
+                    view.normalized);
+            }
+            out[static_cast<size_t>(i)] = glm::vec4(values[0], values[1], values[2], values[3]);
+        }
+        return true;
+    }
+} // namespace
+
+void Scene::load_animations(const tg3_model& model, const std::vector<uint32_t>& importedGltfNodes)
+{
+    m_animations.clear();
+    if (model.animations_count == 0 || model.animations == nullptr)
+        return;
+
+    m_animations.reserve(model.animations_count);
+
+    for (uint32_t i = 0; i < model.animations_count; ++i)
+    {
+        const tg3_animation& tg3Anim = model.animations[i];
+        Animation anim;
+        anim.name = (tg3Anim.name.data != nullptr && tg3Anim.name.len > 0)
+            ? std::string(tg3Anim.name.data, tg3Anim.name.len)
+            : ("Animation " + std::to_string(i));
+
+        anim.samplers.resize(tg3Anim.samplers_count);
+        std::vector<bool> sampler_valid(tg3Anim.samplers_count, false);
+        std::vector<int32_t> sampler_output_type(tg3Anim.samplers_count, 0);
+
+        for (uint32_t s = 0; s < tg3Anim.samplers_count; ++s)
+        {
+            const tg3_animation_sampler& tg3Sampler = tg3Anim.samplers[s];
+            AnimationSampler& sampler = anim.samplers[s];
+
+            if (tg3_str_equals_cstr(tg3Sampler.interpolation, "STEP"))
+            {
+                sampler.interpolation = AnimationInterpolation::Step;
+            }
+            else if (tg3_str_equals_cstr(tg3Sampler.interpolation, "CUBICSPLINE"))
+            {
+                sampler.interpolation = AnimationInterpolation::CubicSpline;
+            }
+            else
+            {
+                sampler.interpolation = AnimationInterpolation::Linear;
+            }
+
+            std::vector<float> inputs;
+            std::vector<glm::vec4> outputs;
+            int32_t output_type = 0;
+            if (!readAccessorScalars(model, tg3Sampler.input, inputs) ||
+                !readAccessorVec4s(model, tg3Sampler.output, outputs, output_type))
+            {
+                continue;
+            }
+
+            if (inputs.empty())
+                continue;
+
+            const size_t expected_outputs = (sampler.interpolation == AnimationInterpolation::CubicSpline)
+                ? (inputs.size() * 3u)
+                : inputs.size();
+            if (outputs.size() != expected_outputs)
+                continue;
+
+            sampler.inputs = std::move(inputs);
+            sampler.outputs = std::move(outputs);
+            sampler_valid[s] = true;
+            sampler_output_type[s] = output_type;
+        }
+
+        anim.channels.reserve(tg3Anim.channels_count);
+        for (uint32_t c = 0; c < tg3Anim.channels_count; ++c)
+        {
+            const tg3_animation_channel& tg3Channel = tg3Anim.channels[c];
+            if (tg3Channel.sampler < 0 ||
+                static_cast<uint32_t>(tg3Channel.sampler) >= tg3Anim.samplers_count ||
+                !sampler_valid[tg3Channel.sampler])
+            {
+                continue;
+            }
+
+            if (tg3Channel.target.node < 0 ||
+                static_cast<uint32_t>(tg3Channel.target.node) >= importedGltfNodes.size())
+            {
+                continue;
+            }
+
+            const uint32_t mapped_node_id = importedGltfNodes[tg3Channel.target.node];
+            if (mapped_node_id == UINT32_MAX || mapped_node_id >= m_nodes.size())
+            {
+                continue;
+            }
+
+            AnimationPath path{};
+            int32_t required_output_type = 0;
+            if (tg3_str_equals_cstr(tg3Channel.target.path, "translation"))
+            {
+                path = AnimationPath::Translation;
+                required_output_type = TG3_TYPE_VEC3;
+            }
+            else if (tg3_str_equals_cstr(tg3Channel.target.path, "rotation"))
+            {
+                path = AnimationPath::Rotation;
+                required_output_type = TG3_TYPE_VEC4;
+            }
+            else if (tg3_str_equals_cstr(tg3Channel.target.path, "scale"))
+            {
+                path = AnimationPath::Scale;
+                required_output_type = TG3_TYPE_VEC3;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (sampler_output_type[tg3Channel.sampler] != required_output_type)
+            {
+                continue;
+            }
+
+            AnimationChannel channel{};
+            channel.sampler_index = static_cast<uint32_t>(tg3Channel.sampler);
+            channel.node_id = mapped_node_id;
+            channel.path = path;
+            anim.channels.push_back(channel);
+        }
+
+        if (anim.channels.empty())
+            continue;
+
+        float min_time = std::numeric_limits<float>::infinity();
+        float max_time = -std::numeric_limits<float>::infinity();
+        bool has_timestamps = false;
+        for (const auto& ch : anim.channels)
+        {
+            const auto& inputs = anim.samplers[ch.sampler_index].inputs;
+            for (float t : inputs)
+            {
+                if (std::isfinite(t))
+                {
+                    min_time = std::min(min_time, t);
+                    max_time = std::max(max_time, t);
+                    has_timestamps = true;
+                }
+            }
+        }
+        if (has_timestamps)
+        {
+            anim.start_time = min_time;
+            anim.end_time = max_time;
+        }
+
+        m_animations.push_back(std::move(anim));
+    }
 }
 
 std::vector<std::pair<glm::mat4, Mesh&>> Scene::get_mesh_transform(const Node* node)
@@ -2973,4 +3273,264 @@ void Scene::free_node_as(uint32_t node_id)
 
     refresh_heterogeneous_tlas_nagata_flags(spaces, as_heterogeneous);
     geometry_context.d_spaces = spaces;
+}
+
+namespace
+{
+    inline glm::quat anim_quat_from_vec4(const glm::vec4& v)
+    {
+        return glm::quat(v.w, v.x, v.y, v.z);
+    }
+
+    inline glm::quat anim_safe_normalize_quat(const glm::quat& q)
+    {
+        const float len2 = glm::dot(q, q);
+        if (len2 > 1e-20f)
+            return q * (1.0f / std::sqrt(len2));
+        return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    inline void anim_eval_cubic_spline_weights(float u, float& h00, float& h10, float& h01, float& h11)
+    {
+        const float u2 = u * u;
+        const float u3 = u2 * u;
+        h00 = 2.0f * u3 - 3.0f * u2 + 1.0f;
+        h10 = u3 - 2.0f * u2 + u;
+        h01 = -2.0f * u3 + 3.0f * u2;
+        h11 = u3 - u2;
+    }
+
+    inline bool anim_find_interval(
+        const std::vector<float>& inputs,
+        float time_sec,
+        size_t& out_prev_idx,
+        size_t& out_next_idx,
+        float& out_dt,
+        float& out_u)
+    {
+        if (inputs.empty())
+            return false;
+
+        if (inputs.size() == 1 || time_sec <= inputs.front())
+        {
+            out_prev_idx = 0;
+            out_next_idx = 0;
+            out_dt = 0.0f;
+            out_u = 0.0f;
+            return false;
+        }
+
+        if (time_sec >= inputs.back())
+        {
+            out_prev_idx = inputs.size() - 1u;
+            out_next_idx = out_prev_idx;
+            out_dt = 0.0f;
+            out_u = 0.0f;
+            return false;
+        }
+
+        const auto it = std::upper_bound(inputs.begin(), inputs.end(), time_sec);
+        out_next_idx = static_cast<size_t>(std::distance(inputs.begin(), it));
+        out_prev_idx = (out_next_idx > 0u) ? (out_next_idx - 1u) : 0u;
+        const float t0 = inputs[out_prev_idx];
+        const float t1 = inputs[out_next_idx];
+        out_dt = t1 - t0;
+        out_u = (out_dt > 1e-8f) ? ((time_sec - t0) / out_dt) : 0.0f;
+        return true;
+    }
+
+    inline glm::vec3 sample_animation_vec3(const AnimationSampler& sampler, float time_sec)
+    {
+        if (sampler.inputs.empty() || sampler.outputs.empty())
+            return glm::vec3(0.0f);
+
+        size_t prev_idx = 0;
+        size_t next_idx = 0;
+        float dt = 0.0f;
+        float u = 0.0f;
+        if (!anim_find_interval(sampler.inputs, time_sec, prev_idx, next_idx, dt, u))
+        {
+            const size_t val_idx = (sampler.interpolation == AnimationInterpolation::CubicSpline)
+                ? (prev_idx * 3u + 1u)
+                : prev_idx;
+            return (val_idx < sampler.outputs.size()) ? glm::vec3(sampler.outputs[val_idx]) : glm::vec3(0.0f);
+        }
+
+        if (sampler.interpolation == AnimationInterpolation::Step)
+        {
+            return (prev_idx < sampler.outputs.size()) ? glm::vec3(sampler.outputs[prev_idx]) : glm::vec3(0.0f);
+        }
+
+        if (sampler.interpolation == AnimationInterpolation::CubicSpline)
+        {
+            const size_t v0_idx = prev_idx * 3u + 1u;
+            const size_t b0_idx = prev_idx * 3u + 2u;
+            const size_t a1_idx = next_idx * 3u;
+            const size_t v1_idx = next_idx * 3u + 1u;
+            if (v1_idx >= sampler.outputs.size() || b0_idx >= sampler.outputs.size())
+                return glm::vec3(0.0f);
+
+            const glm::vec3 v0 = glm::vec3(sampler.outputs[v0_idx]);
+            const glm::vec3 b0 = dt * glm::vec3(sampler.outputs[b0_idx]);
+            const glm::vec3 a1 = dt * glm::vec3(sampler.outputs[a1_idx]);
+            const glm::vec3 v1 = glm::vec3(sampler.outputs[v1_idx]);
+
+            float h00 = 0.0f, h10 = 0.0f, h01 = 0.0f, h11 = 0.0f;
+            anim_eval_cubic_spline_weights(u, h00, h10, h01, h11);
+            return h00 * v0 + h10 * b0 + h01 * v1 + h11 * a1;
+        }
+
+        if (next_idx >= sampler.outputs.size())
+            return glm::vec3(0.0f);
+        return glm::mix(glm::vec3(sampler.outputs[prev_idx]), glm::vec3(sampler.outputs[next_idx]), u);
+    }
+
+    inline glm::quat sample_animation_quat(const AnimationSampler& sampler, float time_sec)
+    {
+        if (sampler.inputs.empty() || sampler.outputs.empty())
+            return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+
+        size_t prev_idx = 0;
+        size_t next_idx = 0;
+        float dt = 0.0f;
+        float u = 0.0f;
+        if (!anim_find_interval(sampler.inputs, time_sec, prev_idx, next_idx, dt, u))
+        {
+            const size_t val_idx = (sampler.interpolation == AnimationInterpolation::CubicSpline)
+                ? (prev_idx * 3u + 1u)
+                : prev_idx;
+            return (val_idx < sampler.outputs.size())
+                ? anim_safe_normalize_quat(anim_quat_from_vec4(sampler.outputs[val_idx]))
+                : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (sampler.interpolation == AnimationInterpolation::Step)
+        {
+            return (prev_idx < sampler.outputs.size())
+                ? anim_safe_normalize_quat(anim_quat_from_vec4(sampler.outputs[prev_idx]))
+                : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (sampler.interpolation == AnimationInterpolation::CubicSpline)
+        {
+            const size_t v0_idx = prev_idx * 3u + 1u;
+            const size_t b0_idx = prev_idx * 3u + 2u;
+            const size_t a1_idx = next_idx * 3u;
+            const size_t v1_idx = next_idx * 3u + 1u;
+            if (v1_idx >= sampler.outputs.size() || b0_idx >= sampler.outputs.size())
+                return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+
+            const glm::vec4 v0 = sampler.outputs[v0_idx];
+            const glm::vec4 b0 = dt * sampler.outputs[b0_idx];
+            const glm::vec4 a1 = dt * sampler.outputs[a1_idx];
+            const glm::vec4 v1 = sampler.outputs[v1_idx];
+
+            float h00 = 0.0f, h10 = 0.0f, h01 = 0.0f, h11 = 0.0f;
+            anim_eval_cubic_spline_weights(u, h00, h10, h01, h11);
+            const glm::vec4 p = h00 * v0 + h10 * b0 + h01 * v1 + h11 * a1;
+            return anim_safe_normalize_quat(anim_quat_from_vec4(p));
+        }
+
+        if (next_idx >= sampler.outputs.size())
+            return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        const glm::quat q0 = anim_safe_normalize_quat(anim_quat_from_vec4(sampler.outputs[prev_idx]));
+        const glm::quat q1 = anim_safe_normalize_quat(anim_quat_from_vec4(sampler.outputs[next_idx]));
+        return anim_safe_normalize_quat(glm::slerp(q0, q1, u));
+    }
+
+    inline float resolve_animation_eval_time(const Animation& anim, float time_sec, bool loop)
+    {
+        if (!loop)
+            return time_sec;
+
+        const float duration = anim.duration();
+        if (duration <= 1e-6f)
+            return anim.start_time;
+
+        if (time_sec >= anim.start_time && time_sec <= anim.end_time)
+            return time_sec;
+
+        float offset = std::fmod(time_sec - anim.start_time, duration);
+        if (offset < 0.0f)
+            offset += duration;
+        return anim.start_time + offset;
+    }
+} // namespace
+
+bool Scene::apply_animation(uint32_t animation_index, float time_sec, bool loop)
+{
+    if (animation_index >= m_animations.size())
+        return false;
+
+    const Animation& anim = m_animations[animation_index];
+    const float eval_time = resolve_animation_eval_time(anim, time_sec, loop);
+    bool any_updated = false;
+    for (const AnimationChannel& ch : anim.channels)
+    {
+        if (ch.sampler_index >= anim.samplers.size() || ch.node_id >= m_nodes.size())
+            continue;
+
+        const AnimationSampler& sampler = anim.samplers[ch.sampler_index];
+        if (sampler.inputs.empty())
+            continue;
+
+        Node& target_node = m_nodes[ch.node_id];
+        switch (ch.path)
+        {
+        case AnimationPath::Translation:
+            target_node.setTranslation(sample_animation_vec3(sampler, eval_time));
+            any_updated = true;
+            break;
+        case AnimationPath::Rotation:
+            target_node.setRotation(sample_animation_quat(sampler, eval_time));
+            any_updated = true;
+            break;
+        case AnimationPath::Scale:
+            target_node.setScale(sample_animation_vec3(sampler, eval_time));
+            any_updated = true;
+            break;
+        }
+    }
+
+    return any_updated;
+}
+
+bool Scene::apply_animations(const std::vector<uint32_t>& animation_indices, float time_sec, bool loop)
+{
+    bool any_updated = false;
+    for (uint32_t anim_idx : animation_indices)
+    {
+        if (apply_animation(anim_idx, time_sec, loop))
+        {
+            any_updated = true;
+        }
+    }
+    return any_updated;
+}
+
+bool Scene::rebuild_active_as()
+{
+    if (m_active_space == UINT32_MAX || !spaces.is_allocated(m_active_space))
+        return false;
+
+    uint32_t target_node_id = UINT32_MAX;
+    for (uint32_t node_id = 0; node_id < static_cast<uint32_t>(m_nodes.size()); ++node_id)
+    {
+        const ASRef& ref = m_nodes[node_id].as_ref;
+        if (ref.is_valid() && ref.space_id == m_active_space)
+        {
+            target_node_id = node_id;
+            break;
+        }
+    }
+
+    if (target_node_id == UINT32_MAX)
+        return false;
+
+    const uint32_t new_space = build_node_as(target_node_id, m_nodes[target_node_id].as_ref.type);
+    if (new_space == UINT32_MAX)
+        return false;
+
+    set_active_space(new_space);
+    return true;
 }

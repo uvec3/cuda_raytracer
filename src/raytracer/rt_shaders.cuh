@@ -180,7 +180,7 @@ glm::vec4 fragment_hit_shader_impl(
         }
 
         auto refracted=glm::refract(ray_dir,normal,eta);
-        if (refracted!=glm::vec3(0))
+        if (refracted!=glm::vec3(0))//refraction
         {
             ray_dir=refracted;
             ray_src=intersection;
@@ -192,7 +192,12 @@ glm::vec4 fragment_hit_shader_impl(
             continue_traversal = false;
         }
     }
-    else
+    else if (out_color.a<0.95f)//transparent
+    {
+        ray_src=intersection;
+        continue_traversal=true;
+    }
+    else//opaque
     {
         continue_traversal=false;
     }

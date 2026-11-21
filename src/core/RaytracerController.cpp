@@ -1,8 +1,10 @@
 #include "RaytracerController.hpp"
 #include "../types.hpp"
+#include "../raytracer/Raytracer.cuh"
 #include "../raytracer/Scene.hpp"
 #include <container_explorer.hpp>
 #include <cuda_profiler_api.h>
+#include <limits>
 #include <numeric>
 #include <vkbase_core.hpp>
 #include "../../vkbase/extensions/imgui/imgui.hpp"
@@ -89,6 +91,7 @@ RaytracerController::RaytracerController()
     windows.push_back({"Table",WRAP_MEMBER_FUNC(ui_table)});
     windows.push_back({"Debug pixel",WRAP_MEMBER_FUNC(ui_debug_pixel)});
     windows.push_back({"Select scene",WRAP_MEMBER_FUNC(ui_scenes_manager)});
+    windows.push_back({"Animations", WRAP_MEMBER_FUNC(ui_animations)});
     windows.push_back({"Output image", [this]()
     {
         bool open=true;
@@ -664,6 +667,10 @@ void RaytracerController::build_as()
     pause();
     {
         std::lock_guard lock(device_data_mutex);
+        if (raytracer != nullptr)
+        {
+            active_scene.as_heterogeneous.set_probe_render_params(raytracer->parameters);
+        }
         const uint32_t new_space_id = active_scene.build_node_as(scene_data.selected_node_id, as_type);
         if (new_space_id != UINT32_MAX && auto_select_after_build)
         {
@@ -704,6 +711,10 @@ bool RaytracerController::ui_scenes_manager()
                 {
                     if (ensure_scene_loaded(i))
                     {
+                        if (i != active_scene_number && raytracer)
+                        {
+                            raytracer->reset_animations_state();
+                        }
                         active_scene_number = i;
                     }
                 }
@@ -797,6 +808,382 @@ bool RaytracerController::ui_scenes_manager()
                 ui_node_inspector();
             }
             ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+    return open;
+}
+
+static const char* animation_path_name(AnimationPath path)
+{
+    switch (path)
+    {
+    case AnimationPath::Translation: return "Translation";
+    case AnimationPath::Rotation:    return "Rotation";
+    case AnimationPath::Scale:       return "Scale";
+    default:                         return "Unknown";
+    }
+}
+
+static const char* animation_interpolation_name(AnimationInterpolation interp)
+{
+    switch (interp)
+    {
+    case AnimationInterpolation::Linear:      return "LINEAR";
+    case AnimationInterpolation::Step:        return "STEP";
+    case AnimationInterpolation::CubicSpline: return "CUBICSPLINE";
+    default:                                  return "UNKNOWN";
+    }
+}
+
+bool RaytracerController::ui_animations()
+{
+    bool open = true;
+    if (ImGui::Begin("Animations", &open))
+    {
+        if (!has_active_loaded_scene())
+        {
+            ImGui::TextUnformatted("No scene loaded.");
+        }
+        else
+        {
+            auto& scene_data = scenes[active_scene_number];
+            const Scene& active_scene = *scene_data.scene;
+
+            ImGui::Text("Scene: %s", active_scene.get_name().c_str());
+            ImGui::Text("Animations: %zu", active_scene.m_animations.size());
+            ImGui::Separator();
+
+            if (active_scene.m_animations.empty())
+            {
+                ImGui::TextUnformatted("No animations in this scene.");
+            }
+            else
+            {
+                if (raytracer != nullptr)
+                {
+                    float min_start = std::numeric_limits<float>::infinity();
+                    float max_end = -std::numeric_limits<float>::infinity();
+                    bool has_range = false;
+                    for (uint32_t idx : raytracer->active_animations)
+                    {
+                        if (idx < active_scene.m_animations.size())
+                        {
+                            const Animation& anim = active_scene.m_animations[idx];
+                            min_start = std::min(min_start, anim.start_time);
+                            max_end = std::max(max_end, anim.end_time);
+                            has_range = true;
+                        }
+                    }
+                    if (!has_range)
+                    {
+                        for (const Animation& anim : active_scene.m_animations)
+                        {
+                            min_start = std::min(min_start, anim.start_time);
+                            max_end = std::max(max_end, anim.end_time);
+                            has_range = true;
+                        }
+                    }
+                    if (!has_range)
+                    {
+                        min_start = 0.0f;
+                        max_end = 0.0f;
+                    }
+
+                    ImGui::BeginDisabled(raytracer->active_animations.empty());
+                    if (raytracer->animation_playing)
+                    {
+                        if (ImGui::Button("Pause"))
+                        {
+                            raytracer->animation_playing = false;
+                            raytracer->has_last_animation_tick = false;
+                        }
+                    }
+                    else
+                    {
+                        if (ImGui::Button("Play"))
+                        {
+                            if (!raytracer->animation_loop)
+                            {
+                                if (raytracer->animation_speed >= 0.0f && raytracer->animation_time >= max_end)
+                                    raytracer->animation_time = min_start;
+                                else if (raytracer->animation_speed < 0.0f && raytracer->animation_time <= min_start)
+                                    raytracer->animation_time = max_end;
+                            }
+                            raytracer->animation_playing = true;
+                            raytracer->has_last_animation_tick = false;
+                            raytracer->animation_dirty = true;
+                        }
+                    }
+                    ImGui::EndDisabled();
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset"))
+                    {
+                        raytracer->animation_time = min_start;
+                        raytracer->has_last_animation_tick = false;
+                        raytracer->animation_dirty = true;
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Select All"))
+                    {
+                        raytracer->active_animations.clear();
+                        raytracer->active_animations.reserve(active_scene.m_animations.size());
+                        for (uint32_t i = 0; i < static_cast<uint32_t>(active_scene.m_animations.size()); ++i)
+                        {
+                            raytracer->active_animations.push_back(i);
+                        }
+                        raytracer->animation_dirty = true;
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear"))
+                    {
+                        raytracer->active_animations.clear();
+                        raytracer->animation_playing = false;
+                        raytracer->has_last_animation_tick = false;
+                        raytracer->animation_dirty = false;
+                    }
+
+                    if (ImGui::Checkbox("Loop", &raytracer->animation_loop))
+                    {
+                        raytracer->animation_dirty = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(140.0f);
+                    ImGui::DragFloat("Speed", &raytracer->animation_speed, 0.05f, -10.0f, 10.0f, "%.2fx");
+
+                    const float slider_max = std::max(min_start + 1e-4f, max_end);
+                    if (ImGui::SliderFloat("Time (s)", &raytracer->animation_time, min_start, slider_max, "%.3f s"))
+                    {
+                        raytracer->animation_dirty = true;
+                        raytracer->has_last_animation_tick = false;
+                    }
+                    ImGui::Separator();
+                }
+
+                constexpr ImGuiTableFlags table_flags =
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable;
+
+                for (size_t anim_idx = 0; anim_idx < active_scene.m_animations.size(); ++anim_idx)
+                {
+                    const Animation& anim = active_scene.m_animations[anim_idx];
+                    ImGui::PushID(static_cast<int>(anim_idx));
+
+                    if (raytracer != nullptr)
+                    {
+                        const uint32_t anim_idx_u32 = static_cast<uint32_t>(anim_idx);
+                        auto active_it = std::find(
+                            raytracer->active_animations.begin(),
+                            raytracer->active_animations.end(),
+                            anim_idx_u32);
+                        bool is_active = (active_it != raytracer->active_animations.end());
+                        if (ImGui::Checkbox("##active", &is_active))
+                        {
+                            if (is_active)
+                            {
+                                if (active_it == raytracer->active_animations.end())
+                                {
+                                    raytracer->active_animations.push_back(anim_idx_u32);
+                                    std::sort(raytracer->active_animations.begin(), raytracer->active_animations.end());
+                                    raytracer->animation_dirty = true;
+                                }
+                            }
+                            else
+                            {
+                                if (active_it != raytracer->active_animations.end())
+                                {
+                                    raytracer->active_animations.erase(active_it);
+                                    if (raytracer->active_animations.empty())
+                                    {
+                                        raytracer->animation_playing = false;
+                                        raytracer->has_last_animation_tick = false;
+                                    }
+                                    raytracer->animation_dirty = true;
+                                }
+                            }
+                        }
+                        ImGui::SameLine();
+                    }
+
+                    const char* anim_name = anim.name.empty() ? "Unnamed" : anim.name.c_str();
+                    const bool anim_open = ImGui::TreeNodeEx(
+                        "##anim",
+                        ImGuiTreeNodeFlags_DefaultOpen,
+                        "[%zu] %s (%.3fs .. %.3fs, duration: %.3fs | %zu channels, %zu samplers)",
+                        anim_idx,
+                        anim_name,
+                        anim.start_time,
+                        anim.end_time,
+                        anim.duration(),
+                        anim.channels.size(),
+                        anim.samplers.size());
+
+                    if (anim_open)
+                    {
+                        if (ImGui::BeginTable("channels", 7, table_flags))
+                        {
+                            ImGui::TableSetupColumn("Channel");
+                            ImGui::TableSetupColumn("Target Node");
+                            ImGui::TableSetupColumn("Path");
+                            ImGui::TableSetupColumn("Sampler");
+                            ImGui::TableSetupColumn("Interpolation");
+                            ImGui::TableSetupColumn("Keyframes");
+                            ImGui::TableSetupColumn("Time Range");
+                            ImGui::TableHeadersRow();
+
+                            for (size_t ch_idx = 0; ch_idx < anim.channels.size(); ++ch_idx)
+                            {
+                                const AnimationChannel& ch = anim.channels[ch_idx];
+                                ImGui::TableNextRow();
+                                ImGui::PushID(static_cast<int>(ch_idx));
+
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Text("%zu", ch_idx);
+
+                                ImGui::TableSetColumnIndex(1);
+                                if (ch.node_id < active_scene.m_nodes.size())
+                                {
+                                    const Node& target_node = active_scene.m_nodes[ch.node_id];
+                                    const std::string node_label =
+                                        (target_node.name.empty() ? "Node" : target_node.name) +
+                                        " (#" + std::to_string(ch.node_id) + ")";
+                                    if (ImGui::Selectable(node_label.c_str(), scene_data.selected_node_id == ch.node_id))
+                                    {
+                                        scene_data.selected_node_id = ch.node_id;
+                                    }
+                                }
+                                else
+                                {
+                                    ImGui::Text("<invalid #%u>", ch.node_id);
+                                }
+
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TextUnformatted(animation_path_name(ch.path));
+
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::Text("%u", ch.sampler_index);
+
+                                if (ch.sampler_index < anim.samplers.size())
+                                {
+                                    const AnimationSampler& smp = anim.samplers[ch.sampler_index];
+                                    ImGui::TableSetColumnIndex(4);
+                                    ImGui::TextUnformatted(animation_interpolation_name(smp.interpolation));
+
+                                    ImGui::TableSetColumnIndex(5);
+                                    ImGui::Text("%zu", smp.inputs.size());
+
+                                    ImGui::TableSetColumnIndex(6);
+                                    if (!smp.inputs.empty())
+                                    {
+                                        ImGui::Text("[%.3fs, %.3fs]", smp.inputs.front(), smp.inputs.back());
+                                    }
+                                    else
+                                    {
+                                        ImGui::TextUnformatted("-");
+                                    }
+                                }
+                                else
+                                {
+                                    ImGui::TableSetColumnIndex(4);
+                                    ImGui::TextUnformatted("-");
+                                    ImGui::TableSetColumnIndex(5);
+                                    ImGui::TextUnformatted("-");
+                                    ImGui::TableSetColumnIndex(6);
+                                    ImGui::TextUnformatted("-");
+                                }
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+                        }
+
+                        if (ImGui::TreeNode("Samplers"))
+                        {
+                            for (size_t s_idx = 0; s_idx < anim.samplers.size(); ++s_idx)
+                            {
+                                const AnimationSampler& smp = anim.samplers[s_idx];
+                                ImGui::PushID(static_cast<int>(s_idx));
+
+                                const bool sampler_open = ImGui::TreeNode(
+                                    "sampler",
+                                    "Sampler %zu (%s | %zu keyframes, %zu outputs)",
+                                    s_idx,
+                                    animation_interpolation_name(smp.interpolation),
+                                    smp.inputs.size(),
+                                    smp.outputs.size());
+
+                                if (sampler_open)
+                                {
+                                    const float table_height = std::min(
+                                        240.0f,
+                                        static_cast<float>(smp.inputs.size() + 1) * ImGui::GetTextLineHeightWithSpacing() + 8.0f);
+
+                                    if (ImGui::BeginTable("sampler_keyframes", 3, table_flags | ImGuiTableFlags_ScrollY, ImVec2(0.0f, table_height)))
+                                    {
+                                        ImGui::TableSetupColumn("Index");
+                                        ImGui::TableSetupColumn("Time (s)");
+                                        ImGui::TableSetupColumn("Output / Value");
+                                        ImGui::TableHeadersRow();
+
+                                        const bool is_cubic =
+                                            (smp.interpolation == AnimationInterpolation::CubicSpline) &&
+                                            (smp.outputs.size() == smp.inputs.size() * 3u);
+
+                                        ImGuiListClipper clipper;
+                                        clipper.Begin(static_cast<int>(smp.inputs.size()));
+                                        while (clipper.Step())
+                                        {
+                                            for (int k = clipper.DisplayStart; k < clipper.DisplayEnd; ++k)
+                                            {
+                                                const size_t idx = static_cast<size_t>(k);
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::Text("%d", k);
+
+                                                ImGui::TableSetColumnIndex(1);
+                                                ImGui::Text("%.4f", smp.inputs[idx]);
+
+                                                ImGui::TableSetColumnIndex(2);
+                                                if (is_cubic)
+                                                {
+                                                    const glm::vec4& in_t = smp.outputs[idx * 3u];
+                                                    const glm::vec4& val = smp.outputs[idx * 3u + 1u];
+                                                    const glm::vec4& out_t = smp.outputs[idx * 3u + 2u];
+                                                    ImGui::Text(
+                                                        "in:(%.3f, %.3f, %.3f, %.3f) val:(%.3f, %.3f, %.3f, %.3f) out:(%.3f, %.3f, %.3f, %.3f)",
+                                                        in_t.x, in_t.y, in_t.z, in_t.w,
+                                                        val.x, val.y, val.z, val.w,
+                                                        out_t.x, out_t.y, out_t.z, out_t.w);
+                                                }
+                                                else if (idx < smp.outputs.size())
+                                                {
+                                                    const glm::vec4& val = smp.outputs[idx];
+                                                    ImGui::Text("(%.4f, %.4f, %.4f, %.4f)", val.x, val.y, val.z, val.w);
+                                                }
+                                                else
+                                                {
+                                                    ImGui::TextUnformatted("-");
+                                                }
+                                            }
+                                        }
+                                        ImGui::EndTable();
+                                    }
+                                    ImGui::TreePop();
+                                }
+
+                                ImGui::PopID();
+                            }
+                            ImGui::TreePop();
+                        }
+
+                        ImGui::TreePop();
+                    }
+
+                    ImGui::PopID();
+                }
+            }
         }
     }
     ImGui::End();

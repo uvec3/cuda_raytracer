@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include "../src/raytracer/Scene.hpp"
 #include "../src/raytracer/Raytracer.cuh"
@@ -3045,6 +3046,521 @@ TEST(Scene, GpuTransformDirectPackMatchesSortedPack)
     cudaFreeArray(cuArray);
 }
 
+TEST(Scene, LoadAnimationDataFromAssets)
+{
+    {
+        auto teapot_view = vkbase::assets::get("Scenes/utah_teapot.glb");
+        ASSERT_FALSE(teapot_view.empty());
+
+        Scene scene("TeapotNoAnim");
+        scene.load(teapot_view, false);
+        ASSERT_TRUE(scene.is_loaded());
+        EXPECT_TRUE(scene.m_animations.empty());
+    }
+
+    {
+        auto watch_view = vkbase::assets::get("Scenes/ChronographWatch.glb");
+        ASSERT_FALSE(watch_view.empty());
+
+        Scene scene("ChronographWatch");
+        scene.load(watch_view, false);
+        ASSERT_TRUE(scene.is_loaded());
+        ASSERT_EQ(scene.m_animations.size(), 1u);
+
+        const Animation& anim = scene.m_animations[0];
+        EXPECT_EQ(anim.name, "Anim_0");
+        EXPECT_FLOAT_EQ(anim.start_time, 0.0f);
+        EXPECT_FLOAT_EQ(anim.end_time, 60.0f);
+        EXPECT_FLOAT_EQ(anim.duration(), 60.0f);
+
+        ASSERT_EQ(anim.samplers.size(), 1u);
+        EXPECT_EQ(anim.samplers[0].interpolation, AnimationInterpolation::Linear);
+        EXPECT_EQ(anim.samplers[0].inputs.size(), 121u);
+        EXPECT_EQ(anim.samplers[0].outputs.size(), 121u);
+        EXPECT_FLOAT_EQ(anim.samplers[0].inputs.front(), 0.0f);
+        EXPECT_FLOAT_EQ(anim.samplers[0].inputs.back(), 60.0f);
+
+        ASSERT_EQ(anim.channels.size(), 1u);
+        EXPECT_EQ(anim.channels[0].sampler_index, 0u);
+        EXPECT_EQ(anim.channels[0].path, AnimationPath::Rotation);
+        ASSERT_LT(anim.channels[0].node_id, scene.m_nodes.size());
+        EXPECT_EQ(scene.m_nodes[anim.channels[0].node_id].name, "Hand Seconds");
+    }
+}
+
+TEST(Scene, LoadSyntheticAnimationPathsInterpolationsAndFiltering)
+{
+    std::vector<uint8_t> bin(144, 0);
+    auto write_bytes = [&](size_t offset, const void* src, size_t bytes) {
+        std::memcpy(bin.data() + offset, src, bytes);
+    };
+
+    const float times0[2] = {0.25f, 1.25f};
+    const float trans0[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const float times1[2] = {0.5f, 2.0f};
+    const int16_t rot1[8] = {0, 0, 0, 32767, 0, 32767, 0, 0};
+    const float times2[2] = {0.0f, 1.5f};
+    const float scale2[18] = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 1.0f, 1.0f,
+        0.5f, 0.5f, 0.5f,
+        -0.5f, -0.5f, -0.5f,
+        2.0f, 3.0f, 4.0f,
+        0.0f, 0.0f, 0.0f
+    };
+    const float weights3[2] = {0.0f, 1.0f};
+
+    write_bytes(0, times0, sizeof(times0));
+    write_bytes(8, trans0, sizeof(trans0));
+    write_bytes(32, times1, sizeof(times1));
+    write_bytes(40, rot1, sizeof(rot1));
+    write_bytes(56, times2, sizeof(times2));
+    write_bytes(64, scale2, sizeof(scale2));
+    write_bytes(136, weights3, sizeof(weights3));
+
+    const std::string json = R"json({
+        "asset": { "version": "2.0" },
+        "scene": 0,
+        "scenes": [ { "nodes": [0] } ],
+        "nodes": [
+            { "name": "RootAnimNode", "children": [1] },
+            { "name": "ChildAnimNode" },
+            { "name": "OrphanNode" }
+        ],
+        "buffers": [ { "byteLength": 144 } ],
+        "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 144 } ],
+        "accessors": [
+            { "bufferView": 0, "byteOffset": 0,   "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 8,   "componentType": 5126, "count": 2, "type": "VEC3" },
+            { "bufferView": 0, "byteOffset": 32,  "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 40,  "componentType": 5122, "normalized": true, "count": 2, "type": "VEC4" },
+            { "bufferView": 0, "byteOffset": 56,  "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 64,  "componentType": 5126, "count": 6, "type": "VEC3" },
+            { "bufferView": 0, "byteOffset": 136, "componentType": 5126, "count": 2, "type": "SCALAR" }
+        ],
+        "animations": [
+            {
+                "name": "TRSAnim",
+                "samplers": [
+                    { "input": 0, "output": 1, "interpolation": "LINEAR" },
+                    { "input": 2, "output": 3, "interpolation": "STEP" },
+                    { "input": 4, "output": 5, "interpolation": "CUBICSPLINE" },
+                    { "input": 0, "output": 6, "interpolation": "LINEAR" }
+                ],
+                "channels": [
+                    { "sampler": 0, "target": { "node": 0, "path": "translation" } },
+                    { "sampler": 3, "target": { "node": 0, "path": "weights" } },
+                    { "sampler": 1, "target": { "node": 0, "path": "rotation" } },
+                    { "sampler": 0, "target": { "node": 2, "path": "translation" } },
+                    { "sampler": 2, "target": { "node": 1, "path": "scale" } }
+                ]
+            },
+            {
+                "name": "WeightsOnlyAnim",
+                "samplers": [
+                    { "input": 0, "output": 6, "interpolation": "LINEAR" }
+                ],
+                "channels": [
+                    { "sampler": 0, "target": { "node": 0, "path": "weights" } }
+                ]
+            }
+        ]
+    })json";
+
+    const uint32_t json_padded_len = static_cast<uint32_t>((json.size() + 3u) & ~3u);
+    const uint32_t bin_padded_len = static_cast<uint32_t>((bin.size() + 3u) & ~3u);
+    const uint32_t total_len = 12u + 8u + json_padded_len + 8u + bin_padded_len;
+
+    std::string glb;
+    glb.reserve(total_len);
+    auto append_u32 = [&](uint32_t v) {
+        glb.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    append_u32(0x46546C67u); // "glTF"
+    append_u32(2u);
+    append_u32(total_len);
+
+    append_u32(json_padded_len);
+    append_u32(0x4E4F534Au); // "JSON"
+    glb.append(json);
+    glb.append(json_padded_len - json.size(), ' ');
+
+    append_u32(bin_padded_len);
+    append_u32(0x004E4942u); // "BIN\0"
+    glb.append(reinterpret_cast<const char*>(bin.data()), bin.size());
+    glb.append(bin_padded_len - bin.size(), '\0');
+
+    Scene scene("SyntheticAnim");
+    scene.load(glb, false);
+    ASSERT_TRUE(scene.is_loaded());
+
+    // WeightsOnlyAnim must be skipped because it has no valid TRS channels
+    ASSERT_EQ(scene.m_animations.size(), 1u);
+    const Animation& anim = scene.m_animations[0];
+    EXPECT_EQ(anim.name, "TRSAnim");
+    EXPECT_FLOAT_EQ(anim.start_time, 0.0f);
+    EXPECT_FLOAT_EQ(anim.end_time, 2.0f);
+    EXPECT_FLOAT_EQ(anim.duration(), 2.0f);
+
+    ASSERT_EQ(anim.samplers.size(), 4u);
+    EXPECT_EQ(anim.samplers[0].interpolation, AnimationInterpolation::Linear);
+    ASSERT_EQ(anim.samplers[0].inputs.size(), 2u);
+    ASSERT_EQ(anim.samplers[0].outputs.size(), 2u);
+    EXPECT_FLOAT_EQ(anim.samplers[0].inputs[0], 0.25f);
+    EXPECT_FLOAT_EQ(anim.samplers[0].inputs[1], 1.25f);
+    EXPECT_EQ(anim.samplers[0].outputs[0], glm::vec4(1.0f, 2.0f, 3.0f, 0.0f));
+    EXPECT_EQ(anim.samplers[0].outputs[1], glm::vec4(4.0f, 5.0f, 6.0f, 0.0f));
+
+    EXPECT_EQ(anim.samplers[1].interpolation, AnimationInterpolation::Step);
+    ASSERT_EQ(anim.samplers[1].inputs.size(), 2u);
+    ASSERT_EQ(anim.samplers[1].outputs.size(), 2u);
+    EXPECT_NEAR(anim.samplers[1].outputs[0].w, 1.0f, 1e-4f);
+    EXPECT_NEAR(anim.samplers[1].outputs[1].y, 1.0f, 1e-4f);
+
+    EXPECT_EQ(anim.samplers[2].interpolation, AnimationInterpolation::CubicSpline);
+    ASSERT_EQ(anim.samplers[2].inputs.size(), 2u);
+    ASSERT_EQ(anim.samplers[2].outputs.size(), 6u);
+    EXPECT_EQ(anim.samplers[2].outputs[1], glm::vec4(1.0f, 1.0f, 1.0f, 0.0f));
+    EXPECT_EQ(anim.samplers[2].outputs[4], glm::vec4(2.0f, 3.0f, 4.0f, 0.0f));
+
+    // Only the 3 valid TRS channels targeting imported scene nodes remain
+    ASSERT_EQ(anim.channels.size(), 3u);
+
+    EXPECT_EQ(anim.channels[0].sampler_index, 0u);
+    EXPECT_EQ(anim.channels[0].path, AnimationPath::Translation);
+    ASSERT_LT(anim.channels[0].node_id, scene.m_nodes.size());
+    EXPECT_EQ(scene.m_nodes[anim.channels[0].node_id].name, "RootAnimNode");
+
+    EXPECT_EQ(anim.channels[1].sampler_index, 1u);
+    EXPECT_EQ(anim.channels[1].path, AnimationPath::Rotation);
+    EXPECT_EQ(anim.channels[1].node_id, anim.channels[0].node_id);
+
+    EXPECT_EQ(anim.channels[2].sampler_index, 2u);
+    EXPECT_EQ(anim.channels[2].path, AnimationPath::Scale);
+    ASSERT_LT(anim.channels[2].node_id, scene.m_nodes.size());
+    EXPECT_EQ(scene.m_nodes[anim.channels[2].node_id].name, "ChildAnimNode");
+
+    // Verify Scene move constructor and move assignment preserve m_animations
+    Scene moved_ctor(std::move(scene));
+    ASSERT_EQ(moved_ctor.m_animations.size(), 1u);
+    EXPECT_EQ(moved_ctor.m_animations[0].name, "TRSAnim");
+    EXPECT_EQ(moved_ctor.m_animations[0].channels.size(), 3u);
+
+    Scene moved_assign("Target");
+    moved_assign = std::move(moved_ctor);
+    ASSERT_EQ(moved_assign.m_animations.size(), 1u);
+    EXPECT_EQ(moved_assign.m_animations[0].name, "TRSAnim");
+    EXPECT_EQ(moved_assign.m_animations[0].samplers.size(), 4u);
+}
+
+TEST(Scene, EvaluateAnimationsAndRebuildASOnFrame)
+{
+    // Part 1: Evaluate ChronographWatch animation and rebuild active AS during Raytracer::update_parameters
+    {
+        auto watch_view = vkbase::assets::get("Scenes/ChronographWatch.glb");
+        ASSERT_FALSE(watch_view.empty());
+
+        Scene scene("WatchAnimPlay");
+        scene.load(watch_view, false);
+        ASSERT_TRUE(scene.is_loaded());
+        ASSERT_EQ(scene.m_animations.size(), 1u);
+        ASSERT_EQ(scene.m_animations[0].channels.size(), 1u);
+
+        scene.config.swapYZ = true;
+        const uint32_t space_id = scene.build_node_as(scene.root_node_id, ASType::UniformGrid);
+        ASSERT_NE(space_id, UINT32_MAX);
+        scene.set_active_space(space_id);
+        ASSERT_GE(scene.get_root_box(), 0);
+
+        const uint32_t hand_node_id = scene.m_animations[0].channels[0].node_id;
+        ASSERT_LT(hand_node_id, scene.m_nodes.size());
+        const glm::quat initial_rot = scene.m_nodes[hand_node_id].getRotation();
+
+        Raytracer rt;
+        rt.active_animations = {0u};
+        rt.animation_playing = false;
+        rt.animation_time = 15.0f;
+        rt.animation_dirty = true;
+
+        rt.update_parameters(scene, 64, 64);
+
+        EXPECT_FALSE(rt.animation_dirty);
+        EXPECT_EQ(scene.get_active_space(), space_id);
+        EXPECT_GE(scene.get_root_box(), 0);
+        EXPECT_TRUE(scene.spaces.is_allocated(space_id));
+
+        const glm::quat rot_at_15 = scene.m_nodes[hand_node_id].getRotation();
+        const float dot_diff_init = std::abs(glm::dot(initial_rot, rot_at_15));
+        EXPECT_LT(dot_diff_init, 0.99f);
+
+        // Advance using active playback state at t = 30.0s
+        rt.animation_playing = true;
+        rt.animation_loop = false;
+        rt.animation_time = 30.0f;
+        rt.update_parameters(scene, 64, 64);
+
+        const glm::quat rot_at_30 = scene.m_nodes[hand_node_id].getRotation();
+        const float dot_diff_15_30 = std::abs(glm::dot(rot_at_15, rot_at_30));
+        EXPECT_LT(dot_diff_15_30, 0.99f);
+    }
+
+    // Part 2: Verify LINEAR translation, STEP rotation, and CUBICSPLINE scale interpolation
+    {
+        std::vector<uint8_t> bin(136, 0);
+        auto write_bytes = [&](size_t offset, const void* src, size_t bytes) {
+            std::memcpy(bin.data() + offset, src, bytes);
+        };
+
+        const float times[2] = {0.0f, 2.0f};
+        const float trans[6] = {0.0f, 0.0f, 0.0f, 2.0f, 4.0f, 6.0f};
+        const float rot[8] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        const float scale_cubic[18] = {
+            0.0f, 0.0f, 0.0f,
+            1.0f, 1.0f, 1.0f,
+            3.0f, 0.0f, 0.0f,
+            3.0f, 0.0f, 0.0f,
+            5.0f, 3.0f, 1.0f,
+            0.0f, 0.0f, 0.0f
+        };
+
+        write_bytes(0, times, sizeof(times));
+        write_bytes(8, trans, sizeof(trans));
+        write_bytes(32, rot, sizeof(rot));
+        write_bytes(64, scale_cubic, sizeof(scale_cubic));
+
+        const std::string json = R"json({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [ { "nodes": [0] } ],
+            "nodes": [ { "name": "AnimNode" } ],
+            "buffers": [ { "byteLength": 136 } ],
+            "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 136 } ],
+            "accessors": [
+                { "bufferView": 0, "byteOffset": 0,  "componentType": 5126, "count": 2, "type": "SCALAR" },
+                { "bufferView": 0, "byteOffset": 8,  "componentType": 5126, "count": 2, "type": "VEC3" },
+                { "bufferView": 0, "byteOffset": 32, "componentType": 5126, "count": 2, "type": "VEC4" },
+                { "bufferView": 0, "byteOffset": 64, "componentType": 5126, "count": 6, "type": "VEC3" }
+            ],
+            "animations": [
+                {
+                    "name": "InterpTest",
+                    "samplers": [
+                        { "input": 0, "output": 1, "interpolation": "LINEAR" },
+                        { "input": 0, "output": 2, "interpolation": "STEP" },
+                        { "input": 0, "output": 3, "interpolation": "CUBICSPLINE" }
+                    ],
+                    "channels": [
+                        { "sampler": 0, "target": { "node": 0, "path": "translation" } },
+                        { "sampler": 1, "target": { "node": 0, "path": "rotation" } },
+                        { "sampler": 2, "target": { "node": 0, "path": "scale" } }
+                    ]
+                }
+            ]
+        })json";
+
+        const uint32_t json_padded_len = static_cast<uint32_t>((json.size() + 3u) & ~3u);
+        const uint32_t bin_padded_len = static_cast<uint32_t>((bin.size() + 3u) & ~3u);
+        const uint32_t total_len = 12u + 8u + json_padded_len + 8u + bin_padded_len;
+
+        std::string glb;
+        glb.reserve(total_len);
+        auto append_u32 = [&](uint32_t v) {
+            glb.append(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+        append_u32(0x46546C67u);
+        append_u32(2u);
+        append_u32(total_len);
+        append_u32(json_padded_len);
+        append_u32(0x4E4F534Au);
+        glb.append(json);
+        glb.append(json_padded_len - json.size(), ' ');
+        append_u32(bin_padded_len);
+        append_u32(0x004E4942u);
+        glb.append(reinterpret_cast<const char*>(bin.data()), bin.size());
+        glb.append(bin_padded_len - bin.size(), '\0');
+
+        Scene scene("SyntheticEval");
+        scene.load(glb, false);
+        ASSERT_TRUE(scene.is_loaded());
+        ASSERT_EQ(scene.m_animations.size(), 1u);
+        ASSERT_EQ(scene.m_animations[0].channels.size(), 3u);
+
+        const uint32_t node_id = scene.m_animations[0].channels[0].node_id;
+        ASSERT_LT(node_id, scene.m_nodes.size());
+
+        // Midpoint t = 1.0 (u = 0.5)
+        EXPECT_TRUE(scene.apply_animation(0u, 1.0f));
+        const glm::vec3 t_mid = scene.m_nodes[node_id].getTranslation();
+        EXPECT_NEAR(t_mid.x, 1.0f, 1e-5f);
+        EXPECT_NEAR(t_mid.y, 2.0f, 1e-5f);
+        EXPECT_NEAR(t_mid.z, 3.0f, 1e-5f);
+
+        const glm::quat r_mid = scene.m_nodes[node_id].getRotation();
+        EXPECT_NEAR(r_mid.w, 1.0f, 1e-5f);
+        EXPECT_NEAR(r_mid.x, 0.0f, 1e-5f);
+        EXPECT_NEAR(r_mid.y, 0.0f, 1e-5f);
+        EXPECT_NEAR(r_mid.z, 0.0f, 1e-5f);
+
+        const glm::vec3 s_mid = scene.m_nodes[node_id].getScale();
+        EXPECT_NEAR(s_mid.x, 3.0f, 1e-5f);
+        EXPECT_NEAR(s_mid.y, 2.0f, 1e-5f);
+        EXPECT_NEAR(s_mid.z, 1.0f, 1e-5f);
+
+        // End clamp t = 5.0 >= 2.0
+        EXPECT_TRUE(scene.apply_animation(0u, 5.0f));
+        const glm::vec3 t_end = scene.m_nodes[node_id].getTranslation();
+        EXPECT_NEAR(t_end.x, 2.0f, 1e-5f);
+        EXPECT_NEAR(t_end.y, 4.0f, 1e-5f);
+        EXPECT_NEAR(t_end.z, 6.0f, 1e-5f);
+
+        const glm::quat r_end = scene.m_nodes[node_id].getRotation();
+        EXPECT_NEAR(r_end.w, 0.0f, 1e-5f);
+        EXPECT_NEAR(r_end.y, 1.0f, 1e-5f);
+
+        const glm::vec3 s_end = scene.m_nodes[node_id].getScale();
+        EXPECT_NEAR(s_end.x, 5.0f, 1e-5f);
+        EXPECT_NEAR(s_end.y, 3.0f, 1e-5f);
+        EXPECT_NEAR(s_end.z, 1.0f, 1e-5f);
+    }
+}
+
+TEST(Scene, ShorterAnimationLoopsOverLongerDuration)
+{
+    std::vector<uint8_t> bin(96, 0);
+    auto write_bytes = [&](size_t offset, const void* src, size_t bytes) {
+        std::memcpy(bin.data() + offset, src, bytes);
+    };
+
+    const float times0[2] = {0.0f, 2.0f};
+    const float trans0[6] = {0.0f, 0.0f, 0.0f, 2.0f, 0.0f, 0.0f};
+    const float times1[2] = {0.0f, 10.0f};
+    const float trans1[6] = {0.0f, 0.0f, 0.0f, 0.0f, 10.0f, 0.0f};
+    const float times2[2] = {1.0f, 3.0f};
+    const float trans2[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2.0f};
+
+    write_bytes(0, times0, sizeof(times0));
+    write_bytes(8, trans0, sizeof(trans0));
+    write_bytes(32, times1, sizeof(times1));
+    write_bytes(40, trans1, sizeof(trans1));
+    write_bytes(64, times2, sizeof(times2));
+    write_bytes(72, trans2, sizeof(trans2));
+
+    const std::string json = R"json({
+        "asset": { "version": "2.0" },
+        "scene": 0,
+        "scenes": [ { "nodes": [0, 1, 2] } ],
+        "nodes": [
+            { "name": "NodeA" },
+            { "name": "NodeB" },
+            { "name": "NodeC" }
+        ],
+        "buffers": [ { "byteLength": 96 } ],
+        "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 96 } ],
+        "accessors": [
+            { "bufferView": 0, "byteOffset": 0,  "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 8,  "componentType": 5126, "count": 2, "type": "VEC3" },
+            { "bufferView": 0, "byteOffset": 32, "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 40, "componentType": 5126, "count": 2, "type": "VEC3" },
+            { "bufferView": 0, "byteOffset": 64, "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "byteOffset": 72, "componentType": 5126, "count": 2, "type": "VEC3" }
+        ],
+        "animations": [
+            {
+                "name": "ShortAnim",
+                "samplers": [ { "input": 0, "output": 1, "interpolation": "LINEAR" } ],
+                "channels": [ { "sampler": 0, "target": { "node": 0, "path": "translation" } } ]
+            },
+            {
+                "name": "LongAnim",
+                "samplers": [ { "input": 2, "output": 3, "interpolation": "LINEAR" } ],
+                "channels": [ { "sampler": 0, "target": { "node": 1, "path": "translation" } } ]
+            },
+            {
+                "name": "OffsetAnim",
+                "samplers": [ { "input": 4, "output": 5, "interpolation": "LINEAR" } ],
+                "channels": [ { "sampler": 0, "target": { "node": 2, "path": "translation" } } ]
+            }
+        ]
+    })json";
+
+    const uint32_t json_padded_len = static_cast<uint32_t>((json.size() + 3u) & ~3u);
+    const uint32_t bin_padded_len = static_cast<uint32_t>((bin.size() + 3u) & ~3u);
+    const uint32_t total_len = 12u + 8u + json_padded_len + 8u + bin_padded_len;
+
+    std::string glb;
+    glb.reserve(total_len);
+    auto append_u32 = [&](uint32_t v) {
+        glb.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    append_u32(0x46546C67u);
+    append_u32(2u);
+    append_u32(total_len);
+    append_u32(json_padded_len);
+    append_u32(0x4E4F534Au);
+    glb.append(json);
+    glb.append(json_padded_len - json.size(), ' ');
+    append_u32(bin_padded_len);
+    append_u32(0x004E4942u);
+    glb.append(reinterpret_cast<const char*>(bin.data()), bin.size());
+    glb.append(bin_padded_len - bin.size(), '\0');
+
+    Scene scene("LoopWrapTest");
+    scene.load(glb, false);
+    ASSERT_TRUE(scene.is_loaded());
+    ASSERT_EQ(scene.m_animations.size(), 3u);
+
+    const uint32_t node_a = scene.m_animations[0].channels[0].node_id;
+    const uint32_t node_b = scene.m_animations[1].channels[0].node_id;
+    const uint32_t node_c = scene.m_animations[2].channels[0].node_id;
+    ASSERT_LT(node_a, scene.m_nodes.size());
+    ASSERT_LT(node_b, scene.m_nodes.size());
+    ASSERT_LT(node_c, scene.m_nodes.size());
+
+    // With loop = true at t = 3.5: ShortAnim wraps 3.5 % 2.0 = 1.5, LongAnim stays at 3.5, OffsetAnim wraps 1.0 + fmod(2.5, 2.0) = 1.5
+    EXPECT_TRUE(scene.apply_animations({0u, 1u, 2u}, 3.5f, true));
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().x, 1.5f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().y, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().z, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().x, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().y, 3.5f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().z, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_c].getTranslation().x, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_c].getTranslation().y, 0.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_c].getTranslation().z, 0.5f, 1e-5f);
+
+    // Exact endpoint t == end_time is preserved without wrapping to start_time
+    EXPECT_TRUE(scene.apply_animation(0u, 2.0f, true));
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().x, 2.0f, 1e-5f);
+
+    // Negative offset t = 0.5 < OffsetAnim.start_time (1.0) wraps modulo 2.0 into [1.0, 3.0] -> 2.5
+    EXPECT_TRUE(scene.apply_animation(2u, 0.5f, true));
+    EXPECT_NEAR(scene.m_nodes[node_c].getTranslation().z, 1.5f, 1e-5f);
+
+    // With loop = false at t = 3.5: shorter animations clamp at their own end_time
+    EXPECT_TRUE(scene.apply_animations({0u, 1u, 2u}, 3.5f, false));
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().x, 2.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().y, 3.5f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_c].getTranslation().z, 2.0f, 1e-5f);
+
+    // Verify Raytracer::update_parameters propagates animation_loop
+    Raytracer rt;
+    rt.active_animations = {0u, 1u};
+    rt.animation_playing = false;
+    rt.animation_time = 3.5f;
+
+    rt.animation_loop = true;
+    rt.animation_dirty = true;
+    rt.update_parameters(scene, 64, 64);
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().x, 1.5f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().y, 3.5f, 1e-5f);
+
+    rt.animation_loop = false;
+    rt.animation_dirty = true;
+    rt.update_parameters(scene, 64, 64);
+    EXPECT_NEAR(scene.m_nodes[node_a].getTranslation().x, 2.0f, 1e-5f);
+    EXPECT_NEAR(scene.m_nodes[node_b].getTranslation().y, 3.5f, 1e-5f);
+}
+
 TEST(HeterogeneousAS, AllTlasTypesRenderIdenticalAndStopOnHitGPU)
 {
     auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
@@ -3562,6 +4078,178 @@ TEST(HeterogeneousAS, BenchmarkTlasRebuildChess)
                   << " | wall_ms avg=" << (sum_wall_ms / kIters)
                   << " min=" << min_wall_ms
                   << std::endl;
+    }
+
+    scene.free_node_as(scene.root_node_id);
+}
+
+TEST(HeterogeneousAS, BenchmarkTlasRebuildBistro)
+{
+    auto view = vkbase::assets::get("Scenes/Bistro.glb");
+    if (view.empty())
+    {
+        GTEST_SKIP() << "Bistro.glb not found";
+    }
+
+    Scene scene("BistroTlasBench");
+    scene.load(view);
+
+    // Enable only a single fast BVH16 variant so initial BLAS setup for 1,235 meshes is quick.
+    scene.as_heterogeneous.init_default_variants();
+    for (size_t i = 0; i < scene.as_heterogeneous.variants.size(); ++i)
+    {
+        scene.as_heterogeneous.variants[i].enabled = (i == 0);
+    }
+
+    scene.as_heterogeneous.config.rebuild_blas = true;
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 256;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+    ASSERT_NE(tlas_space, UINT32_MAX);
+    const auto* insts = scene.as_heterogeneous.get_instance_records(tlas_space);
+    ASSERT_NE(insts, nullptr);
+    const size_t num_instances = insts->size();
+
+    struct TlasCase
+    {
+        const char* name;
+        ASType type;
+    };
+    const TlasCase cases[] = {
+        {"BVH16", ASType::BVH},
+        {"KDTree", ASType::KDTree},
+        {"UniformGrid", ASType::UniformGrid},
+        {"Octree", ASType::Octree},
+    };
+
+    scene.as_heterogeneous.config.rebuild_blas = false;
+    constexpr int kIters = 5;
+
+    for (const auto& c : cases)
+    {
+        scene.as_heterogeneous.config.tlas_type = c.type;
+        tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+        ASSERT_NE(tlas_space, UINT32_MAX);
+
+        double sum_tlas_ms = 0.0;
+        double min_tlas_ms = std::numeric_limits<double>::infinity();
+        double sum_wall_ms = 0.0;
+        double min_wall_ms = std::numeric_limits<double>::infinity();
+
+        for (int it = 0; it < kIters; ++it)
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            ASSERT_NE(tlas_space, UINT32_MAX);
+
+            const double wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double tlas_ms = scene.as_heterogeneous.get_tlas_build_time_ms(tlas_space);
+            sum_tlas_ms += tlas_ms;
+            min_tlas_ms = std::min(min_tlas_ms, tlas_ms);
+            sum_wall_ms += wall_ms;
+            min_wall_ms = std::min(min_wall_ms, wall_ms);
+        }
+
+        std::cout << "[TLAS BENCH] Bistro (" << num_instances << " instances) | " << c.name
+                  << " | tlas_ms avg=" << (sum_tlas_ms / kIters)
+                  << " min=" << min_tlas_ms
+                  << " | wall_ms avg=" << (sum_wall_ms / kIters)
+                  << " min=" << min_wall_ms
+                  << std::endl;
+    }
+
+    scene.free_node_as(scene.root_node_id);
+}
+
+TEST(HeterogeneousAS, ProbeUsesRenderParamsTexturesAndRefractionGPU)
+{
+    auto view = vkbase::assets::get("Scenes/ABeautifulGame.glb");
+    if (view.empty())
+    {
+        GTEST_SKIP() << "ABeautifulGame.glb not found";
+    }
+
+    Scene scene("ProbeRenderParamsTest");
+    scene.load(view);
+
+    // Enable 4 representative variants (BVH16, KDTree, UniformGrid, Octree)
+    scene.as_heterogeneous.init_default_variants();
+    for (auto& v : scene.as_heterogeneous.variants)
+    {
+        v.enabled =
+            (v.name == "BVH16 SAH (Leaf <= 4)") ||
+            (v.name == "KDTree SAH") ||
+            (v.name == "UniformGrid (2.0 vox/tri)") ||
+            (v.name == "Octree");
+    }
+
+    scene.as_heterogeneous.config.rebuild_blas = true;
+    scene.as_heterogeneous.config.tlas_type = ASType::BVH;
+    scene.as_heterogeneous.config.num_probe_rays = 4096;
+    scene.as_heterogeneous.config.max_memory_bytes_per_triangle = 128.0f;
+
+    struct ProbeCase
+    {
+        const char* label;
+        ProbeRayPattern pattern;
+        bool enable_refraction;
+        bool dirty_debug_flags;
+    };
+
+    const ProbeCase cases[] = {
+        {"CoherentTiles_NoRefract_SanitizeFlags", ProbeRayPattern::CoherentTiles, false, true},
+        {"CoherentTiles_WithRefract", ProbeRayPattern::CoherentTiles, true, false},
+        {"RandomSphere_WithRefract", ProbeRayPattern::RandomSphere, true, false},
+    };
+
+    for (const auto& c : cases)
+    {
+        RenderParameters rp{};
+        rp.enableRefraction = c.enable_refraction;
+        rp.use_fake_normals = true;
+        rp.fixed_light_source = true;
+        rp.light_source = glm::vec3(1.5f, 1.5f, 2.0f);
+        if (c.dirty_debug_flags)
+        {
+            rp.show_triangles = false;
+            rp.show_iterations = true;
+            rp.show_boxes = true;
+            rp.measure_time = true;
+        }
+
+        scene.as_heterogeneous.config.probe_ray_pattern = c.pattern;
+        scene.as_heterogeneous.set_probe_render_params(rp);
+
+        const uint32_t tlas_space = scene.build_node_as(scene.root_node_id, ASType::Heterogeneous);
+        ASSERT_NE(tlas_space, UINT32_MAX) << c.label;
+        EXPECT_EQ(cudaGetLastError(), cudaSuccess) << c.label;
+
+        const auto* recs = scene.as_heterogeneous.get_mesh_records(tlas_space);
+        ASSERT_NE(recs, nullptr) << c.label;
+        ASSERT_FALSE(recs->empty()) << c.label;
+
+        for (const auto& rec : *recs)
+        {
+            EXPECT_NE(rec.selected_as_type, ASType::None) << c.label << " mesh=" << rec.mesh_name;
+            EXPECT_EQ(rec.candidates.size(), 4u) << c.label << " mesh=" << rec.mesh_name;
+            for (const auto& cand : rec.candidates)
+            {
+                EXPECT_TRUE(std::isfinite(cand.probe_trace_ms)) << c.label << " " << cand.variant_name;
+                EXPECT_GT(cand.probe_trace_ms, 0.0f) << c.label << " " << cand.variant_name;
+            }
+        }
+
+        const auto& sample = (*recs)[0];
+        std::cout << "[PROBE TEST] " << c.label << " | mesh=" << sample.mesh_name
+                  << " selected=" << sample.selected_variant_name;
+        for (const auto& cand : sample.candidates)
+        {
+            std::cout << " | " << cand.variant_name << "=" << cand.probe_trace_ms << "ms";
+        }
+        std::cout << std::endl;
     }
 
     scene.free_node_as(scene.root_node_id);

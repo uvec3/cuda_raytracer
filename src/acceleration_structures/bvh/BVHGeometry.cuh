@@ -665,8 +665,9 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
     int it = 0;
     bool continue_traversal = true;
     bool missed = false;
+    bool alpha_terminated = false;
 
-    for (int bounce = 0; bounce < 8 && continue_traversal && it < max_iterations; ++bounce)
+    for (int bounce = 0; continue_traversal && it < max_iterations; ++bounce)
     {
         const float ray_t_min = (bounce == 0) ? 0.0f : 1e-4f;
         uint32_t closest_triangle = UINT32_MAX;
@@ -768,6 +769,11 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
         {
             auto res = fragment_hit_shader<HasNagata>(closest_triangle, source, direction, closest_tuv, p, continue_traversal);
             hit_primitive_color = blend_colors(hit_primitive_color, res);
+            if (continue_traversal && hit_primitive_color.a > p.alpha_threshold)
+            {
+                continue_traversal = false;
+                alpha_terminated = true;
+            }
         }
         else
         {
@@ -781,7 +787,7 @@ glm::vec4 BVHASDeviceView::first_hit(const RenderParams& p, glm::vec3 source, gl
 
     if (!p.show_iterations && !p.show_boxes)
     {
-        if (missed)
+        if (missed || alpha_terminated)
             hit_primitive_color = blend_colors(hit_primitive_color, miss_shader(source, direction, p));
         return hit_primitive_color;
     }

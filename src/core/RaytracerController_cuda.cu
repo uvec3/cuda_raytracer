@@ -64,6 +64,7 @@ bool RaytracerController::ui_rendering_parameters()
         ImGui::Checkbox("Refraction",&p.enableRefraction);
         ImGui::Checkbox("Reflection",&p.enableReflection);
         ImGui::Checkbox("Shadows",&p.enableShadows);
+        ImGui::SliderFloat("Alpha threshold", &p.alpha_threshold, 0.0f, 1.0f, "%.3f");
 
         ImGui::Separator();
         ImGui::Text("Resolution");

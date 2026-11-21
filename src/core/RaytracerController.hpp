@@ -138,6 +138,8 @@ public:
 
     bool ui_scenes_manager();
 
+    bool ui_animations();
+
     void ui_node_inspector();
 
     void build_as();

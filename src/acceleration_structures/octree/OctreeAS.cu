@@ -1000,16 +1000,22 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
     std::vector<BoxStack> eval_stack;
     eval_stack.reserve(64);
 
+    auto aabb_intersects_cube = [](const glm::vec3& center, float half_size, const glm::vec3& bmin, const glm::vec3& bmax) noexcept -> bool
+    {
+        return !(bmax.x < center.x - half_size || bmin.x > center.x + half_size ||
+                 bmax.y < center.y - half_size || bmin.y > center.y + half_size ||
+                 bmax.z < center.z - half_size || bmin.z > center.z + half_size);
+    };
+
     for (uint32_t i = 0; i < count; ++i)
     {
-        const glm::vec3 v0 = subspaces[i].bounds_min;
-        const glm::vec3 v1 = subspaces[i].bounds_max;
-        const glm::vec3 v2 = 0.5f * (v0 + v1);
-        const glm::vec3 dim = glm::max(v0, v1) - glm::min(v0, v1);
+        const glm::vec3 bmin = subspaces[i].bounds_min;
+        const glm::vec3 bmax = subspaces[i].bounds_max;
+        const glm::vec3 dim = bmax - bmin;
         const float tri_size = glm::max(glm::max(dim.x, dim.y), dim.z);
 
         BoxStack root{.m_data = 0};
-        if (find_triangle_cube_relation_approximate(root.get_center(), root.half_box_size(), v0, v1, v2) == TriangleCubeRelation::Outside)
+        if (!aabb_intersects_cube(root.get_center(), root.half_box_size(), bmin, bmax))
             continue;
 
         eval_stack.clear();
@@ -1031,7 +1037,7 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
                 for (int branch = 0; branch < 8; ++branch)
                 {
                     box.move(branch);
-                    if (find_triangle_cube_relation_approximate(box.get_center(), box.half_box_size(), v0, v1, v2) != TriangleCubeRelation::Outside)
+                    if (aabb_intersects_cube(box.get_center(), box.half_box_size(), bmin, bmax))
                     {
                         eval_stack.push_back(box);
                     }
@@ -1048,11 +1054,19 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
         return a.number < b.number;
     });
 
-    std::vector<int> local_as(1, 0);
-    std::vector<BoxContent> local_bc(1, BoxContent{});
+    std::vector<int> local_as;
+    local_as.reserve(std::max<size_t>(64u, count * 16u));
+    local_as.push_back(0);
+    std::vector<BoxContent> local_bc;
+    local_bc.reserve(std::max<size_t>(64u, pairs.size() * 2u));
+    local_bc.emplace_back();
 
-    auto insert_rec = [&](auto&& self, int box_id, BoxStack stack, uint32_t start, uint32_t size,
-                          const std::vector<std::pair<uint32_t, uint32_t>>& parent_ranges) -> void
+    std::vector<std::pair<uint32_t, uint32_t>> parent_ranges;
+    parent_ranges.reserve(32);
+    std::vector<uint32_t> leaf_prims;
+    leaf_prims.reserve(64);
+
+    auto insert_rec = [&](auto&& self, int box_id, BoxStack stack, uint32_t start, uint32_t size) -> void
     {
         uint32_t exact_count = 0;
         for (uint32_t i = 0; i < size && BoxStack{.m_data = pairs[start + i].number}.depth() == stack.depth(); ++i)
@@ -1062,21 +1076,19 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
 
         if (exact_count == size)
         {
-            std::vector<uint32_t> leaf_prims;
-            leaf_prims.reserve(size);
+            leaf_prims.clear();
             for (uint32_t i = 0; i < size; ++i)
             {
                 leaf_prims.push_back(space.primitives_start + pairs[start + i].local_idx * SubspacePrimitive::occupied_slots);
             }
+            const glm::vec3 center = stack.get_center();
+            const float half_size = stack.half_box_size();
             for (auto [p_start, p_size] : parent_ranges)
             {
                 for (uint32_t i = p_start; i < p_start + p_size; ++i)
                 {
                     const uint32_t li = pairs[i].local_idx;
-                    const glm::vec3 v0 = subspaces[li].bounds_min;
-                    const glm::vec3 v1 = subspaces[li].bounds_max;
-                    const glm::vec3 v2 = 0.5f * (v0 + v1);
-                    if (find_triangle_cube_relation_approximate(stack.get_center(), stack.half_box_size(), v0, v1, v2) != TriangleCubeRelation::Outside)
+                    if (aabb_intersects_cube(center, half_size, subspaces[li].bounds_min, subspaces[li].bounds_max))
                     {
                         leaf_prims.push_back(space.primitives_start + li * SubspacePrimitive::occupied_slots);
                     }
@@ -1094,9 +1106,8 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
             return;
         }
 
-        auto next_parents = parent_ranges;
         if (exact_count > 0)
-            next_parents.emplace_back(start, exact_count);
+            parent_ranges.emplace_back(start, exact_count);
 
         start += exact_count;
         size -= exact_count;
@@ -1120,17 +1131,20 @@ void OctreeAS::build_subspaces_cpu(uint32_t space_id, Space space, std::span<con
                 else
                     hi = mid;
             }
-            if (hi > start || !next_parents.empty())
+            if (hi > start || !parent_ranges.empty())
             {
-                self(self, child_start + branch, stack, start, hi - start, next_parents);
+                self(self, child_start + branch, stack, start, hi - start);
             }
             size -= (hi - start);
             start = hi;
             stack.ascend();
         }
+
+        if (exact_count > 0)
+            parent_ranges.pop_back();
     };
 
-    insert_rec(insert_rec, 0, BoxStack{}, 0u, static_cast<uint32_t>(pairs.size()), {});
+    insert_rec(insert_rec, 0, BoxStack{}, 0u, static_cast<uint32_t>(pairs.size()));
 
     const uint32_t as_size = static_cast<uint32_t>(local_as.size());
     const uint32_t bc_size = static_cast<uint32_t>(local_bc.size());

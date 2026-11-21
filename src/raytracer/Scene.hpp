@@ -76,6 +76,45 @@ struct MeshInstanceDesc
 	std::string instance_name;
 };
 
+enum class AnimationInterpolation : uint8_t
+{
+	Linear,
+	Step,
+	CubicSpline
+};
+
+enum class AnimationPath : uint8_t
+{
+	Translation,
+	Rotation,
+	Scale
+};
+
+struct AnimationSampler
+{
+	std::vector<float> inputs;
+	std::vector<glm::vec4> outputs;
+	AnimationInterpolation interpolation = AnimationInterpolation::Linear;
+};
+
+struct AnimationChannel
+{
+	uint32_t sampler_index = 0;
+	uint32_t node_id = UINT32_MAX;
+	AnimationPath path = AnimationPath::Translation;
+};
+
+struct Animation
+{
+	std::string name;
+	float start_time = 0.0f;
+	float end_time = 0.0f;
+	std::vector<AnimationSampler> samplers;
+	std::vector<AnimationChannel> channels;
+
+	float duration() const { return (end_time >= start_time) ? (end_time - start_time) : 0.0f; }
+};
+
 class Scene
 {
 public:
@@ -101,6 +140,9 @@ public:
 
 	uint32_t build_node_as(uint32_t node_id, ASType type);
 	void free_node_as(uint32_t node_id);
+	bool apply_animation(uint32_t animation_index, float time_sec, bool loop = false);
+	bool apply_animations(const std::vector<uint32_t>& animation_indices, float time_sec, bool loop = false);
+	bool rebuild_active_as();
 
 	bool is_mesh_node_shared(uint32_t node_id) const;
 	std::vector<std::pair<glm::mat4, Mesh&>> get_mesh_transform(const Node* node = nullptr);
@@ -125,6 +167,7 @@ public:
 	soa::soa_vector<Material> m_materials;
 	soa::cuda_device_vector<Material> d_materials;
 	std::vector<Node> m_nodes;
+	std::vector<Animation> m_animations;
 	uint32_t root_node_id = 0;
 	std::vector<uint32_t> m_mesh_node_ids;
 	uint32_t default_scene = 0;
@@ -169,5 +212,6 @@ private:
 	std::vector<uint32_t> loadMeshes(const tg3_model& model, const std::vector<uint32_t>& materialIds);
 	std::vector<uint32_t> loadMaterials(const tg3_model& model, const std::vector<uint32_t>& textureIds);
 	uint32_t importNode(const tg3_model& model, uint32_t nodeIndex, const std::vector<uint32_t>& meshIds, std::vector<uint32_t>& importedGltfNodes);
-	void load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds);
+	std::vector<uint32_t> load_nodes(const tg3_model& model, const std::vector<uint32_t>& meshIds);
+	void load_animations(const tg3_model& model, const std::vector<uint32_t>& importedGltfNodes);
 };
